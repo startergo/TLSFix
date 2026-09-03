@@ -109,6 +109,8 @@ static char *cf_to_c(CFStringRef s) {
     return buf;
 }
 
+// Caller holds tf_rules_lock: the rule returned points into the array a concurrent reload
+// frees, so it is valid only until the caller releases it.
 static const tf_headerrule *match_headers(const char *url) {
     const tf_headerrule *rules = NULL;
     int n = tf_headerrules(&rules);
@@ -153,10 +155,13 @@ static int apply_rules(void *m) {
     char *before = cf_to_c(CFURLGetString(url));
     if (!before) return 0;
 
+    // One critical section across the redirect, the match, and the use of what matched: the
+    // rule points into an array a concurrent reload frees.
+    tf_rules_lock();
     char *after = tf_apply_redirect(before);
     const char *effective = after ? after : before;
     const tf_headerrule *hr = match_headers(effective);
-    if (!after && !hr) { free(before); return 0; }
+    if (!after && !hr) { tf_rules_unlock(); free(before); return 0; }
 
     if (after) {
         CFStringRef s = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
@@ -179,6 +184,7 @@ static int apply_rules(void *m) {
         tf_log("rewrite %s -> %s", before, after);
     }
     if (hr) apply_header_rule(hr, m, (hdr_set)p_SetHeader);
+    tf_rules_unlock();
     free(before); free(after);
     return 1;
 }
@@ -224,6 +230,8 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
                                     (CFURLRef)url, (CFStringRef)version);
 
+    // Held across match and use, as in apply_rules: the rule points into an array a reload frees.
+    tf_rules_lock();
     char *after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
 
@@ -238,6 +246,7 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
 
     void *msg = p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, use, (CFStringRef)version);
     if (msg && hr) apply_header_rule(hr, msg, (hdr_set)p_MsgSetHeader);
+    tf_rules_unlock();
 
     if (nu) CFRelease(nu);
     if (ns) CFRelease(ns);
@@ -276,9 +285,11 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
     if (url) CFRelease(url);
     if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
 
+    tf_rules_lock();                     // the rule is read below, still under the lock
     char *after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
     int ours = (hr && rule_sets_header(hr, hn));
+    tf_rules_unlock();
     if (ours) tf_log("header %s kept from rule, caller overruled", hn);
     free(hn); free(before); free(after);
 

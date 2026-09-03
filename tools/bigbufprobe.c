@@ -68,7 +68,8 @@ int main(int argc, char **argv) {
     if (fd < 0 || connect(fd, res->ai_addr, res->ai_addrlen)) { printf("FAIL: connect\n"); return 1; }
     freeaddrinfo(res);
 
-    SSLContextRef ctx = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
+    SSLContextRef ctx = NULL;
+    SSLNewContext(false, &ctx);
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
     SSLSetIOFuncs(ctx, sock_read, sock_write);
     SSLSetConnection(ctx, &fd);
@@ -107,7 +108,7 @@ int main(int argc, char **argv) {
     int ok = wok && rok;
 
     SSLClose(ctx);
-    CFRelease(ctx);
+    SSLDisposeContext(ctx);   // pairs with SSLNewContext, not CFRelease
     close(fd);
     free(buf);
     printf(ok ? "PASS\n" : "FAIL\n");

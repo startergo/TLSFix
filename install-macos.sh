@@ -91,7 +91,17 @@ install)
 uninstall)
   [ -e "$BACKUP" ] || { echo "not installed"; exit 1; }
   ln "$BACKUP" "$SEC.restore"; mv -f "$SEC.restore" "$SEC"; rm -f "$BACKUP"
-  rm -rf "$LIBDIR"
+  # The rule files are the admin's, not the package's: headers.txt and redirects.txt are
+  # edited in place and a reinstall seeds defaults only where a file is missing, so deleting
+  # them here would quietly revert that tuning on an uninstall/reinstall cycle. Remove what
+  # the package owns; keep the config directory when it holds anything, and the directories
+  # above it only when they are empty.
+  rm -f "$DYLIB" "$ENGINE" "$LIBDIR/insert_dylib" "$LIBDIR/aquatransport.sh" "$LIBDIR/uninstall.sh"
+  rmdir "$CONFDIR" 2>/dev/null || true
+  rmdir "$LIBDIR" 2>/dev/null || true
   echo "Uninstalled. Restart your computer."
+  if [ -d "$CONFDIR" ]; then
+    echo "Rule files kept at $CONFDIR; delete that directory to discard them."
+  fi
   ;;
 esac

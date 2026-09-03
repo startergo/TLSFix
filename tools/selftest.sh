@@ -46,7 +46,7 @@ if LC_ALL=C grep -q -a -F "$T/aquatransport.dylib" "$SECBIN" 2>/dev/null ||
     exit 1
 fi
 [ -x "$PROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$PROBE" "$DIR/tools/httpsprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$PROBE" "$DIR/tools/httpsprobe.c"
 [ -x "$URLPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 \
     -framework Foundation -o "$URLPROBE" "$DIR/tools/urlprobe.m"
 [ -x "$ASYNCPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 \
@@ -56,9 +56,9 @@ fi
 [ -x "$POOLPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 \
     -framework Foundation -o "$POOLPROBE" "$DIR/tools/poolprobe.m"
 [ -x "$MULTIPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$MULTIPROBE" "$DIR/tools/multiprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$MULTIPROBE" "$DIR/tools/multiprobe.c"
 [ -x "$UPLOADPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$UPLOADPROBE" "$DIR/tools/uploadprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$UPLOADPROBE" "$DIR/tools/uploadprobe.c"
 # x86_64 only: the >INT_MAX buffer it passes needs a 64-bit size_t to be a distinct case.
 [ -x "$BIGBUFPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework Security -o "$BIGBUFPROBE" "$DIR/tools/bigbufprobe.c"
@@ -315,12 +315,33 @@ if "$DIR/tools/mtlstest/make.sh" >/dev/null 2>&1; then
     "$MTLSSRV" "$port" "$W/server.crt" "$W/server.key" "$W/ca.crt" > "$out" 2>/dev/null &
     srvpid=$!
     # Wait for the port rather than sleeping: the server prints LISTENING once it is accepting.
-    for _ in $(seq 1 50); do grep -q LISTENING "$out" && break; sleep 0.1; done
+    i=0; while [ $i -lt 50 ]; do grep -q LISTENING "$out" && break; sleep 0.1; i=$((i+1)); done
     run "$MTLSPROBE" 127.0.0.1 "$port" "$W/client$bits.p12" test123 > /dev/null 2>&1
     wait $srvpid 2>/dev/null
-    check "RSA-$bits client certificate reaches the server" "CLIENT_CERT" "$(grep CLIENT "$out")"
+    # Anchored to the whole word: NO_CLIENT_CERT contains CLIENT_CERT, so a substring match
+    # would pass on exactly the failure the case exists to catch.
+    check "RSA-$bits client certificate reaches the server" "^CLIENT_CERT " "$(grep CLIENT "$out")"
     rm -f "$out"
     port=$((port+1))
+    if [ "$bits" = 2048 ]; then
+      # The on-demand identity flow: no certificate up front, the handshake pauses with
+      # errSSLClientCertRequested, and SSLSetCertificate answers the pause -- the exact
+      # sequence its contract names. BreakOnServerAuth is set too, so both breaks are in play
+      # and the ordering is exercised: the pause the identity answers must be -9842, not a
+      # repeat of the -9841 the probe already handled.
+      out="$DIR/build/mtlssrv-late.out"
+      : > "$out"
+      "$MTLSSRV" "$port" "$W/server.crt" "$W/server.key" "$W/ca.crt" > "$out" 2>/dev/null &
+      srvpid=$!
+      i=0; while [ $i -lt 50 ]; do grep -q LISTENING "$out" && break; sleep 0.1; i=$((i+1)); done
+      lateout=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" \
+                "$MTLSPROBE" 127.0.0.1 "$port" "$W/client2048.p12" test123 late 2>&1)
+      wait $srvpid 2>/dev/null
+      check "identity supplied at the cert-request break reaches the server" "^CLIENT_CERT " "$(grep CLIENT "$out")"
+      check "engine pauses with -9842 before the identity is set" "cert request break" "$lateout"
+      rm -f "$out"
+      port=$((port+1))
+    fi
   done
   rm -rf "$W"
 else

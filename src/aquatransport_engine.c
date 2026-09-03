@@ -442,24 +442,40 @@ static int rsa_seckey_priv_enc(int flen, const unsigned char *from, unsigned cha
     return (int)tlen;
 }
 
-void capture_identity(Shadow *s, CFArrayRef certRefs) {
-    if (!certRefs || CFArrayGetCount(certRefs) < 1) { s->clientBypass = 1; return; }
+// Drops whatever identity the shadow holds. The last SSLSetCertificate wins, as it does on
+// stock: a caller whose latest call names nothing -- or something this engine cannot carry --
+// must be answered with no certificate, not with the identity an earlier call left behind.
+// Clearing first, rather than only on the paths that install something, is also what keeps a
+// repeated call from leaking the previous identity's references.
+static void identity_clear(Shadow *s) {
+    if (s->clientX509)  { X509_free(s->clientX509);                       s->clientX509 = NULL; }
+    if (s->clientChain) { sk_X509_pop_free(s->clientChain, X509_free);    s->clientChain = NULL; }
+    if (s->clientKey)   { CFRelease(s->clientKey);                         s->clientKey = NULL; }
+}
+
+// mayBypass says whether an identity this engine cannot carry may hand the whole connection
+// to the system stack. Before the handshake it may, and does. At the cert-request pause it
+// must not: the handshake is already ours and half-consumed on the socket, and mid-stream is
+// no place to switch stacks -- the resume then sends no certificate and the server judges.
+void capture_identity(Shadow *s, CFArrayRef certRefs, int mayBypass) {
+    identity_clear(s);
+    if (!certRefs || CFArrayGetCount(certRefs) < 1) { if (mayBypass) s->clientBypass = 1; return; }
     CFTypeRef first = CFArrayGetValueAtIndex(certRefs, 0);
-    if (!first || CFGetTypeID(first) != SecIdentityGetTypeID()) { s->clientBypass = 1; return; }
+    if (!first || CFGetTypeID(first) != SecIdentityGetTypeID()) { if (mayBypass) s->clientBypass = 1; return; }
     SecCertificateRef leaf = NULL; SecKeyRef key = NULL;
     if (SecIdentityCopyCertificate((SecIdentityRef)first, &leaf) != errSecSuccess || !leaf ||
         SecIdentityCopyPrivateKey((SecIdentityRef)first, &key) != errSecSuccess || !key) {
-        if (leaf) CFRelease(leaf); if (key) CFRelease(key); s->clientBypass = 1; return;
+        if (leaf) CFRelease(leaf); if (key) CFRelease(key); if (mayBypass) s->clientBypass = 1; return;
     }
     X509 *x = NULL;
     CFDataRef d = SecCertificateCopyData(leaf);
     if (d) { const unsigned char *p = CFDataGetBytePtr(d); x = d2i_X509(NULL, &p, CFDataGetLength(d)); CFRelease(d); }
     CFRelease(leaf);
-    if (!x) { CFRelease(key); s->clientBypass = 1; return; }
+    if (!x) { CFRelease(key); if (mayBypass) s->clientBypass = 1; return; }
     EVP_PKEY *pub = X509_get_pubkey(x);
     int isRSA = (pub && EVP_PKEY_base_id(pub) == EVP_PKEY_RSA);
     if (pub) EVP_PKEY_free(pub);
-    if (!isRSA) { X509_free(x); CFRelease(key); s->clientBypass = 1; return; }   // non-RSA -> system stack
+    if (!isRSA) { X509_free(x); CFRelease(key); if (mayBypass) s->clientBypass = 1; return; }   // non-RSA -> system stack
     STACK_OF(X509) *chain = NULL;
     for (CFIndex i = 1, n = CFArrayGetCount(certRefs); i < n; i++) {
         SecCertificateRef ic = (SecCertificateRef)CFArrayGetValueAtIndex(certRefs, i);
@@ -525,7 +541,17 @@ static int sec_cb(const SSL *ssl, const SSL_CTX *ctx, int op, int bits, int nid,
 // so the pinning pause could not be expressed through it.
 static int client_cert_cb(SSL *ssl, X509 **px509, EVP_PKEY **ppkey) {
     Shadow *s = (Shadow *)SSL_get_ex_data(ssl, gSslExIdx);
-    if (!s || !s->clientX509) return 0;          // no identity -> send no certificate
+    if (!s) return 0;
+    // Being called at all is a fact worth recording: the callback fires exactly when the
+    // server's CertificateRequest arrives. Whether an identity is installed is a different
+    // question, and SSLGetClientCertificateState answers the first one.
+    s->certReqSeen = 1;
+    // The cert-request break suspends whatever identity is installed: stock pauses with
+    // errSSLClientCertRequested whenever the server asks and the option is set, and the
+    // caller is entitled to choose an identity only then. Which break the resulting
+    // suspension is reported as is decided in my_SSLHandshake -- this only says "pause".
+    if (s->breakCertReq && !s->certApproved) return -1;
+    if (!s->clientX509) return 0;                // no identity -> send no certificate
     if (s->breakAuth && !s->approved) return -1;
     EVP_PKEY *certpub = X509_get_pubkey(s->clientX509);
     if (!certpub) return 0;

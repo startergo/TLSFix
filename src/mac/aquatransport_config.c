@@ -284,6 +284,11 @@ static int read_blocks(const char *name, block **out, time_t *mtime) {
 
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 
+// Held by the caller across a rule lookup and everything done with the result, because a
+// reload frees the array the result points into; see the contract note in the header.
+void tf_rules_lock(void)   { pthread_mutex_lock(&gLock); }
+void tf_rules_unlock(void) { pthread_mutex_unlock(&gLock); }
+
 static tf_redirect *gRed = NULL; static int gNRed = 0; static time_t gRedMtime = 0; static int gRedLoaded = 0;
 static tf_headerrule *gHdr = NULL; static int gNHdr = 0; static time_t gHdrMtime = 0; static int gHdrLoaded = 0;
 static time_t gRedCheck = 0, gHdrCheck = 0;
@@ -295,8 +300,9 @@ static int stat_mtime(const char *name, time_t *t) {
     *t = st.st_mtime; return 1;
 }
 
+// Both lookups expect tf_rules_lock held: the arrays they return are freed by a reload, so
+// the caller has to be inside the same critical section it will use them in.
 int tf_redirects(const tf_redirect **out) {
-    pthread_mutex_lock(&gLock);
     time_t m = 0;
     int present = (!gRedLoaded || recheck_due(&gRedCheck)) ? stat_mtime("redirects.txt", &m) : -1;
     if (present < 0) { /* checked within the last second; use what is loaded */ }
@@ -322,12 +328,10 @@ int tf_redirects(const tf_redirect **out) {
     }
     *out = gRed;
     int n = gNRed;
-    pthread_mutex_unlock(&gLock);
     return n;
 }
 
 int tf_headerrules(const tf_headerrule **out) {
-    pthread_mutex_lock(&gLock);
     time_t m = 0;
     int present = (!gHdrLoaded || recheck_due(&gHdrCheck)) ? stat_mtime("headers.txt", &m) : -1;
     if (present < 0) { /* checked within the last second; use what is loaded */ }
@@ -360,7 +364,6 @@ int tf_headerrules(const tf_headerrule **out) {
     }
     *out = gHdr;
     int n = gNHdr;
-    pthread_mutex_unlock(&gLock);
     return n;
 }
 
