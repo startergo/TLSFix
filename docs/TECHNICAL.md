@@ -49,10 +49,9 @@ sudo ./install-macos.sh uninstall  # restore Security.framework, then remove the
 
 | path | contents |
 | --- | --- |
-| `/usr/share/aquatransport/` | `aquatransport.dylib` (loader), `aquatransport_engine.dylib`, `flags.txt`, `headers.txt`, `redirects.txt`, `disabled-processes.txt` |
-| `/Library/AquaTransport/` | `insert_dylib`, `aquatransport.sh`, `uninstall.sh` — placed by the installer package, run by root |
+| `/usr/share/aquatransport/` | `aquatransport.dylib` (loader), `aquatransport_engine.dylib`, `flags.txt`, `headers.txt`, `redirects.txt`, `disabled.txt`, and the root-only `insert_dylib`, `aquatransport.sh`, `uninstall.sh` |
 
-The split follows from who reads what. A patched process makes both of its reads itself — dyld
+The directory is `/usr/share` because of who reads what. A patched process makes both of its reads itself — dyld
 maps the dylib at launch, and the library reads the rule files at runtime — so both happen under
 *that process's* sandbox, and `/System/Library/Sandbox/Profiles/system.sb`, imported by every
 sandboxed process, grants `file-read*` only for world-readable files under `/System`,
@@ -73,13 +72,14 @@ Sandbox: webpushd(715) deny file-read-data /usr/share/aquatransport/aquatranspor
 ```
 
 That silence is what makes the location load-bearing rather than a matter of taste: a path
-outside the grant leaves every sandboxed application unfixed and says nothing. `/Library`
-carries no grant at all, which is why nothing a sandboxed process needs is kept there —
-`insert_dylib` and the installer script go there because only root ever runs them.
+outside the grant leaves every sandboxed application unfixed and says nothing. `insert_dylib`
+and the installer scripts sit in the same directory, though nothing sandboxed reads them: only
+root runs them, to add and remove the load command.
 
-The `(file-mode #o0004)` clause is why the installer sets 0644 on these files and 0755 on the
-directory: a stricter mode is readable to root alone, and every sandboxed process goes
-unpatched. Not every sandboxed process is this restricted — `application.sb`, which backs the
+The `(file-mode #o0004)` clause is why the installer sets the dylib and rule files 0644 and the
+directory 0755: a stricter mode is readable to root alone, and every sandboxed process goes
+unpatched. The tools are 0755 rather than 0644, because root runs them as programs, but 0755 is
+world-readable too, so it meets the same clause. Not every sandboxed process is this restricted — `application.sb`, which backs the
 app sandbox, carries a blanket `(allow file-read* (subpath "/Library"))` — but `/usr/share` is
 what the whole range of them share.
 
@@ -200,7 +200,7 @@ immediately; a reboot covers everything.
 The installed library is two images. `aquatransport.dylib` is a ~25 KB loader that links
 nothing but libc, and it is the only thing Security.framework's load command names.
 `aquatransport_engine.dylib` is everything else — the hooks and OpenSSL — and the loader
-`dlopen()`s it, from beside itself, only for processes not named in `disabled-processes.txt`.
+`dlopen()`s it, from beside itself, only for processes not named in `disabled.txt`.
 
 The split exists because a load command is unconditional. Whatever Security names is mapped
 into every process on the system, and a process hosting third-party code cannot always afford
@@ -211,7 +211,7 @@ which is what a gate inside the engine would have been. The only fix available i
 mapped, and the only way to be conditionally not-mapped behind an unconditional load command is
 for the thing named by it to be a stub that loads the rest itself.
 
-`disabled-processes.txt` holds one executable name per line, matched exactly against
+`disabled.txt` holds one executable name per line, matched exactly against
 `getprogname()`; `#` begins a comment. An excluded process gets the system TLS stack and
 nothing else on the Mac is affected. The shipped default lists
 `com.apple.WebKit.WebContent`, Safari's rendering process, which costs nothing because WebKit

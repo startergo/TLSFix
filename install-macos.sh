@@ -13,17 +13,19 @@
 # loads Security, loginwindow included. If that happens, boot from another volume or into
 # single-user mode (Cmd-S, then `mount -uw /`) and put the original back:
 #
-#   ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatransport-original \
+#   ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.original \
 #         /System/Library/Frameworks/Security.framework/Versions/A/Security
 
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$DIR/build/stage/usr/share/aquatransport"
+DEFAULTS="$DIR/packaging/Default Configuration"
 LIBDIR=/usr/share/aquatransport
+CONFDIR="$LIBDIR/config"
 DYLIB="$LIBDIR/aquatransport.dylib"
 ENGINE="$LIBDIR/aquatransport_engine.dylib"
 SEC="${AQ_SECURITY_PATH:-/System/Library/Frameworks/Security.framework/Versions/A/Security}"
-BACKUP="$SEC.aquatransport-original"
+BACKUP="$SEC.original"
 INSERT="${AQ_INSERT_DYLIB:-/usr/local/bin/insert_dylib}"
 
 case "${1:-}" in install|uninstall) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;; esac
@@ -37,21 +39,39 @@ install)
   # by rename rather than in-place write, so a load in progress never sees a partial file.
   # The engine goes first. Only the loader is named by a load command, so a window in which
   # the loader is present and the engine is not is a window of processes without TLS.
-  mkdir -p "$LIBDIR"
+  mkdir -p "$LIBDIR" "$CONFDIR"
   for lib in aquatransport_engine.dylib aquatransport.dylib; do
     [ -f "$SRC/$lib" ] &&
       { cp "$SRC/$lib" "$LIBDIR/$lib.new"; mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"; }
   done
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
-  for f in flags.txt headers.txt redirects.txt disabled-processes.txt; do [ -f "$LIBDIR/$f" ] || : > "$LIBDIR/$f"; done
+  # Seed each rule file from the shipped default when it is not already present, so a reinstall
+  # keeps a user's edits. flags.txt has no default and starts empty.
+  for f in headers.txt redirects.txt disabled.txt; do
+    [ -f "$CONFDIR/$f" ] || cp "$DEFAULTS/$f" "$CONFDIR/$f"
+  done
+  [ -f "$CONFDIR/flags.txt" ] || : > "$CONFDIR/flags.txt"
 
-  # 0755 on the directory and 0644 on the files is what system.sb requires: it grants
-  # file-read* under /usr/share only for world-readable files, and because the load command is
-  # weak, a sandboxed process that cannot read the library is left unpatched in silence rather
-  # than failing. root:wheel because the library loads into root daemons.
-  chown root:wheel "$LIBDIR" "$LIBDIR"/*
-  chmod 0755 "$LIBDIR"; chmod 0644 "$LIBDIR"/*
+  # Everything stays world-readable: system.sb grants file-read* under /usr/share only for
+  # world-readable files, and because the load command is weak, a sandboxed process that cannot
+  # read the library is left unpatched in silence rather than failing. The library directory is
+  # root:wheel because the library loads into root daemons.
+  chown root:wheel "$LIBDIR" "$DYLIB" "$ENGINE"
+  chmod 0755 "$LIBDIR"; chmod 0644 "$DYLIB" "$ENGINE"
+
+  # insert_dylib and the installer scripts are run as programs, not read as data, so they keep the
+  # execute bit. Still world-readable, which is all the /usr/share grant asks for.
+  for t in insert_dylib aquatransport.sh uninstall.sh; do
+    [ -e "$LIBDIR/$t" ] && { chown root:wheel "$LIBDIR/$t"; chmod 0755 "$LIBDIR/$t"; }
+  done
+
+  # The rule files sit in their own group-writable directory so an admin can edit them in a GUI
+  # editor -- whose save replaces the file, needing write on the directory -- without write to the
+  # directory that holds the dylibs. root:admin 0775 on the directory and 0664 on the files, still
+  # world-readable for the sandbox; the subpath grant reaches this depth under /usr/share.
+  chown root:admin "$CONFDIR"; chmod 0775 "$CONFDIR"
+  chown root:admin "$CONFDIR"/*; chmod 0664 "$CONFDIR"/*
 
   # --strip-codesig: editing the file invalidates Security's signature, and an invalid signature
   # is far worse than none. The kernel validates the pages of a signed library as a signed
@@ -71,7 +91,7 @@ install)
 uninstall)
   [ -e "$BACKUP" ] || { echo "not installed"; exit 1; }
   ln "$BACKUP" "$SEC.restore"; mv -f "$SEC.restore" "$SEC"; rm -f "$BACKUP"
-  rm -rf "$LIBDIR" /Library/AquaTransport
+  rm -rf "$LIBDIR"
   echo "Uninstalled. Restart your computer."
   ;;
 esac

@@ -1,0 +1,12 @@
+Old versions of Mac OS X have trouble talking to the modern internet. AquaTransport can help.
+
+AquaTransport modifies how apps on your Mac talk to servers on the internet. It will replace outdated TLS protocols with modern ones, and redirect connections to defunct web addresses with newer, working locations. It won't fix everything, but it will fix a lot of little things. For example, AquaTransport can fix problems with:
+
+¥ Logging into iCloud.
+¥ Viewing web pages in Safari.
+¥ Connecting to email providers in Mail.
+¥ Subscribing to calendars in Calendar/iCal.
+¥ Loading Help Center pages in various apps.
+¥ Reading Wikipedia in the Dictionary app. (OS X 10.7+)
+
+You will be guided through the steps necessary to install AquaTransport.

@@ -1,6 +1,6 @@
 // Shared configuration for both AquaTransport subsystems on macOS.
 //
-// Files live in /usr/share/aquatransport (override with AQUATRANSPORT_DIR for development).
+// Files live in /usr/share/aquatransport/config (override with AQUATRANSPORT_DIR for development).
 // Sandboxed targets read these files themselves, and system.sb confines them to a short list
 // of readable directories that /usr/share is on -- see the note in aquatransport_config.c.
 //
@@ -11,7 +11,7 @@
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)
 //
-// disabled-processes.txt holds one executable name per line, matched exactly against
+// disabled.txt holds one executable name per line, matched exactly against
 // getprogname(). A listed process gets nothing installed in it -- no hooks, no gate -- so it
 // keeps the system TLS stack and every other process is unaffected. Intended for processes
 // hosting third-party code that inspects its own address space and will not tolerate having

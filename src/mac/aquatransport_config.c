@@ -21,9 +21,14 @@
 //                       (require-any ... (subpath "/usr/share") ...)))
 //
 // A deny-default daemon such as WebKit's webpushd reads nothing outside that set, so the rule
-// files sit inside it to apply everywhere. The installers keep them 0644 to satisfy the
-// file-mode clause.
-#define TF_DEFAULT_DIR "/usr/share/aquatransport"
+// files sit inside it to apply everywhere. They stay world-readable to satisfy the file-mode
+// clause; the subpath match reaches any depth beneath /usr/share.
+//
+// The files sit in their own "config" subdirectory, apart from the library that reads them, so
+// that directory can be group-writable -- letting an admin edit a rule file in a GUI editor,
+// whose save replaces the file and so needs write on the directory -- without granting write to
+// the directory that holds the dylibs.
+#define TF_DEFAULT_DIR "/usr/share/aquatransport/config"
 
 static int stat_mtime(const char *name, time_t *t);
 
@@ -370,10 +375,7 @@ int tf_name_listed(const char *file, const char *name) {
     while (fgets(buf, sizeof buf, f)) {
         size_t l = strlen(buf);
         while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t')) buf[--l] = 0;
-        // '#' comments are accepted here and nowhere else: this is the one rule file a user
-        // writes from scratch rather than by copying a block, so it has to be able to say
-        // what a line is for. The block files are positional and a stray line changes meaning.
-        if (l == 0 || buf[0] == '#') continue;
+        if (l == 0) continue;
         if (!strcmp(buf, name)) { hit = 1; break; }
     }
     fclose(f);

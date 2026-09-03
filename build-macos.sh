@@ -109,23 +109,16 @@ for a in "${ARCHS[@]}"; do
   echo "    $a ok"
 done
 
-# The stage mirrors the installed layout, so it doubles as a pkgbuild root.
-#
-#   usr/share/aquatransport/   the dylib and the rule files -- everything a patched process
-#                              reads for itself. /usr/share is one of the few directories a
-#                              sandboxed process may read, which is what puts them there:
-#                              see src/mac/aquatransport_config.c.
-#   Library/AquaTransport/     insert_dylib and the installer script, which root runs to add
-#                              the load command. Nothing sandboxed reads them, so they are not
-#                              bound by the /usr/share grant above.
+# The stage holds the build's output -- the loader and engine dylibs -- alongside the rule-file
+# fixtures selftest.sh reads through AQUATRANSPORT_DIR. install-macos.sh copies the dylibs from
+# here; the installer package is assembled separately under packaging/.
 ST="$BUILD/stage/usr/share/aquatransport"
-STOOL="$BUILD/stage/Library/AquaTransport"
 
-# Clear the whole stage tree first, keeping only the rule files. Because the stage is a pkgbuild
-# root, anything left at a path this build no longer writes is still packaged and installed, so
-# a binary from a retired layout would ship alongside the real one. Clearing everything the
-# build regenerates -- rather than a list of names it knows about -- is what keeps that true
-# through a rename: a name dropped from the list is exactly the file that would survive.
+# Clear the regenerated files first, keeping only the rule files. Anything left at a path this
+# build no longer writes would linger in the stage install-macos.sh copies from, so a binary
+# from a retired layout could ship alongside the real one. Clearing everything the build
+# regenerates -- rather than a list of names it knows about -- is what keeps that true through a
+# rename: a name dropped from the list is exactly the file that would survive.
 #
 # The rule files are the exception: they are hand-maintained fixtures that selftest.sh reads
 # through AQUATRANSPORT_DIR, and nothing regenerates them.
@@ -133,7 +126,7 @@ if [ -d "$BUILD/stage" ]; then
   find "$BUILD/stage" -type f ! -name '*.txt' -delete
 fi
 
-mkdir -p "$ST" "$STOOL"
+mkdir -p "$ST"
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
@@ -170,24 +163,3 @@ ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print 
 lsz=$(stat -f%z "$ST/aquatransport.dylib")
 [ "$lsz" -lt 200000 ] || { echo "FATAL: loader is $lsz bytes; it is meant to be a stub"; exit 1; }
 echo "built: $ST/aquatransport.dylib (loader) + $ST/aquatransport_engine.dylib (engine)"
-
-# ---- 4. the package root's root-only tools ----------------------------------
-# A package payload has to carry everything the install needs, and the install needs a patcher:
-# insert_dylib writes the load command into Security.framework, and aquatransport.sh drives it
-# from the postinstall. Both are staged under Library/AquaTransport, and both are removed again
-# by the uninstaller.
-#
-# insert_dylib is not built here and not vendored -- point AQ_INSERT_DYLIB at a build of it, or
-# drop one at deps/insert_dylib. Without it the dylib above is still complete and usable by hand;
-# it is the package root that is not.
-cp "$DIR/install-macos.sh"      "$STOOL/aquatransport.sh"; chmod 0755 "$STOOL/aquatransport.sh"
-cp "$DIR/packaging/uninstall.sh" "$STOOL/uninstall.sh";    chmod 0755 "$STOOL/uninstall.sh"
-
-INS="${AQ_INSERT_DYLIB:-$DIR/deps/insert_dylib}"
-if [ -x "$INS" ]; then
-  cp "$INS" "$STOOL/insert_dylib"; chmod 0755 "$STOOL/insert_dylib"
-  echo "built: $STOOL (insert_dylib from $INS)"
-else
-  echo "NOTE: no insert_dylib at $INS, so $STOOL is not a complete package root."
-  echo "      Set AQ_INSERT_DYLIB or put a build at deps/insert_dylib to package."
-fi

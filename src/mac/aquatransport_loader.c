@@ -21,9 +21,11 @@
 #include <stdint.h>
 #include <dlfcn.h>
 
-#define AQ_DEFAULT_DIR "/usr/share/aquatransport"
+// The rule files (AQ_DISABLED and flags.txt) live in the config subdirectory; the engine does
+// not -- it is found beside this file (see aq_engine_path), not under this directory.
+#define AQ_DEFAULT_DIR "/usr/share/aquatransport/config"
 #define AQ_ENGINE      "aquatransport_engine.dylib"
-#define AQ_DISABLED    "disabled-processes.txt"
+#define AQ_DISABLED    "disabled.txt"
 
 static const char *aq_dir(void) {
     const char *e = getenv("AQUATRANSPORT_DIR");
@@ -45,7 +47,7 @@ static int aq_listed(const char *dir, const char *file, const char *name) {
         size_t l = strlen(buf);
         while (l && (buf[l-1] == '\n' || buf[l-1] == '\r' || buf[l-1] == ' ' || buf[l-1] == '\t'))
             buf[--l] = 0;
-        if (l == 0 || buf[0] == '#') continue;
+        if (l == 0) continue;
         if (!strcmp(buf, name)) { hit = 1; break; }
     }
     fclose(f);

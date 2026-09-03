@@ -57,7 +57,7 @@ static const char *kDeny[] = {
 
 // Whether this process may be touched at all: every process except the trust daemons on the
 // deny list, whose own traffic routing through our verify path would be a cycle, and any
-// process the user has named in disabled-processes.txt.
+// process the user has named in disabled.txt.
 //
 // The file is a separate mechanism from kDeny above, not an extension of it. kDeny encodes a
 // structural cycle in our own design. The file exists because a process can host third-party
@@ -69,7 +69,7 @@ static int process_eligible(void) {
     const char *pn = getprogname();
     if (!pn) return 1;
     for (int i = 0; kDeny[i]; i++) if (!strcmp(pn, kDeny[i])) return 0;
-    if (tf_name_listed("disabled-processes.txt", pn)) return 0;
+    if (tf_name_listed("disabled.txt", pn)) return 0;
     return 1;
 }
 
