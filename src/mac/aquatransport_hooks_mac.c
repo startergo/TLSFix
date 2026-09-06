@@ -172,19 +172,21 @@ static OSStatus my_SSLSetConnection(SSLContextRef c, SSLConnectionRef conn) {
 }
 
 static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_t len) {
-    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, len);
     // A single trailing dot is the DNS root label, and callers do send it: iTunes sets
     // "s.mzstatic.com." as the peer domain name. TLS wants the name without it -- an SNI
     // carrying the dot makes CDNs answer with their default site's certificate
     // (s.mzstatic.com serves CN=images.apple.com for the dotted name), and the handshake
     // then dies in hostname validation against a cert that was never meant for this host.
     // Strip exactly one dot ("a.b.." stays malformed rather than being silently
-    // reinterpreted), and strip it for both stacks: Secure Transport keeps its own copy of
-    // the name for the SNI it sends and the hostname match it runs, so a context that
-    // falls back to the stock path -- engine bypassed, server side, an init failure --
-    // must not go on carrying the dotted one. The dotless name is also what SNI, the
-    // trust policy, the session cache and the debug log all key on.
+    // reinterpreted), and strip it in every path, this one included: Secure Transport
+    // keeps its own copy of the name for the SNI it sends and the hostname match it runs,
+    // so a context that runs on the stock stack -- engine bypassed, server side, an init
+    // failure, or the engine dynamically gated off below -- must not go on carrying the
+    // dotted one. (The deny-listed processes never install hooks at all and are untouched
+    // by any of this.) The dotless name is also what SNI, the trust policy, the session
+    // cache and the debug log all key on.
     size_t nlen = (name && len > 1 && name[len-1] == '.') ? len - 1 : len;
+    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, nlen);
     OSStatus r = o_SSLSetPeerDomainName(c, name, nlen);
     // Recorded only when the stock call accepted it. A set the stock stack refused must leave
     // the shadow as it was: re-initialising on a refused set would discard a handshake already

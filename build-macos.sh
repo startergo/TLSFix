@@ -33,20 +33,26 @@ TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 # The choice is validated, not trusted: SDKROOT is often set by Xcode build environments to
 # the current SDK, which does not carry i386, and a nonexistent directory would otherwise
 # surface later as an opaque clang error. An unusable setting falls back to the known-good
-# location, and only when that is unusable too does the build stop. The probe scrubs the
-# environment because lipo itself honours SDKROOT -- a stale exported value makes lipo
-# error out looking for tooling inside it, which would fail the check on a perfectly good
-# SDK. For the same reason SDKROOT is dropped once the choice is made: the build's later
-# lipo/clang calls must not be steered by it either.
-sdk_usable() { [ -d "$1" ] && env -u SDKROOT -u DEVELOPER_DIR /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib" 2>/dev/null | grep -qw i386; }
+# location, and only when that is unusable too does the build stop. The probe requires both
+# of the architectures the build links -- an i386-only SDK would pass an i386-only check and
+# then fail the x86_64 link -- and it scrubs the environment because lipo itself honours
+# SDKROOT: a stale exported value makes lipo error out looking for tooling inside it, which
+# would fail the check on a perfectly good SDK. For the same reason SDKROOT is dropped once
+# the choice is made: the build's later lipo/clang calls must not be steered by it either.
+sdk_usable() {
+  [ -d "$1" ] || return 1
+  local archs
+  archs="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib" 2>/dev/null)" || return 1
+  grep -qw x86_64 <<<"$archs" && grep -qw i386 <<<"$archs"
+}
 
 SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-}}"
 [ -z "$SDK" ] && [ -d "$HOME/Downloads/MacOSX10.6.sdk" ] && SDK="$HOME/Downloads/MacOSX10.6.sdk"
 if ! sdk_usable "$SDK"; then
-  [ -n "$SDK" ] && echo "SDK has no i386 libSystem, not using it: $SDK" >&2
+  [ -n "$SDK" ] && echo "SDK libSystem lacks i386 or x86_64, not using it: $SDK" >&2
   SDK="$HOME/Downloads/MacOSX10.6.sdk"
 fi
-sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
+sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386+x86_64 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
 unset SDKROOT DEVELOPER_DIR
 
 [ -f "$TARBALL" ] || { echo "missing vendored dependency: $TARBALL"; exit 1; }
