@@ -72,6 +72,19 @@ run_root chown -R root:wheel "$W/scripts"
 (cd "$W/scripts" && sudo pax -w -x cpio . > "$W/scripts.cpio")
 gzip -9 < "$W/scripts.cpio" > "$W/x/AquaTransport.pkg/Scripts"
 
+# Modern Roots: carry the repo's current postinstall into the distribution. That script is
+# the component's entire behaviour -- its payload is empty, and the pems it installs ride
+# beside it in the Scripts archive -- so an edit that never gets copied here would ship the
+# old rules silently. Layout and modes mirror the Packages-app original (pems 0755).
+mkdir -p "$W/mr/trust" "$W/mr/distrust"
+cp "$REPO/packaging/Modern Roots/Root Certificates Post Install.sh" "$W/mr/postinstall"
+cp "$REPO/packaging/Modern Roots/trust/"*.pem "$W/mr/trust/"
+cp "$REPO/packaging/Modern Roots/distrust/"*.pem "$W/mr/distrust/"
+chmod 0755 "$W/mr/postinstall" "$W/mr/trust/"*.pem "$W/mr/distrust/"*.pem
+run_root chown -R root:wheel "$W/mr"
+(cd "$W/mr" && sudo pax -w -x cpio . > "$W/mr.cpio")
+gzip -9 < "$W/mr.cpio" > "$W/x/Modern_Root_Certificates.pkg/Scripts"
+
 # PackageInfo: add the preinstall reference, refresh the size estimate. The newline in the
 # replacement is a literal backslash-line-continuation, which is how BSD sed spells it.
 sed -e 's|<postinstall file="./postinstall"/>|<postinstall file="./postinstall"/>\

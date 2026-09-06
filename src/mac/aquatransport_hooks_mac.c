@@ -182,6 +182,15 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
     if (s) {
         if (name && len) {
             size_t n = len < 255 ? len : 255; memcpy(s->host, name, n); s->host[n] = 0;
+            // A single trailing dot is the DNS root label, and callers do send it: iTunes
+            // sets "s.mzstatic.com." as the peer domain name. TLS wants the name without it --
+            // an SNI carrying the dot makes CDNs answer with their default site's certificate
+            // (s.mzstatic.com serves CN=images.apple.com for the dotted name), and the
+            // handshake then dies in hostname validation against a cert that was never meant
+            // for this host. Strip exactly one dot: "a.b.." stays malformed rather than being
+            // silently reinterpreted, and the dotless name is what SNI, the trust policy,
+            // the session cache and the debug log all key on.
+            if (n > 1 && s->host[n-1] == '.') s->host[--n] = 0;
             // late SNI -> re-init; the cached trust goes too, since a new handshake means a
             // new peer chain, and so does everything the write side was holding for the old one.
             if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
