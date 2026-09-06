@@ -23,6 +23,38 @@ LS_SRC="$BUILD/src/openssl-$OPENSSL_VERSION"
 LS_OUT="$BUILD/openssl"
 TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 
+# The i386 slice cannot link against the default SDK: its libSystem.tbd has no i386 members,
+# and the link dies on plain libc ("symbol(s) not found for architecture i386" -- _time,
+# _vfprintf, _vm_protect). A 10.6-era SDK supplies every slice the deployment target names,
+# so the dylib links name one explicitly; compilation keeps the default SDK's headers, which
+# sit above the deployment floor. AQUATRANSPORT_SDK overrides, then SDKROOT, then the usual
+# place the SDK is kept on the machines that build this.
+#
+# The choice is validated, not trusted: SDKROOT is often set by Xcode build environments to
+# the current SDK, which does not carry i386, and a nonexistent directory would otherwise
+# surface later as an opaque clang error. An unusable setting falls back to the known-good
+# location, and only when that is unusable too does the build stop. The probe requires both
+# of the architectures the build links -- an i386-only SDK would pass an i386-only check and
+# then fail the x86_64 link -- and it scrubs the environment because lipo itself honours
+# SDKROOT: a stale exported value makes lipo error out looking for tooling inside it, which
+# would fail the check on a perfectly good SDK. For the same reason SDKROOT is dropped once
+# the choice is made: the build's later lipo/clang calls must not be steered by it either.
+sdk_usable() {
+  [ -d "$1" ] || return 1
+  local archs
+  archs="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib" 2>/dev/null)" || return 1
+  grep -qw x86_64 <<<"$archs" && grep -qw i386 <<<"$archs"
+}
+
+SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-}}"
+[ -z "$SDK" ] && [ -d "$HOME/Downloads/MacOSX10.6.sdk" ] && SDK="$HOME/Downloads/MacOSX10.6.sdk"
+if ! sdk_usable "$SDK"; then
+  [ -n "$SDK" ] && echo "SDK libSystem lacks i386 or x86_64, not using it: $SDK" >&2
+  SDK="$HOME/Downloads/MacOSX10.6.sdk"
+fi
+sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386+x86_64 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
+unset SDKROOT DEVELOPER_DIR
+
 [ -f "$TARBALL" ] || { echo "missing vendored dependency: $TARBALL"; exit 1; }
 
 # ---- 1. OpenSSL (cached; delete build/openssl to force a rebuild) ----------
@@ -48,17 +80,25 @@ if [ ! -f "$LS_OUT/lib/libssl.a" ] || [ ! -f "$LS_OUT/lib/libcrypto.a" ]; then
       esac
       # --with-rand-seed=devrandom keeps the seeding off getentropy(), which is 10.12+ and
       # would bind lazily then kill the process on first use (see the import check below).
+      # AR/RANLIB are pinned to Apple's tools: a homebrew binutils install shadows /usr/bin/ar
+      # in PATH, and GNU ar writes archives with even-byte member padding that the Apple
+      # linker then rejects for 64-bit members ("64-bit mach-o member not 8-byte aligned").
       ( cd "$BUILD/ossl-$a" && perl "$LS_SRC/Configure" "$target" \
           no-shared no-tests no-docs no-apps no-legacy no-engine \
+          AR=/usr/bin/ar RANLIB=/usr/bin/ranlib \
           --with-rand-seed=devrandom \
           -mmacosx-version-min="$MIN" -O2 -fPIC $extra > configure.log 2>&1 )
       echo "    compile $a"
-      ( cd "$BUILD/ossl-$a" && make -j4 build_libs > build.log 2>&1 )
+      ( cd "$BUILD/ossl-$a" && make -j4 AR=/usr/bin/ar RANLIB=/usr/bin/ranlib build_libs > build.log 2>&1 )
     fi
   done
   mkdir -p "$LS_OUT/lib" "$LS_OUT/include"
   crypto=(); ssl=()
   for a in "${ARCHS[@]}"; do crypto+=("$BUILD/ossl-$a/libcrypto.a"); ssl+=("$BUILD/ossl-$a/libssl.a"); done
+  # lipo, not libtool: libtool -static merges the inputs' member lists and drops the
+  # second appearance of every same-named member (both architectures use identical .o
+  # names), leaving slices that are missing half their objects. lipo keeps each thin
+  # archive intact as a slice.
   lipo -create "${crypto[@]}" -output "$LS_OUT/lib/libcrypto.a"
   lipo -create "${ssl[@]}"    -output "$LS_OUT/lib/libssl.a"
   # Headers: the shipped tree plus the per-arch generated ones (opensslconf.h and friends).
@@ -89,10 +129,24 @@ for a in "${ARCHS[@]}"; do
     objs+=("$o")
   done
   out="$OBJDIR/aquatransport_engine-$a.dylib"
-  clang -arch "$a" -mmacosx-version-min="$MIN" -dynamiclib -o "$out" \
+  # Plain -framework, not -lazy_framework: against the 10.6 SDK's stubs the linker actually
+  # engages the lazy-load machinery, which wants __dyld_lazy_load -- a dyld feature the 10.6
+  # deployment target predates -- and the link dies. Function bindings are lazily resolved
+  # by default anyway, so nothing is lost. Nothing is lost off the 10.6 floor either: the
+  # current linker ignores -lazy_framework at EVERY deployment target from 10.6 through
+  # 15.0 (measured; it warns "deployment target version is too low" even for 15.0) -- the
+  # lazy-dylib feature only ever lived in a narrow 10.11-era toolchain/OS window, and dyld
+  # has since dropped it. This also matches the previously shipped engine exactly: the
+  # linker ignored -lazy_framework for it too and emitted plain load commands -- verified
+  # by dlopening both engines in a CoreFoundation-free process on 10.6 and diffing what
+  # dyld maps: identical sets. Making the engine resolve Sec*/CF* through dlsym instead
+  # would avoid mapping those frameworks until first use, but the loader only dlopens the
+  # engine at a process's first Secure Transport call, by which point CoreFoundation is
+  # present by construction, so the rework buys nothing observed.
+  clang -arch "$a" -mmacosx-version-min="$MIN" -isysroot "$SDK" -dynamiclib -o "$out" \
     -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
-    -Wl,-lazy_framework,Security -Wl,-lazy_framework,CoreFoundation \
+    -Wl,-framework,Security -Wl,-framework,CoreFoundation \
     -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
   slices+=("$out")
 
@@ -100,7 +154,7 @@ for a in "${ARCHS[@]}"; do
   # process on the system. It links nothing but libc: see the header of the source for why
   # the engine must not be reachable through a load command.
   lout="$OBJDIR/aquatransport-$a.dylib"
-  clang -arch "$a" -mmacosx-version-min="$MIN" -O2 -fPIC -fvisibility=hidden \
+  clang -arch "$a" -mmacosx-version-min="$MIN" -isysroot "$SDK" -O2 -fPIC -fvisibility=hidden \
     -Wall -Wno-deprecated-declarations -dynamiclib -o "$lout" \
     -install_name /usr/share/aquatransport/aquatransport.dylib \
     "$DIR/src/mac/aquatransport_loader.c" \

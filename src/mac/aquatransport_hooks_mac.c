@@ -172,16 +172,30 @@ static OSStatus my_SSLSetConnection(SSLContextRef c, SSLConnectionRef conn) {
 }
 
 static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_t len) {
-    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, len);
-    OSStatus r = o_SSLSetPeerDomainName(c, name, len);
+    // A single trailing dot is the DNS root label, and callers do send it: iTunes sets
+    // "s.mzstatic.com." as the peer domain name. TLS wants the name without it -- an SNI
+    // carrying the dot makes CDNs answer with their default site's certificate
+    // (s.mzstatic.com serves CN=images.apple.com for the dotted name), and the handshake
+    // then dies in hostname validation against a cert that was never meant for this host.
+    // Strip exactly one dot ("a.b.." stays malformed rather than being silently
+    // reinterpreted), and strip it in every path, this one included: Secure Transport
+    // keeps its own copy of the name for the SNI it sends and the hostname match it runs,
+    // so a context that runs on the stock stack -- engine bypassed, server side, an init
+    // failure, or the engine dynamically gated off below -- must not go on carrying the
+    // dotted one. (The deny-listed processes never install hooks at all and are untouched
+    // by any of this.) The dotless name is also what SNI, the trust policy, the session
+    // cache and the debug log all key on.
+    size_t nlen = (name && len > 1 && name[len-1] == '.') ? len - 1 : len;
+    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, nlen);
+    OSStatus r = o_SSLSetPeerDomainName(c, name, nlen);
     // Recorded only when the stock call accepted it. A set the stock stack refused must leave
     // the shadow as it was: re-initialising on a refused set would discard a handshake already
     // in progress on a socket that has consumed its bytes, and the retry could only misfire.
     if (r != noErr) return r;
     Shadow *s = sh_create(c);
     if (s) {
-        if (name && len) {
-            size_t n = len < 255 ? len : 255; memcpy(s->host, name, n); s->host[n] = 0;
+        if (name && nlen) {
+            size_t n = nlen < 255 ? nlen : 255; memcpy(s->host, name, n); s->host[n] = 0;
             // late SNI -> re-init; the cached trust goes too, since a new handshake means a
             // new peer chain, and so does everything the write side was holding for the old one.
             if (s->inited && s->state != -1) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = 0;
