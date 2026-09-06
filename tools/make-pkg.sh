@@ -86,7 +86,16 @@ cp "$W/PackageInfo.new" "$W/x/AquaTransport.pkg/PackageInfo"
 # one first, renamed into place, so no state ever sees a half-written pkg. The staging name
 # carries the pid: a fixed name is shared by concurrent rebuilds, and one run's rename can
 # then hand the other's still-writing cp the live pkg as its destination.
-(cd "$W/x" && xar -cf "$W/AquaTransport-new.pkg" Distribution AquaTransport.pkg Modern_Root_Certificates.pkg Resources)
+#
+# --compression none is load-bearing: xar's default re-compresses every file it stores, and
+# Payload/Scripts are already gzip (that is the pkg payload format), so the default leaves
+# them double-compressed in the heap. Leopard-era installers read those two entries raw and
+# gunzip them as the cpio's own layer; handed a second gzip stream there they fail with
+# BOMCopierFatalError "cpio read error: bad file format" (PKInstallErrorDomain 110). Apple's
+# own packaging tools always store Payload/Scripts as application/octet-stream -- the
+# Packages-app original this script replicates included, and 10.6 accepts the uncompressed
+# heap for Bom/PackageInfo too (verified on 10.6.8, single-variable against the default).
+(cd "$W/x" && xar -cf "$W/AquaTransport-new.pkg" --compression none Distribution AquaTransport.pkg Modern_Root_Certificates.pkg Resources)
 NEW="$OLDPKG.new.$$"
 cp "$W/AquaTransport-new.pkg" "$NEW"
 mv -f "$NEW" "$OLDPKG"
