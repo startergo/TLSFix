@@ -21,16 +21,20 @@ for cert in trust/*.pem
 do
 	fingerprint="$(openssl x509 -in "$cert" -noout -fingerprint -sha1 2>/dev/null | sed 's/^.*=//' | tr -d ':')"
 
-	if ! security find-certificate -a -Z \
-		/System/Library/Keychains/SystemRootCertificates.keychain \
-		/Library/Keychains/System.keychain 2>/dev/null | \
-		grep -Fq "SHA-1 hash: $fingerprint"
-	then
-		security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$cert"
-		# The system anchor set, not just an admin trust record -- piece 2 above. Failure is
-		# tolerated: on systems where this keychain is not importable the EV plist will not
-		# exist either, and piece 1 remains what carries ordinary chains.
+	in_keychain() { security find-certificate -a -Z "$1" 2>/dev/null | grep -Fq "SHA-1 hash: $fingerprint"; }
+
+	# The two keychains are checked independently. An upgrade from the earlier
+	# admin-only install has every root in System.keychain and none in the system
+	# anchor set, and one combined check would skip the import the upgrade needs --
+	# the exact state the first EV failures were debugged in.
+	if ! in_keychain /System/Library/Keychains/SystemRootCertificates.keychain; then
+		# The system anchor set (piece 2). Failure is tolerated: where this keychain
+		# is not importable the EV plist will not exist either, and piece 1 remains
+		# what carries ordinary chains.
 		security import "$cert" -k /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null || true
+	fi
+	if ! in_keychain /Library/Keychains/System.keychain; then
+		security -v add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$cert"
 	fi
 done
 
@@ -47,16 +51,28 @@ import base64, hashlib, os, plistlib, shutil, tempfile
 # The roots in this bundle that anchor EV CAs today, keyed by the CA EV policy OID their
 # leaves assert -- the same OIDs the plist already keys on for that CA. A root absent from
 # this map is simply not EV-enabled: its DV/OV chains verify through pieces 1-2 alone.
+# Paths are relative to this script's directory, where the payload places trust/.
 EV = {
-    "DigiCert Global Root G2.pem":                        "2.16.840.1.114412.2.1",
-    "DigiCert Global Root G3.pem":                        "2.16.840.1.114412.2.1",
-    "USERTrust ECC Certification Authority.pem":          "1.3.6.1.4.1.6449.1.2.1.5.1",
-    "USERTrust RSA Certification Authority.pem":          "1.3.6.1.4.1.6449.1.2.1.5.1",
-    "SSL.com EV Root Certification Authority RSA R2.pem": "1.3.6.1.4.1.23223.1.1.1",
+    "trust/DigiCert Global Root G2.pem":                        "2.16.840.1.114412.2.1",
+    "trust/DigiCert Global Root G3.pem":                        "2.16.840.1.114412.2.1",
+    "trust/USERTrust ECC Certification Authority.pem":          "1.3.6.1.4.1.6449.1.2.1.5.1",
+    "trust/USERTrust RSA Certification Authority.pem":          "1.3.6.1.4.1.6449.1.2.1.5.1",
+    "trust/SSL.com EV Root Certification Authority RSA R2.pem": "1.3.6.1.4.1.23223.1.1.1",
 }
 
 path = "/System/Library/Keychains/EVRoots.plist"
 pl = plistlib.readPlist(path)
+
+# Python 2's plistlib hands <data> values back as plistlib.Data and will only write
+# <data> for Data instances -- a plain str becomes a <string>, which is not the format
+# the trust engine reads. Python 3 uses bytes both ways.
+try:
+    Data = plistlib.Data
+except AttributeError:
+    Data = None
+
+def as_bytes(v):
+    return v.data if Data is not None and isinstance(v, Data) else v
 
 def der_sha1(pem):
     b64 = "".join(l for l in open(pem).read().splitlines() if not l.startswith("-----"))
@@ -68,8 +84,8 @@ for name in sorted(EV):
         continue
     lst = pl.setdefault(EV[name], [])
     dg = der_sha1(name)
-    if dg not in lst:
-        lst.append(dg)
+    if not any(as_bytes(x) == dg for x in lst):
+        lst.append(Data(dg) if Data is not None else dg)
         changed = True
 
 if changed:

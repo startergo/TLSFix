@@ -29,9 +29,25 @@ TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 # so the dylib links name one explicitly; compilation keeps the default SDK's headers, which
 # sit above the deployment floor. AQUATRANSPORT_SDK overrides, then SDKROOT, then the usual
 # place the SDK is kept on the machines that build this.
+#
+# The choice is validated, not trusted: SDKROOT is often set by Xcode build environments to
+# the current SDK, which does not carry i386, and a nonexistent directory would otherwise
+# surface later as an opaque clang error. An unusable setting falls back to the known-good
+# location, and only when that is unusable too does the build stop. The probe scrubs the
+# environment because lipo itself honours SDKROOT -- a stale exported value makes lipo
+# error out looking for tooling inside it, which would fail the check on a perfectly good
+# SDK. For the same reason SDKROOT is dropped once the choice is made: the build's later
+# lipo/clang calls must not be steered by it either.
+sdk_usable() { [ -d "$1" ] && env -u SDKROOT -u DEVELOPER_DIR /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib" 2>/dev/null | grep -qw i386; }
+
 SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-}}"
 [ -z "$SDK" ] && [ -d "$HOME/Downloads/MacOSX10.6.sdk" ] && SDK="$HOME/Downloads/MacOSX10.6.sdk"
-[ -n "$SDK" ] || { echo "no 10.6-era SDK found: set AQUATRANSPORT_SDK (or SDKROOT) to one"; exit 1; }
+if ! sdk_usable "$SDK"; then
+  [ -n "$SDK" ] && echo "SDK has no i386 libSystem, not using it: $SDK" >&2
+  SDK="$HOME/Downloads/MacOSX10.6.sdk"
+fi
+sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
+unset SDKROOT DEVELOPER_DIR
 
 [ -f "$TARBALL" ] || { echo "missing vendored dependency: $TARBALL"; exit 1; }
 
@@ -110,7 +126,14 @@ for a in "${ARCHS[@]}"; do
   # Plain -framework, not -lazy_framework: against the 10.6 SDK's stubs the linker actually
   # engages the lazy-load machinery, which wants __dyld_lazy_load -- a dyld feature the 10.6
   # deployment target predates -- and the link dies. Function bindings are lazily resolved
-  # by default anyway, so nothing is lost.
+  # by default anyway, so nothing is lost. This also matches the previously shipped engine
+  # exactly: the modern linker ignored -lazy_framework at this deployment target (warning
+  # "lazy-load will be ignored") and emitted plain load commands there too -- verified by
+  # dlopening both engines in a CoreFoundation-free process on 10.6 and diffing what dyld
+  # maps: identical sets. Making the engine resolve Sec*/CF* through dlsym instead would
+  # avoid mapping those frameworks until first use, but the loader only dlopens the engine
+  # at a process's first Secure Transport call, by which point CoreFoundation is present
+  # by construction, so the rework buys nothing observed.
   clang -arch "$a" -mmacosx-version-min="$MIN" -isysroot "$SDK" -dynamiclib -o "$out" \
     -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
