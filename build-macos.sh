@@ -132,14 +132,17 @@ for a in "${ARCHS[@]}"; do
   # Plain -framework, not -lazy_framework: against the 10.6 SDK's stubs the linker actually
   # engages the lazy-load machinery, which wants __dyld_lazy_load -- a dyld feature the 10.6
   # deployment target predates -- and the link dies. Function bindings are lazily resolved
-  # by default anyway, so nothing is lost. This also matches the previously shipped engine
-  # exactly: the modern linker ignored -lazy_framework at this deployment target (warning
-  # "lazy-load will be ignored") and emitted plain load commands there too -- verified by
-  # dlopening both engines in a CoreFoundation-free process on 10.6 and diffing what dyld
-  # maps: identical sets. Making the engine resolve Sec*/CF* through dlsym instead would
-  # avoid mapping those frameworks until first use, but the loader only dlopens the engine
-  # at a process's first Secure Transport call, by which point CoreFoundation is present
-  # by construction, so the rework buys nothing observed.
+  # by default anyway, so nothing is lost. Nothing is lost off the 10.6 floor either: the
+  # current linker ignores -lazy_framework at EVERY deployment target from 10.6 through
+  # 15.0 (measured; it warns "deployment target version is too low" even for 15.0) -- the
+  # lazy-dylib feature only ever lived in a narrow 10.11-era toolchain/OS window, and dyld
+  # has since dropped it. This also matches the previously shipped engine exactly: the
+  # linker ignored -lazy_framework for it too and emitted plain load commands -- verified
+  # by dlopening both engines in a CoreFoundation-free process on 10.6 and diffing what
+  # dyld maps: identical sets. Making the engine resolve Sec*/CF* through dlsym instead
+  # would avoid mapping those frameworks until first use, but the loader only dlopens the
+  # engine at a process's first Secure Transport call, by which point CoreFoundation is
+  # present by construction, so the rework buys nothing observed.
   clang -arch "$a" -mmacosx-version-min="$MIN" -isysroot "$SDK" -dynamiclib -o "$out" \
     -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
