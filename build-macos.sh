@@ -65,6 +65,16 @@ fi
 sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386+x86_64 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
 unset SDKROOT DEVELOPER_DIR
 
+# The GSA module is Foundation code for 10.7+ -- NSURLConnectionDelegate and friends
+# postdate the 10.6 SDK -- so it compiles and links against a newer one: 10.9, the era
+# its account flows were validated on. Same validation rules as the engine's SDK.
+GSA_SDK="${AQUATRANSPORT_GSA_SDK:-}"
+[ -z "$GSA_SDK" ] && for cand in "$HOME/leopard-webkit-build/sdk/MacOSX-SDKs/MacOSX10.9.sdk" \
+                                   "$HOME/Downloads/MacOSX10.9.sdk"; do
+  sdk_usable "$cand" && GSA_SDK="$cand" && break
+done
+sdk_usable "$GSA_SDK" || { echo "no 10.7-era SDK with an i386+x86_64 libSystem found for the GSA module: set AQUATRANSPORT_GSA_SDK to one"; exit 1; }
+
 [ -f "$TARBALL" ] || { echo "missing vendored dependency: $TARBALL"; exit 1; }
 
 # ---- 1. OpenSSL (cached; delete build/openssl to force a rebuild) ----------
@@ -175,15 +185,18 @@ for a in "${ARCHS[@]}"; do
   # iCloud begins at 10.7. This separate image supports GC for System Preferences;
   # the engine stays pure C and the loader never maps it during process startup.
   gobj="$OBJDIR/aquatransport_gsa-$a.o"
-  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -O2 -fPIC -fvisibility=hidden \
+  # -isysroot names the 10.7-era SDK for both compilers: the GC toolchain is a stock LLVM
+  # drop with no macOS headers of its own, and the modern clang linking the dylib needs the
+  # SDK's i386 Foundation, which the default SDK does not carry.
+  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
     -fobjc-gc -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
     -c "$DIR/src/mac/aquatransport_gsa.m" -o "$gobj"
   cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
-  clang -arch "$a" -mmacosx-version-min=10.7 -O2 -fPIC -fvisibility=hidden \
+  clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
     -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
     -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
   gout="$OBJDIR/aquatransport_gsa-$a.dylib"
-  clang -arch "$a" -mmacosx-version-min=10.7 -dynamiclib -o "$gout" \
+  clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -dynamiclib -o "$gout" \
     -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
     "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
     -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
@@ -213,6 +226,20 @@ mkdir -p "$ST"
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
+
+# Restore the Objective-C GC bit the linker drops. The compile emits __objc_imageinfo
+# flags 0x2 (OBJC_IMAGE_SUPPORTS_GC -- loadable by GC and non-GC processes alike), but
+# modern ld64 writes the section back as zero, and ld-classic rewrites it to 0x40. A GC
+# process such as Mavericks' System Preferences refuses a library without the bit, so it
+# is written straight into the x86_64 slice at the section's file offset: the fat header
+# gives the slice's base, the section header the offset within it, and byte 4 of the
+# 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
+# use retain/release, and the verifier below only demands the bit of x86_64.
+GSADY="$ST/aquatransport_gsa.dylib"
+gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
+gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
+[ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
+printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc status=none
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # and has no Objective-C dependency. The GSA image is loaded at request time.
