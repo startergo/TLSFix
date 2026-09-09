@@ -1,3 +1,7 @@
 Dictionary
-http://lookup-api.apple.com
+http*://lookup-api.apple.com
 User-Agent: Legacy Mac OS X via AquaTransport (https://mavericksforever.com)
+
+Dictionary
+http*://upload.wikimedia.org/
+Referer: https://en.wikipedia.org/
