@@ -62,6 +62,14 @@ install)
       mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
     fi
   done
+  # A build without the GSA module supersedes an install that had one: the rewriter
+  # dlopens whatever file it finds beside the engine, so an image left behind would run
+  # stale GSA code against a newer engine, exactly what this update was meant to replace.
+  # Only a build stage that exists and lacks the module counts -- with no stage at all the
+  # libraries came from a package install and are not this script's to prune.
+  if [ -d "$SRC" ] && [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
+    rm -f "$LIBDIR/aquatransport_gsa.dylib"
+  fi
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
   # Seed each rule file from the shipped default when it is not already present, so a reinstall

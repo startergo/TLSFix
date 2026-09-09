@@ -62,6 +62,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 typedef void *(*fn6)(void *, void *, void *, void *, void *, void *);
 
@@ -170,15 +171,28 @@ static int gsa_dav_url(const char *url) {
            (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
 }
 
-/* The reservation shields the GSA exchange from general rules, but where the module
- * cannot load at all -- Snow Leopard, which load_gsa_once below gates out by the same
- * Darwin-11 check -- holding its hosts out of the configured rules would only discard
- * the admin's redirect and header settings for nothing. Ask the kernel once. */
+/* The reservation shields the GSA exchange from general rules, but only where the
+ * module can actually run: on Snow Leopard (which load_gsa_once below gates out by
+ * the same Darwin-11 check), and on a Lion-or-newer install built without the optional
+ * module, there is no exchange to protect, and holding its hosts out of the configured
+ * rules would only discard the admin's redirect and header settings. Both facts are
+ * settled once: the kernel release, and whether the module image sits beside this
+ * library where load_gsa_once will look for it. */
 static int gsa_possible(void) {
     static int ok = -1;
     if (ok < 0) {
         struct utsname os;
-        ok = (!uname(&os) && atoi(os.release) >= 11) ? 1 : 0;
+        int darwin = !uname(&os) && atoi(os.release) >= 11;
+        int present = 0;
+        Dl_info info;
+        if (darwin && dladdr((void *)&gsa_possible, &info) && info.dli_fname) {
+            const char *slash = strrchr(info.dli_fname, '/');
+            char path[1024];
+            if (slash && snprintf(path, sizeof path, "%.*s/aquatransport_gsa.dylib",
+                    (int)(slash-info.dli_fname), info.dli_fname) < sizeof path)
+                present = access(path, R_OK) == 0;
+        }
+        ok = darwin && present;
     }
     return ok;
 }

@@ -77,8 +77,10 @@ unset SDKROOT DEVELOPER_DIR
 # The GSA module is Foundation code for 10.7+ -- NSURLConnectionDelegate and friends
 # postdate the 10.6 SDK -- so it compiles and links against a newer one: 10.9, the era
 # its account flows were validated on. Same validation rules as the engine's SDK, and
-# the same optional/strict split as the GC compiler above.
-if [ "$GSA_OK" = 1 ]; then
+# the same optional/strict split as the GC compiler above. An SDK named explicitly is
+# validated even when the compiler is missing and the module will not build this run:
+# an explicit setting that is silently ignored is worse than the error.
+if [ "$GSA_OK" = 1 ] || [ -n "${AQUATRANSPORT_GSA_SDK:-}" ]; then
   GSA_SDK="${AQUATRANSPORT_GSA_SDK:-}"
   [ -z "$GSA_SDK" ] && for cand in "$HOME/leopard-webkit-build/sdk/MacOSX-SDKs/MacOSX10.9.sdk" \
                                      "$HOME/Downloads/MacOSX10.9.sdk"; do
