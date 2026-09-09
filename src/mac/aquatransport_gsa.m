@@ -263,7 +263,13 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if ([endpoint length]) {
         NSURL *url = [NSURL URLWithString:endpoint];
-        BOOL local = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] || [[url host] isEqual:@"[::1]"];
+        /* NSURL renders an IPv6 loopback authority differently across releases:
+         * the systems this adapter targets expose the host as "::1" without the
+         * brackets, newer Foundation builds have been known to keep them. Accept
+         * both spellings so a loopback provider is not mistaken for a remote
+         * HTTP host, which HTTP on loopback explicitly permits. */
+        BOOL local = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] ||
+            [[url host] isEqual:@"::1"] || [[url host] isEqual:@"[::1]"];
         if ((![[url scheme] isEqual:@"https"] && !(local && [[url scheme] isEqual:@"http"])) ||
             ![url host] || [url user] || [url password] || [url fragment]) {
             *error = aq_error(10, @"The anisette server must use HTTPS (HTTP is allowed only on loopback)."); return nil;
@@ -540,13 +546,22 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
         return aq_result(response, aq_encode(result));
     }
     if ([[[original URL] path] isEqual:@"/setup/iosbuddy/loginDelegates"]) {
-        NSMutableDictionary *body = [[aq_plist([original HTTPBody]) mutableCopy] autorelease];
+        /* Classification accepts gzip-encoded plist credentials, so this body must
+         * be reread through the same bounded decode; a raw plist parse would fail
+         * here only after the password exchange had already run, stranding a
+         * claimed request that could neither proceed nor fall back. Decoding is
+         * preferred over refusing compressed bodies at classification: the other
+         * login endpoints never reread the body, so a blanket refusal would
+         * needlessly push their gzip requests native. The rebuilt body is plain
+         * xml, so the stale content-encoding goes the way of the content-length. */
+        NSMutableDictionary *body = [[aq_request_plist(original) mutableCopy] autorelease];
         if (!body) { *error = aq_error(32, @"Unsupported loginDelegates body."); return nil; }
         [body setObject:pet forKey:@"password"];
         NSString *dsid = aq_string([session objectForKey:@"adsid"]);
         if (dsid) [body setObject:dsid forKey:@"apple-id"];
         NSMutableURLRequest *req = [[original mutableCopy] autorelease];
         [req setHTTPBody:aq_encode(body)]; [req setValue:nil forHTTPHeaderField:@"Content-Length"];
+        [req setValue:nil forHTTPHeaderField:@"Content-Encoding"];
         [req setValue:nil forHTTPHeaderField:@"Authorization"];
         for (NSString *k in headers) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
         NSData *data = aq_send(owner, req, &response, error);
