@@ -23,10 +23,19 @@ mkdir -p "$BUILD"
 GSA_CC="${AQUATRANSPORT_GSA_CC:-$BUILD/gsa-toolchain/bin/clang}"
 [ -x "$GSA_CC" ] || GSA_CC="${AQUATRANSPORT_GSA_CC:-clang}"
 # Clang 3.4 still emits GC write barriers; newer Apple clang cannot. See docs/ICLOUD.md.
+# The GSA module is optional: without its toolchain or SDK the build still produces the
+# loader and engine, and install-macos.sh and make-pkg.sh stage whatever exists. A
+# compiler named by AQUATRANSPORT_GSA_CC is held to strictly, though -- a setting that
+# silently falls back to no module at all is worse than the error.
+GSA_OK=1
 if ! printf '@interface AQGC @end\n@implementation AQGC @end\n' | \
     "$GSA_CC" -x objective-c -fobjc-gc -c -o "$BUILD/gsa-gc-check.o" - 2>/dev/null; then
-  echo "GSA needs a GC-capable compiler. Set AQUATRANSPORT_GSA_CC (see docs/ICLOUD.md)."
-  exit 1
+  if [ -n "${AQUATRANSPORT_GSA_CC:-}" ]; then
+    echo "AQUATRANSPORT_GSA_CC is set but cannot compile Objective-C GC (see docs/ICLOUD.md)."
+    exit 1
+  fi
+  echo "==> no GC-capable compiler; building without the GSA module (docs/ICLOUD.md)"
+  GSA_OK=0
 fi
 rm -f "$BUILD/gsa-gc-check.o"
 LS_SRC="$BUILD/src/openssl-$OPENSSL_VERSION"
@@ -67,13 +76,23 @@ unset SDKROOT DEVELOPER_DIR
 
 # The GSA module is Foundation code for 10.7+ -- NSURLConnectionDelegate and friends
 # postdate the 10.6 SDK -- so it compiles and links against a newer one: 10.9, the era
-# its account flows were validated on. Same validation rules as the engine's SDK.
-GSA_SDK="${AQUATRANSPORT_GSA_SDK:-}"
-[ -z "$GSA_SDK" ] && for cand in "$HOME/leopard-webkit-build/sdk/MacOSX-SDKs/MacOSX10.9.sdk" \
-                                   "$HOME/Downloads/MacOSX10.9.sdk"; do
-  sdk_usable "$cand" && GSA_SDK="$cand" && break
-done
-sdk_usable "$GSA_SDK" || { echo "no 10.7-era SDK with an i386+x86_64 libSystem found for the GSA module: set AQUATRANSPORT_GSA_SDK to one"; exit 1; }
+# its account flows were validated on. Same validation rules as the engine's SDK, and
+# the same optional/strict split as the GC compiler above.
+if [ "$GSA_OK" = 1 ]; then
+  GSA_SDK="${AQUATRANSPORT_GSA_SDK:-}"
+  [ -z "$GSA_SDK" ] && for cand in "$HOME/leopard-webkit-build/sdk/MacOSX-SDKs/MacOSX10.9.sdk" \
+                                     "$HOME/Downloads/MacOSX10.9.sdk"; do
+    sdk_usable "$cand" && GSA_SDK="$cand" && break
+  done
+  if ! sdk_usable "$GSA_SDK"; then
+    if [ -n "${AQUATRANSPORT_GSA_SDK:-}" ]; then
+      echo "AQUATRANSPORT_GSA_SDK is set but has no i386+x86_64 libSystem."
+      exit 1
+    fi
+    echo "==> no 10.7-era SDK; building without the GSA module (docs/ICLOUD.md)"
+    GSA_OK=0
+  fi
+fi
 
 [ -f "$TARBALL" ] || { echo "missing vendored dependency: $TARBALL"; exit 1; }
 
@@ -184,23 +203,25 @@ for a in "${ARCHS[@]}"; do
 
   # iCloud begins at 10.7. This separate image supports GC for System Preferences;
   # the engine stays pure C and the loader never maps it during process startup.
-  gobj="$OBJDIR/aquatransport_gsa-$a.o"
-  # -isysroot names the 10.7-era SDK for both compilers: the GC toolchain is a stock LLVM
-  # drop with no macOS headers of its own, and the modern clang linking the dylib needs the
-  # SDK's i386 Foundation, which the default SDK does not carry.
-  "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
-    -fobjc-gc -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
-    -c "$DIR/src/mac/aquatransport_gsa.m" -o "$gobj"
-  cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
-  clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
-    -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
-    -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
-  gout="$OBJDIR/aquatransport_gsa-$a.dylib"
-  clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -dynamiclib -o "$gout" \
-    -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
-    "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
-    -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
-  gsa_slices+=("$gout")
+  if [ "$GSA_OK" = 1 ]; then
+    gobj="$OBJDIR/aquatransport_gsa-$a.o"
+    # -isysroot names the 10.7-era SDK for both compilers: the GC toolchain is a stock LLVM
+    # drop with no macOS headers of its own, and the modern clang linking the dylib needs the
+    # SDK's i386 Foundation, which the default SDK does not carry.
+    "$GSA_CC" -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
+      -fobjc-gc -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
+      -c "$DIR/src/mac/aquatransport_gsa.m" -o "$gobj"
+    cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
+    clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
+      -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
+      -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
+    gout="$OBJDIR/aquatransport_gsa-$a.dylib"
+    clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -dynamiclib -o "$gout" \
+      -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
+      "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
+      -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
+    gsa_slices+=("$gout")
+  fi
   echo "    $a ok"
 done
 
@@ -225,21 +246,25 @@ mkdir -p "$ST"
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
-lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
+if [ ${#gsa_slices[@]} -gt 0 ]; then
+  lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 
-# Restore the Objective-C GC bit the linker drops. The compile emits __objc_imageinfo
-# flags 0x2 (OBJC_IMAGE_SUPPORTS_GC -- loadable by GC and non-GC processes alike), but
-# modern ld64 writes the section back as zero, and ld-classic rewrites it to 0x40. A GC
-# process such as Mavericks' System Preferences refuses a library without the bit, so it
-# is written straight into the x86_64 slice at the section's file offset: the fat header
-# gives the slice's base, the section header the offset within it, and byte 4 of the
-# 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
-# use retain/release, and the verifier below only demands the bit of x86_64.
-GSADY="$ST/aquatransport_gsa.dylib"
-gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
-gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
-[ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
-printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc status=none
+  # Restore the Objective-C GC bit the linker drops. The compile emits __objc_imageinfo
+  # flags 0x2 (OBJC_IMAGE_SUPPORTS_GC -- loadable by GC and non-GC processes alike), but
+  # modern ld64 writes the section back as zero, and ld-classic rewrites it to 0x40. A GC
+  # process such as Mavericks' System Preferences refuses a library without the bit, so it
+  # is written straight into the x86_64 slice at the section's file offset: the fat header
+  # gives the slice's base, the section header the offset within it, and byte 4 of the
+  # 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
+  # use retain/release, and the verifier below only demands the bit of x86_64.
+  GSADY="$ST/aquatransport_gsa.dylib"
+  gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
+  gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
+  [ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
+  printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc status=none
+else
+  echo "==> GSA module skipped: no GC toolchain or no 10.7-era SDK (docs/ICLOUD.md)"
+fi
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # and has no Objective-C dependency. The GSA image is loaded at request time.
@@ -254,26 +279,42 @@ printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrun
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
 for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib; do
+# A build without the GC toolchain stages no GSA image at all; verify what exists.
+[ -f "$ST/$img" ] || continue
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
+# The engine and loader floor at $MIN; the GSA module floors at 10.7 -- its loader gates
+# on Darwin 11+, so what Lion added (strndup, strnlen, getline, getdelim, memmem,
+# arc4random_buf) is legal there, and only the newer set is banned.
+floor="$MIN"; banned="$POST106"
+[ "$img" = aquatransport_gsa.dylib ] && {
+  floor=10.7
+  banned='^_(getentropy|clock_gettime|clock_gettime_nsec_np|dispatch_activate|os_unfair_lock_lock)$'
+}
 for a in "${ARCHS[@]}"; do
   echo "$have" | grep -qw "$a" || { echo "FATAL: $img missing $a slice; $a processes would go unpatched"; exit 1; }
   n=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
   [ "$n" = "0" ] || { echo "FATAL: $img $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
-  bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$POST106" || true)
-  [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $MIN (would crash on first use):"
+  bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$banned" || true)
+  [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $floor (would crash on first use):"
                      echo "$bad" | sed 's/^/      /'; exit 1; }
 done
 done
-echo "    per slice: present, 0 exports, no post-$MIN imports"
-# OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
-otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
-  { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
-echo "    GSA: GC-compatible, deployment target 10.7"
+echo "    per slice: present, 0 exports, no post-floor imports"
+if [ -f "$ST/aquatransport_gsa.dylib" ]; then
+  # OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
+  otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
+    { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
+  echo "    GSA: GC-compatible, deployment target 10.7"
+fi
 
 ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print "    "$9": "$5}'
 # The loader must stay small: its whole purpose is to be harmless to map.
 lsz=$(stat -f%z "$ST/aquatransport.dylib")
 [ "$lsz" -lt 200000 ] || { echo "FATAL: loader is $lsz bytes; it is meant to be a stub"; exit 1; }
-echo "built: loader + TLS engine + iCloud GSA module in $ST"
+if [ -f "$ST/aquatransport_gsa.dylib" ]; then
+  echo "built: loader + TLS engine + iCloud GSA module in $ST"
+else
+  echo "built: loader + TLS engine in $ST (no GSA module this build)"
+fi

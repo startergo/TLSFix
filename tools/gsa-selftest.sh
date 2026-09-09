@@ -17,17 +17,23 @@ done
 # Every probe is an executable, and linking one needs crt1.10.6.o, which 10.7-era SDKs no
 # longer carry (it moved into the toolchain, and this machine's /usr/lib does not have it
 # either -- modern clang errors with "library 'crt1.10.6.o' not found", clang 3.4.2 the
-# same). The 10.6 SDK still ships the crt objects, so a one-time overlay gives every build
-# a sysroot with both: everything of the 10.9 SDK by symlink, plus the crt files copied in.
-OLD_SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-$HOME/Downloads/MacOSX10.6.sdk}}"
+# same). The crt objects come from the 10.6 SDK: an explicit AQUATRANSPORT_SDK or SDKROOT
+# is honoured only when it actually has them, since SDKROOT is routinely set to the current
+# SDK by Xcode build shells and that one carries no crt files at all. The overlay gives
+# every build a sysroot with both: everything of the 10.9 SDK by symlink, plus the crt
+# files copied in.
+CRT_SRC=""
+for cand in "${AQUATRANSPORT_SDK:-${SDKROOT:-}}" "$HOME/Downloads/MacOSX10.6.sdk"; do
+  [ -n "$cand" ] && [ -f "$cand/usr/lib/crt1.10.6.o" ] && CRT_SRC="$cand" && break
+done
+[ -n "$CRT_SRC" ] || { echo "no SDK with crt1.10.6.o found: set AQUATRANSPORT_SDK to the 10.6 SDK"; exit 1; }
 GSA_LINKROOT="$DIR/build/gsa-sysroot"
 if [ ! -f "$GSA_LINKROOT/usr/lib/crt1.10.6.o" ]; then
-  [ -f "$OLD_SDK/usr/lib/crt1.10.6.o" ] || { echo "no crt1.10.6.o under $OLD_SDK: set AQUATRANSPORT_SDK"; exit 1; }
   rm -rf "$GSA_LINKROOT"; mkdir -p "$GSA_LINKROOT/usr/lib"
   for f in "$GSA_SDKROOT"/*; do ln -s "$f" "$GSA_LINKROOT/$(basename "$f")"; done
   for f in "$GSA_SDKROOT"/usr/*; do [ "$(basename "$f")" = lib ] || ln -s "$f" "$GSA_LINKROOT/usr/$(basename "$f")"; done
   for f in "$GSA_SDKROOT"/usr/lib/*; do ln -s "$f" "$GSA_LINKROOT/usr/lib/$(basename "$f")"; done
-  for f in "$OLD_SDK"/usr/lib/crt*.o "$OLD_SDK"/usr/lib/bundle1.o "$OLD_SDK"/usr/lib/dylib1*.o; do
+  for f in "$CRT_SRC"/usr/lib/crt*.o "$CRT_SRC"/usr/lib/bundle1.o "$CRT_SRC"/usr/lib/dylib1*.o; do
     [ -f "$f" ] && cp "$f" "$GSA_LINKROOT/usr/lib/"
   done
 fi
@@ -41,7 +47,10 @@ printf 'http://127.0.0.1:9/anisette\n' > "$CONF/gsa-anisette-url.txt"
 # These would break the exchange if authentication were subject to generic rules.
 printf '*\nhttps://gsa.apple.com/\nhttps://example.invalid/\n' > "$CONF/redirects.txt"
 printf '*\nhttps://setup.icloud.com/\nAuthorization: must-not-replace-token\n\n*\nhttps://profile.ess.apple.com/\nAuthorization: must-not-replace-token\n' > "$CONF/headers.txt"
-python tools/gsa-vectors.py > build/gsa-vectors.h
+# gsa-vectors.py runs under both pythons; prefer python3, which is what a modern host
+# has -- several still ship no unversioned `python` at all.
+PY="$(command -v python3 || command -v python)" || { echo "no python found for gsa-vectors"; exit 1; }
+"$PY" tools/gsa-vectors.py > build/gsa-vectors.h
 clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated-declarations \
     -Ibuild -Ibuild/openssl/include tools/gsacrypto.c build/openssl/lib/libcrypto.a -o build/gsacrypto
 clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated-declarations \

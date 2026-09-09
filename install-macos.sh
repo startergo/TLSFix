@@ -41,9 +41,11 @@ install)
       { echo "Security backup exists but the AquaTransport load command is missing"; exit 1; }
     updating=1
   fi
-  # Require the complete payload before replacing any library. Package installations
-  # can supply it in LIBDIR instead of the build stage.
-  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+  # Require the core payload before replacing any library; the GSA module is optional,
+  # so a build made without its GC toolchain installs the loader and engine alone and a
+  # GSA-less build neither fails here nor over an absent third library below. Package
+  # installations can supply any of these in LIBDIR instead of the build stage.
+  for lib in aquatransport_engine.dylib aquatransport.dylib; do
     [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
       { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
   done
@@ -121,7 +123,8 @@ uninstall)
   # them here would quietly revert that tuning on an uninstall/reinstall cycle. Remove what
   # the package owns; keep the config directory when it holds anything, and the directories
   # above it only when they are empty.
-  rm -f "$DYLIB" "$ENGINE" "$LIBDIR/insert_dylib" "$LIBDIR/aquatransport.sh" "$LIBDIR/uninstall.sh"
+  rm -f "$DYLIB" "$ENGINE" "$LIBDIR/aquatransport_gsa.dylib" \
+        "$LIBDIR/insert_dylib" "$LIBDIR/aquatransport.sh" "$LIBDIR/uninstall.sh"
   rmdir "$CONFDIR" 2>/dev/null || true
   rmdir "$LIBDIR" 2>/dev/null || true
   echo "Uninstalled. Restart your computer."

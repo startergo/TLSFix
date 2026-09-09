@@ -170,6 +170,19 @@ static int gsa_dav_url(const char *url) {
            (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
 }
 
+/* The reservation shields the GSA exchange from general rules, but where the module
+ * cannot load at all -- Snow Leopard, which load_gsa_once below gates out by the same
+ * Darwin-11 check -- holding its hosts out of the configured rules would only discard
+ * the admin's redirect and header settings for nothing. Ask the kernel once. */
+static int gsa_possible(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        struct utsname os;
+        ok = (!uname(&os) && atoi(os.release) >= 11) ? 1 : 0;
+    }
+    return ok;
+}
+
 static int gsa_reserved_url(const char *url) {
     /* Authentication requests must not be redirected or have credentials logged by
      * general URL/header rules. Match a full authority, including its slash. */
@@ -229,7 +242,7 @@ static int apply_rules(void *m) {
     char *before = cf_to_c(CFURLGetString(url));
     if (!before) return 0;
 
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         prepare_gsa();
         free(before);
         return 0;
@@ -319,7 +332,7 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     char *before = cf_to_c(CFURLGetString((CFURLRef)url));
     if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
                                     (CFURLRef)url, (CFStringRef)version);
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(before);
         return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
     }
@@ -378,7 +391,7 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
     char *before = url ? cf_to_c(CFURLGetString(url)) : NULL;
     if (url) CFRelease(url);
     if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return;
     }
 
