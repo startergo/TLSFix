@@ -55,23 +55,32 @@ install)
   # Dependencies go first. Only the loader is named by a load command, so a window in which
   # the loader is present and the engine is not is a window of processes without TLS.
   mkdir -p "$LIBDIR" "$CONFDIR"
-  # A complete build without the GSA module supersedes an install that had one: the
-  # rewriter dlopens whatever file it finds beside the engine, so an image left behind
-  # would run stale GSA code against a newer engine. The prune happens before the new
-  # core is published, so no process can start in the window between and pair a stale
-  # module with the new engine. Completeness is the marker -- a stage that lacks the
-  # engine and loader is a botched build whose install falls back to the already-
-  # installed libraries, and those are not this run's to prune.
-  if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ] &&
-     [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
-    rm -f "$LIBDIR/aquatransport_gsa.dylib"
-  fi
+  # Stage every replacement first and publish nothing until all of them are ready: a
+  # copy or chown that fails under set -e aborts with the install untouched -- the set
+  # on disk is still the old, complete one, engine and GSA module alike. Only then does
+  # the stale-GSA prune below run, and publication is the final step, because a rename
+  # inside one directory is the step that cannot leave a partial file behind.
+  staged=""
   for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
     if [ -f "$SRC/$lib" ]; then
       cp "$SRC/$lib" "$LIBDIR/$lib.new"
       chown root:wheel "$LIBDIR/$lib.new"; chmod 0644 "$LIBDIR/$lib.new"
-      mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
+      staged="$staged $lib"
     fi
+  done
+  # A complete build without the GSA module supersedes an install that had one: the
+  # rewriter dlopens whatever file it finds beside the engine, so an image left behind
+  # would run stale GSA code against a newer engine. The prune runs after staging
+  # succeeded and before the staged core is published, so no process starts in the
+  # window between and pairs a stale module with the new engine. Completeness is the
+  # marker -- a stage that lacks the engine and loader is a botched build whose install
+  # falls back to the already-installed libraries, and those are not this run's to prune.
+  if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ] &&
+     [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
+    rm -f "$LIBDIR/aquatransport_gsa.dylib"
+  fi
+  for lib in $staged; do
+    mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
   done
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
