@@ -197,6 +197,18 @@ static int gsa_possible(void) {
     return ok;
 }
 
+/* Armed means the module is actually running in this process: its principal class
+ * resolves. Presence on disk is not enough -- an image that exists but would not load
+ * (the wrong slice for this process, a broken dependency) protects nothing, and
+ * holding reserved URLs out of the configured rules beside it is exactly the harm the
+ * reservation was tightened to avoid. The request path below attempts the load before
+ * asking; the message-path sites ask without attempting, so a process that never loads
+ * the module keeps its rules there. */
+static int gsa_armed(void) {
+    void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    return get_class && get_class("AQGSAProtocol") != NULL;
+}
+
 static int gsa_reserved_url(const char *url) {
     /* Authentication requests must not be redirected or have credentials logged by
      * general URL/header rules. Match a full authority, including its slash. */
@@ -258,8 +270,7 @@ static int apply_rules(void *m) {
 
     if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         prepare_gsa();
-        free(before);
-        return 0;
+        if (gsa_armed()) { free(before); return 0; }
     }
 
     // One critical section across the redirect, the match, and the use of what matched: the
@@ -346,7 +357,7 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     char *before = cf_to_c(CFURLGetString((CFURLRef)url));
     if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
                                     (CFURLRef)url, (CFStringRef)version);
-    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && gsa_armed() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(before);
         return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
     }
@@ -405,7 +416,7 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
     char *before = url ? cf_to_c(CFURLGetString(url)) : NULL;
     if (url) CFRelease(url);
     if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
-    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && gsa_armed() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return;
     }
 

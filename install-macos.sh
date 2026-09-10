@@ -55,6 +55,17 @@ install)
   # Dependencies go first. Only the loader is named by a load command, so a window in which
   # the loader is present and the engine is not is a window of processes without TLS.
   mkdir -p "$LIBDIR" "$CONFDIR"
+  # A complete build without the GSA module supersedes an install that had one: the
+  # rewriter dlopens whatever file it finds beside the engine, so an image left behind
+  # would run stale GSA code against a newer engine. The prune happens before the new
+  # core is published, so no process can start in the window between and pair a stale
+  # module with the new engine. Completeness is the marker -- a stage that lacks the
+  # engine and loader is a botched build whose install falls back to the already-
+  # installed libraries, and those are not this run's to prune.
+  if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ] &&
+     [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
+    rm -f "$LIBDIR/aquatransport_gsa.dylib"
+  fi
   for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
     if [ -f "$SRC/$lib" ]; then
       cp "$SRC/$lib" "$LIBDIR/$lib.new"
@@ -62,14 +73,6 @@ install)
       mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
     fi
   done
-  # A build without the GSA module supersedes an install that had one: the rewriter
-  # dlopens whatever file it finds beside the engine, so an image left behind would run
-  # stale GSA code against a newer engine, exactly what this update was meant to replace.
-  # Only a build stage that exists and lacks the module counts -- with no stage at all the
-  # libraries came from a package install and are not this script's to prune.
-  if [ -d "$SRC" ] && [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
-    rm -f "$LIBDIR/aquatransport_gsa.dylib"
-  fi
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
   # Seed each rule file from the shipped default when it is not already present, so a reinstall
