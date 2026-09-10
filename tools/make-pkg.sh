@@ -37,16 +37,19 @@ STAGE="$REPO/build/stage/usr/share/aquatransport"
 mkdir -p "$W/x"
 (cd "$W/x" && xar -xf "$OLDPKG")
 
-# Stage the AquaTransport payload: new dylibs, current default rule files.
+# Stage the AquaTransport payload: new dylibs, current default rule files. The GSA module
+# rides along when the build produced it; a 10.6-only build without the GC toolchain
+# ships an installer without it just as cleanly.
 R="$W/root/usr/share/aquatransport"
 mkdir -p "$R/config"
 cp "$STAGE/aquatransport.dylib" "$STAGE/aquatransport_engine.dylib" "$R/"
+[ -f "$STAGE/aquatransport_gsa.dylib" ] && cp "$STAGE/aquatransport_gsa.dylib" "$R/"
 cp "$REPO/packaging/Default Configuration/disabled.txt" \
    "$REPO/packaging/Default Configuration/headers.txt" \
    "$REPO/packaging/Default Configuration/redirects.txt" "$R/config/"
 chmod 0755 "$W/root" "$R"
 chmod 0775 "$W/root/usr" "$W/root/usr/share" "$R/config"
-chmod 0644 "$R/aquatransport.dylib" "$R/aquatransport_engine.dylib"
+chmod 0644 "$R/"*.dylib
 chmod 0664 "$R/config/"*.txt
 run_root chown -R root:wheel "$W/root"
 run_root chgrp admin "$R/config" "$R/config/"*.txt

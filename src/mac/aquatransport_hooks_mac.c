@@ -33,6 +33,7 @@
 
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
+#include "aquatransport_gsa_mail.h"
 #include "../../deps/fishhook/fishhook.h"
 #include <openssl/err.h>
 #include <pthread.h>
@@ -187,6 +188,9 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
     // cache and the debug log all key on.
     size_t nlen = (name && len > 1 && name[len-1] == '.') ? len - 1 : len;
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, nlen);
+    // Mail's authenticator keys on the peer name as set; the dotless form still names the
+    // same host, and is what its matcher expects (see tf_gsa_prepare_mail).
+    tf_gsa_prepare_mail(name, nlen);
     OSStatus r = o_SSLSetPeerDomainName(c, name, nlen);
     // Recorded only when the stock call accepted it. A set the stock stack refused must leave
     // the shadow as it was: re-initialising on a refused set would discard a handshake already
