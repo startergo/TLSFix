@@ -91,6 +91,34 @@ request. The server still sees the connecting IP and supplies device identity
 material. [SideStore documents why shared older anisette identities can cause
 account locks](https://docs.sidestore.io/docs/advanced/anisette).
 
+### Self-hosted anisette from a modern Mac
+
+A Mac that is itself signed into iCloud can mint properly paired anisette through
+its own AOSKit, and `tools/anisette-server.m` serves it over the GET-JSON contract
+above. `tools/anisette-host.sh` builds it and installs two launch agents on the
+modern Mac: the server, bound to `127.0.0.1:9724`, and a reverse SSH tunnel that
+binds the same port on the client's loopback. The client's
+`gsa-anisette-url.txt` then holds `http://127.0.0.1:9724/anisette`; plain HTTP on
+loopback is what the adapter's URL check permits, and the tunnel provides the
+encryption. `anisette-host.sh` also has `status`, `stop` and `uninstall`
+subcommands.
+
+**The identity fields must pair with the one-time password.** AOSKit's OTP is
+minted under the current machine's AuthKit provisioning, so the accompanying
+fields must come from the same context — exactly the pairing SideStore's
+[MacAnisette](https://github.com/SideStore/MacAnisette) uses: client info from
+`AKDevice.currentDevice.serverFriendlyDescription`, device ID from
+`uniqueDeviceIdentifier`, local user from `localUserUUID`, routing info `0`, and
+`AOSUtilities machineSerialNumber` for the optional serial field. A mismatched
+pair — for example OTP from one machine paired with a different or hand-written
+client identity, as with the legacy local-AOSKit mapping — is rejected by
+Apple's edge as a **bare HTTP 503 with an nginx error page and no GrandSlam
+status at all**. That response is widely misread as an IP block or an Apple
+outage (see SideStore's 2026 sign-in issues); varying the client info, user
+agent, IP address or network does not change it. Only a correctly paired, fresh
+one-time password is accepted, and such a request is answered with a structured
+GrandSlam response even from datacenter IPs.
+
 ## Install and try a sign-in
 
 Install or update the built libraries with:
