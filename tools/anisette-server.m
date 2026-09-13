@@ -27,6 +27,9 @@
 #import <sys/socket.h>
 #import <unistd.h>
 #import <string.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <time.h>
 
 static Class gUtility, gAKDevice;
 static SEL gOTP, gSerial;
@@ -90,6 +93,21 @@ static NSDictionary *mint(NSString **error) {
     return out;
 }
 
+/* A partial write would truncate the JSON while reporting success; send every
+ * byte or log why not. */
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n; len -= (size_t)n;
+    }
+    return 0;
+}
+
 static void respond(int fd, int status, const char *reason, NSData *body) {
     char head[256];
     int n = snprintf(head, sizeof head,
@@ -99,7 +117,7 @@ static void respond(int fd, int status, const char *reason, NSData *body) {
         "Connection: close\r\n\r\n",
         status, reason, (unsigned long)[body length]);
     if (n > 0 && n < (int)sizeof head) {
-        if (write(fd, head, n) < 0 || write(fd, [body bytes], [body length]) < 0)
+        if (write_all(fd, head, (size_t)n) < 0 || write_all(fd, [body bytes], [body length]) < 0)
             logline("write failed: %s", strerror(errno));
     }
 }
@@ -165,6 +183,9 @@ int main(int argc, char **argv) {
                 if (errno != EINTR) logline("accept: %s", strerror(errno));
                 continue;
             }
+            /* One pool per connection: the listener's pool would otherwise
+             * accumulate every mint's autoreleased objects for its lifetime. */
+            @autoreleasepool {
             struct timeval tv = {5, 0};
             setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
             setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -213,6 +234,7 @@ int main(int argc, char **argv) {
                 logline("GET %s -> 503 (exception %s)", path, [[e name] UTF8String]);
             }
             close(c);
+            }
         }
     }
     return 0;

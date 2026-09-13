@@ -160,7 +160,9 @@ void tf_gsa_prepare_mail(const char *host, size_t length) {
  * the Foundation protocol still cannot see. */
 void tf_gsa_prepare_keychain(const char *host, size_t length) {
     if (tf_flag("disable-icloud-gsa")) return;
-    if (length < 22) return;
+    /* Reached from the SSLSetPeerDomainName hook before Secure Transport has
+     * validated anything, so a NULL name arrives exactly as the caller sent it. */
+    if (!host || length < 22) return;
     int kv = length >= 26 && !strncasecmp(host + length - 26, "keyvalueservice.icloud.com", 26);
     int escrow = !kv && !strncasecmp(host + length - 22, "escrowproxy.icloud.com", 22);
     if (!kv && !escrow) return;
@@ -221,12 +223,16 @@ static int device_auth_url(const char *url) {
 /* The device data comes from the same provider the GSA module uses, fetched
  * here with a socket because this side has no HTTP stack it may lean on.
  * Loopback HTTP only -- the module's own URL check permits exactly that
- * without a certificate, and this code has nowhere to validate one. Values
+ * without a certificate, and this code has nowhere to validate one -- or an
+ * exec: helper, the same arrangement the Foundation adapter accepts. Values
  * are base64, UUID or digit strings, so scanning for the closing quote is a
  * complete parse; anything else is refused rather than half-trusted. One
- * fetch per minute; a failure leaves the previous data in place, as the OTP
- * bucket outlives a brief provider outage. */
+ * fetch per minute; a failed refresh serves the previous data for up to five
+ * minutes, as the OTP bucket outlives a brief provider outage. */
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <time.h>
@@ -240,19 +246,106 @@ static const char *const device_keys[] = {
 
 static pthread_mutex_t device_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+/* Values are base64, UUID or digit strings, so scanning to the closing quote
+ * is a complete parse; the needle carries both quotes so a key can never match
+ * a longer sibling (X-Apple-I-MD vs X-Apple-I-MD-M). Whitespace between the
+ * colon and the value's opening quote is accepted -- pretty-printed providers
+ * are legal JSON. */
+static int device_parse(const char *body, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int found = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        out[i][0] = 0;
+        char needle[64];
+        snprintf(needle, sizeof needle, "\"%s\"", device_keys[i]);
+        const char *v = strstr(body, needle);
+        if (!v) continue;
+        v += strlen(needle);
+        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != ':') continue;
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != '"') continue;
+        v++;
+        const char *endv = strchr(v, '"');
+        if (!endv) continue;
+        size_t len = (size_t)(endv - v);
+        if (!len || len >= DEVICE_VALUE_MAX) continue;
+        memcpy(out[i], v, len); out[i][len] = 0;
+        found++;
+    }
+    /* The one-time password and the machine data are the irreducible pair. */
+    return out[0][0] && out[1][0] && found >= 2;
+}
+
+/* The provider line, trimmed at both ends: an indented line would otherwise
+ * silently disable injection by failing the prefix checks. */
+static int device_read_line(char *url, size_t n) {
     char path[1024];
     snprintf(path, sizeof path, "%s/gsa-anisette-url.txt", tf_dir());
     FILE *f = fopen(path, "r");
     if (!f) return 0;
-    char url[512] = "";
-    int have = fgets(url, sizeof url, f) != NULL;
+    int have = fgets(url, (int)n, f) != NULL;
     fclose(f);
     if (!have) return 0;
-    char *trim = url + strlen(url);
-    while (trim > url && (trim[-1] == '\n' || trim[-1] == '\r' || trim[-1] == ' ')) *--trim = 0;
+    char *end = url + strlen(url);
+    while (end > url && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+    char *start = url;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+    if (start != url) memmove(url, start, strlen(start) + 1);
+    return url[0] != 0;
+}
 
-    /* http://127.0.0.1:PORT/... or http://localhost:PORT/... only. */
+/* The exec form runs the same helpers the Foundation side accepts: an absolute
+ * path and nothing else on the line. No arguments and no shell, the identical
+ * restriction aq_exec_anisette applies, so one config line behaves the same
+ * for both. The child's stdout is capped at 64 KiB and read under the same
+ * ten-second bound as the HTTP fetch, counted from launch; a helper that
+ * overruns it is killed rather than left holding the pipe. */
+static int device_fetch_exec(const char *spec, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    if (spec[0] != '/' || strcspn(spec, " \t\r\n") != strlen(spec)) return 0;
+    int fds[2];
+    if (pipe(fds)) return 0;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 1);
+        close(fds[1]);
+        execl(spec, spec, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    char body[64 * 1024];
+    size_t total = 0;
+    int eof = 0;
+    time_t deadline = time(NULL) + 10;
+    struct pollfd pfd = {fds[0], POLLIN, 0};
+    while (total < sizeof body - 1) {
+        time_t left = deadline - time(NULL);
+        if (left <= 0) break;
+        if (poll(&pfd, 1, (int)(left * 1000)) <= 0) break;
+        ssize_t got = read(fds[0], body + total, sizeof body - 1 - total);
+        if (got <= 0) { eof = got == 0; break; }
+        total += (size_t)got;
+    }
+    close(fds[0]);
+    int status = 0;
+    if (eof) waitpid(pid, &status, 0);          /* output closed: the exit follows it */
+    else { kill(pid, SIGKILL); waitpid(pid, &status, 0); }   /* wedged, or overran the cap */
+    if (!eof || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 0;
+    body[total] = 0;
+    return device_parse(body, out);
+}
+
+static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char url[512];
+    if (!device_read_line(url, sizeof url)) return 0;
+
+    if (!strncasecmp(url, "exec:", 5)) return device_fetch_exec(url + 5, out);
+
+    /* http://127.0.0.1:PORT/... or http://localhost:PORT/... only: plain HTTP
+     * is permitted exactly on loopback, and this side has no certificate
+     * validation to offer any other transport. */
     const char *prefix = NULL;
     if (!strncasecmp(url, "http://127.0.0.1:", 17)) prefix = url + 7;
     else if (!strncasecmp(url, "http://localhost:", 17)) prefix = url + 7;
@@ -292,28 +385,14 @@ static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
 
     char *b = strstr(body, "\r\n\r\n");
     if (!b || total < 12 || strncmp(body, "HTTP/1.", 7) || strncmp(body + 9, "200", 3)) return 0;
-    b += 4;
-
-    int found = 0;
-    for (int i = 0; device_keys[i]; i++) {
-        out[i][0] = 0;
-        char needle[64];
-        snprintf(needle, sizeof needle, "\"%s\":\"", device_keys[i]);
-        char *v = strstr(b, needle);
-        if (!v) continue;
-        v += strlen(needle);
-        char *endv = strchr(v, '"');
-        if (!endv) continue;
-        size_t len = (size_t)(endv - v);
-        if (!len || len >= DEVICE_VALUE_MAX) continue;
-        memcpy(out[i], v, len); out[i][len] = 0;
-        found++;
-    }
-    /* The one-time password and the machine data are the irreducible pair. */
-    return out[0][0] && out[1][0] && found >= 2;
+    return device_parse(b + 4, out);
 }
 
-/* Returns 1 with fresh-enough values in out, locking the cache. */
+/* Returns 1 with fresh-enough values in out, locking the cache. A failed
+ * refresh falls back to the previous data for as long as it is plausibly
+ * still live: the one-time password is bucketed well beyond a minute, and a
+ * brief provider outage must not strip device headers from keychain traffic.
+ * Five minutes bounds how stale a served value may be. */
 static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
     static char cache[DEVICE_VALUES][DEVICE_VALUE_MAX];
     static time_t when;
@@ -327,40 +406,92 @@ static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
         memcpy(cache, out, sizeof cache);
         when = now;
         ok = 1;
+    } else if (when && now - when < 300) {
+        memcpy(out, cache, sizeof cache);
+        ok = out[0][0] && out[1][0];
     }
     pthread_mutex_unlock(&device_lock);
     return ok;
 }
 
-/* Set the device headers on a CFHTTPMessage for a device-auth URL. Used only
- * where no NSURLProtocol can be running for this request: the raw stream path,
- * and request-path processes where the Foundation module could not arm. */
-static void device_headers_message(void *msg) {
-    char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
-    if (!device_values(values)) return;
-    for (int i = 0; device_keys[i]; i++) {
-        if (!values[i][0]) continue;
-        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
-        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
-        if (n && v) p_MsgSetHeader(msg, n, v);
-        if (n) CFRelease(n);
-        if (v) CFRelease(v);
-    }
-    tf_log("device authentication headers added to keychain request");
+/* The Foundation adapter stamps every anisette use with client time, time zone
+ * and locale; the C injection presents the same set so the request does not
+ * read as a different client class. The zone takes TZ when the user set it --
+ * its value is the identifier form NSTimeZone names -- and the abbreviation
+ * tzname carries otherwise, for the zone as it stands right now, DST included.
+ * The locale is fixed here -- this side has no per-process locale, and en_US
+ * is what the adapter's client data carries. */
+static void device_generated(char out[3][64]) {
+    tzset();
+    time_t now = time(NULL);
+    struct tm utc, loc;
+    gmtime_r(&now, &utc);
+    strftime(out[0], 64, "%Y-%m-%dT%H:%M:%SZ", &utc);
+    const char *tz = getenv("TZ");
+    const char *zone;
+    if (tz && *tz) zone = *tz == ':' ? tz + 1 : tz;
+    else { localtime_r(&now, &loc); zone = tzname[loc.tm_isdst > 0 ? 1 : 0]; }
+    snprintf(out[1], 64, "%s", zone && *zone ? zone : "UTC");
+    snprintf(out[2], 64, "en_US");
 }
 
-static void device_headers_request(void *req) {
-    char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
-    if (!device_values(values)) return;
+/* Set the device headers on a CFHTTPMessage for a device-auth URL. Used only
+ * where no NSURLProtocol can be running for this request: the raw stream path,
+ * and request-path processes where the Foundation module could not arm. The
+ * values arrive pre-fetched -- the message call runs under the rules lock, and
+ * the fetch can take seconds. Returns the number of headers set. The generated
+ * fields ride along only with provider data: alone, they would present a
+ * request as anisette-authenticated that carries no credentials. */
+static int device_headers_message(void *msg, const char values[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int set = 0;
     for (int i = 0; device_keys[i]; i++) {
         if (!values[i][0]) continue;
         CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
         CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
-        if (n && v) p_SetHeader(req, n, v);
+        if (n && v) { p_MsgSetHeader(msg, n, v); set++; }
         if (n) CFRelease(n);
         if (v) CFRelease(v);
     }
-    tf_log("device authentication headers added to keychain request");
+    if (set) {
+        char gen[3][64];
+        device_generated(gen);
+        static const char *const genkeys[3] = {"X-Apple-I-Client-Time", "X-Apple-I-TimeZone", "X-Apple-Locale"};
+        for (int i = 0; i < 3; i++) {
+            CFStringRef n = CFStringCreateWithCString(NULL, genkeys[i], kCFStringEncodingUTF8);
+            CFStringRef v = CFStringCreateWithCString(NULL, gen[i], kCFStringEncodingUTF8);
+            if (n && v) { p_MsgSetHeader(msg, n, v); set++; }
+            if (n) CFRelease(n);
+            if (v) CFRelease(v);
+        }
+    }
+    if (set) tf_log("device authentication headers added to keychain request");
+    return set;
+}
+
+static int device_headers_request(void *req, const char values[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int set = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        if (!values[i][0]) continue;
+        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
+        if (n && v) { p_SetHeader(req, n, v); set++; }
+        if (n) CFRelease(n);
+        if (v) CFRelease(v);
+    }
+    if (set) {
+        char gen[3][64];
+        device_generated(gen);
+        static const char *const genkeys[3] = {"X-Apple-I-Client-Time", "X-Apple-I-TimeZone", "X-Apple-Locale"};
+        for (int i = 0; i < 3; i++) {
+            CFStringRef n = CFStringCreateWithCString(NULL, genkeys[i], kCFStringEncodingUTF8);
+            CFStringRef v = CFStringCreateWithCString(NULL, gen[i], kCFStringEncodingUTF8);
+            if (n && v) { p_SetHeader(req, n, v); set++; }
+            if (n) CFRelease(n);
+            if (v) CFRelease(v);
+        }
+    }
+    if (set) tf_log("device authentication headers added to keychain request");
+    return set;
 }
 
 /* The reservation shields the GSA exchange from general rules, but only where the
@@ -467,9 +598,13 @@ static int apply_rules(void *m) {
          * traffic through: the rewritten copy carries the device headers, so
          * report the change and let the caller send it. */
         if (device_auth_url(before)) {
-            device_headers_request(m);
-            free(before);
-            return 1;
+            char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
+            if (device_values(values) && device_headers_request(m, values) > 0) {
+                free(before);
+                return 1;
+            }
+            /* A failed fetch must not strand the request: fall through so the
+             * configured rules still apply to it. */
         }
     }
 
@@ -562,6 +697,13 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
         return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
     }
 
+    /* The device fetch runs before the rules lock: it can take seconds on a
+     * stalled provider, and holding the lock across it would freeze every
+     * other request in the process. Only the header writes happen locked. */
+    char device_vals[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    int have_device = gsa_possible() && !gsa_armed() && !tf_flag("disable-icloud-gsa") &&
+        device_auth_url(before) && device_values(device_vals);
+
     // Held across match and use, as in apply_rules: the rule points into an array a reload frees.
     tf_rules_lock();
     char *after = tf_apply_redirect(before);
@@ -582,9 +724,8 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
      * native token authentication and gains the device headers directly. Only
      * when the module is not armed -- an armed process sends its keychain
      * traffic through the streaming adapter, which has added its own. */
-    if (msg && gsa_possible() && !gsa_armed() && !tf_flag("disable-icloud-gsa") &&
-        device_auth_url(before))
-        device_headers_message(msg);
+    if (msg && have_device)
+        device_headers_message(msg, device_vals);
     tf_rules_unlock();
 
     if (nu) CFRelease(nu);

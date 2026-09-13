@@ -28,7 +28,7 @@ LOG="$LOGDIR/aquatransport-anisette.log"
 PORT=9724
 SERVER_LABEL=com.aquatransport.anisette-server
 TUNNEL_LABEL=com.aquatransport.anisette-tunnel
-SSH_HOST=mavericksm
+SSH_HOST=""
 
 plist_server="$AGENTS/$SERVER_LABEL.plist"
 plist_tunnel="$AGENTS/$TUNNEL_LABEL.plist"
@@ -81,7 +81,15 @@ PLIST
 
 case "${1:-}" in
 install)
-    [ $# -ge 2 ] && SSH_HOST="$2"
+    # The host name is interpolated into a bash -c command inside a launchd
+    # plist, so anything beyond host-name characters would be shell or XML
+    # injection; and there is no universal default -- an ssh alias local to
+    # one machine means nothing on another. Require the argument.
+    [ $# -ge 2 ] || { echo 'usage: anisette-host.sh install <ssh-host-or-alias>'; exit 1; }
+    SSH_HOST="$2"
+    case "$SSH_HOST" in
+        *[!A-Za-z0-9._-]*) echo "invalid host name: $SSH_HOST"; exit 1 ;;
+    esac
     mkdir -p "$DEST" "$AGENTS" "$LOGDIR"
     echo "Building anisette-server..."
     cc -O2 -Wall -framework Foundation "$DIR/tools/anisette-server.m" -o "$DEST/anisette-server"

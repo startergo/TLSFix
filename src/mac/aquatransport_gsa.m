@@ -8,6 +8,8 @@
 #import <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <syslog.h>
+#include <signal.h>
+#include <unistd.h>
 #include <zlib.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -266,14 +268,16 @@ static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLReques
 /* A local helper named by an exec: line in gsa-anisette-url.txt replaces the
  * HTTP provider: the adapter launches it, reads the same JSON dictionary from
  * stdout, and applies the same field whitelist. The helper is an absolute
- * executable path with nothing else on the line -- typically a one-line ssh
- * forced command that mints anisette on another Mac, so no server or tunnel
- * runs anywhere. Launching is direct (no shell), output is capped, and a hung
- * helper is terminated at the same 30-second bound the HTTP path enforces. */
+ * executable path with nothing else on the line -- a config line is not a
+ * shell, and the documented form is a one-line wrapper (an ssh forced command
+ * that mints anisette on another Mac, so no server or tunnel runs anywhere).
+ * Launching is direct, output is capped, a hung helper is killed at the same
+ * 30-second bound the HTTP path enforces, and a stopped request abandons the
+ * wait at once rather than holding the serial queue. */
 static NSDictionary *aq_exec_anisette(AQGSAProtocol *owner, NSString *cmd, NSError **error) {
     if ([cmd length] < 2 || ![cmd hasPrefix:@"/"] ||
         [cmd rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound) {
-        *error = aq_error(10, @"The anisette helper must be an absolute path with no arguments."); return nil;
+        *error = aq_error(10, @"The anisette helper must be an absolute path with no arguments; use a wrapper script."); return nil;
     }
     NSTask *task = [[[NSTask alloc] init] autorelease];
     NSPipe *pipe = [NSPipe pipe];
@@ -298,16 +302,35 @@ static NSDictionary *aq_exec_anisette(AQGSAProtocol *owner, NSString *cmd, NSErr
             dispatch_semaphore_signal(eof);
         }
     }];
-    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 30LL*NSEC_PER_SEC);
-    BOOL complete = !dispatch_semaphore_wait(eof, deadline) && done;
+    /* Wait in slices so a cancelled request is noticed immediately instead of
+     * blocking the serial authentication queue for the full bound. */
+    NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + 30.0;
+    BOOL complete = NO, stopped = NO;
+    while (!complete) {
+        stopped = [owner isStopped];
+        if (stopped) break;
+        if (dispatch_semaphore_wait(eof, dispatch_time(DISPATCH_TIME_NOW, 250LL*NSEC_PER_MSEC))) {
+            if ([NSDate timeIntervalSinceReferenceDate] >= deadline) break;
+            continue;
+        }
+        complete = done;
+    }
     if (!complete) {
         [[pipe fileHandleForReading] setReadabilityHandler:nil];
         [task terminate];
+        /* terminate is SIGTERM; a helper that handles or ignores it would
+         * otherwise hang waitUntilExit past every bound. */
+        NSDate *grace = [NSDate dateWithTimeIntervalSinceNow:2.0];
+        while ([task isRunning] && [grace timeIntervalSinceNow] > 0) usleep(50000);
+        if ([task isRunning]) kill([task processIdentifier], SIGKILL);
     }
+    /* The readability handler is gone in both paths -- it removed itself at
+     * EOF, or the block above removed it -- so nothing signals after this. */
+    dispatch_release(eof);
     @try { [task waitUntilExit]; } @catch (NSException *e) {}
     if (!complete) {
-        *error = [owner isStopped] ? aq_error(NSUserCancelledError, @"Sign-in cancelled.")
-                                   : aq_error(11, @"The anisette helper timed out."); return nil;
+        *error = stopped ? aq_error(NSUserCancelledError, @"Sign-in cancelled.")
+                         : aq_error(11, @"The anisette helper timed out."); return nil;
     }
     int status = [task terminationStatus];
     if (status != 0) {

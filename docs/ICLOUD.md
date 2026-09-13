@@ -115,6 +115,16 @@ loopback is what the adapter's URL check permits, and the tunnel provides the
 encryption. `anisette-host.sh` also has `status`, `stop` and `uninstall`
 subcommands.
 
+**Daemon-free variant.** `gsa-anisette-url.txt` also accepts an `exec:` line:
+the absolute path of a helper that prints the same JSON dictionary on stdout
+and exits. The adapter launches it directly — no shell, no arguments, at most a
+64 KiB response, killed at the HTTP path's 30-second bound — so the natural
+form is a one-line wrapper, e.g. an `ssh` forced command running
+`anisette-server --once` on the minting Mac. Nothing runs resident anywhere;
+each fetch costs one helper launch. The C-side keychain injection (below)
+understands the same `exec:` line, so DAV, Mail, keychain and sign-in paths all
+keep working when the loopback server is replaced by helpers.
+
 **The identity fields must pair with the one-time password.** AOSKit's OTP is
 minted under the current machine's AuthKit provisioning, so the accompanying
 fields must come from the same context — exactly the pairing SideStore's
