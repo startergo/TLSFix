@@ -13,6 +13,18 @@ device headers. The user confirmed both Calendar and Contacts work with the nati
 Mail failed with the account-helper fixes alone; the user confirmed it works after
 installing the six-field ATOKEN adapter on 2026-09-09. All 63 offline checks passed
 for that build, including native MailCore tests with synthetic credentials.**
+
+**2026-09-13 update:** Apple's edge stopped accepting the shared GSAPort anisette
+identity, and its password-equivalent exchange began issuing `U`-prefixed
+(144-char) MME tokens in place of `E`-prefixed ones. Both required adapter
+changes (self-hosted anisette with AKDevice-paired identity; `E`/`U` token
+acceptance). With those, a real pane sign-in, saved-token refresh and the Mail
+adapter all work end-to-end on 10.9.5: `account refresh completed (HTTP 200)`
+repeatedly, no password re-prompt. The pane's setup spinner can outlast the
+account creation because Apple's modern responses carry no setup transaction
+ID; the account is nevertheless written and functional — close and reopen the
+pane. `p402-quota.icloud.com` quota lookups still fail natively (no adapter,
+no device authentication) and only affect the storage display.
 The mock tests pass through the installed AOSKit framework's actual
 `AOSRequest` / `CFURLConnection` path. They cannot establish that Apple's current
 servers accept this client identity, issue the required tokens, or return an account
@@ -175,7 +187,7 @@ The module intercepts HTTPS requests on `setup.icloud.com`, port 443, for:
 * `/setup/login_or_create_account`
 * `/setup/iosbuddy/loginDelegates`
 * `/setup/authenticate/<Apple ID>` (including the literal `$APPLE_ID$` placeholder)
-* `/setup/get_account_settings` with a numeric DSID and a modern `E`-prefixed MME token
+* `/setup/get_account_settings` with a numeric DSID and a modern `E`- or `U`-prefixed MME token
 
 It recognizes preemptive Basic authentication or a plist body containing
 `username`/`apple-id` and `password`. It lowercases the account identifier before
@@ -292,7 +304,7 @@ The C engine loads the adapter during `SSLSetPeerDomainName`, before taking a TL
 context lock, only for exact iCloud IMAP/SMTP hosts and with legacy MailCore already
 present. The adapter replaces `_MCAppleTokenSaslClient initialResponse` in memory.
 It preserves native credential retrieval and appends device fields only to an
-existing three-field response with an `E`-prefixed token and an iCloud account
+existing three-field response with an `E`- or `U`-prefixed token and an iCloud account
 hostname. IMAP and SMTP hosts under `mail.me.com` and `mail.icloud.com`, including
 their `p<digits>-` shards, are recognized. Other accounts and older tokens retain
 native behavior. Device data is cached for 60 seconds per Mail process; credentials
