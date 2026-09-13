@@ -119,8 +119,11 @@ static BOOL aq_settings_request(NSURLRequest *req, NSArray *credentials) {
         [credentials count] != 2) return NO;
     NSString *dsid = [credentials objectAtIndex:0], *token = [credentials objectAtIndex:1];
     /* Modern MME tokens require device authentication on subsequent refreshes.
-     * These are DSID/token requests, never another password/SRP exchange. */
-    return [dsid length] && [token hasPrefix:@"E"] &&
+     * These are DSID/token requests, never another password/SRP exchange.
+     * Apple issued E-prefixed tokens through 2026-09-09; since 2026-09-13 the
+     * password-equivalent exchange returns U-prefixed tokens instead, and both
+     * spellings need the same device-authenticated refresh handling. */
+    return [dsid length] && ([token hasPrefix:@"E"] || [token hasPrefix:@"U"]) &&
         [dsid rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location == NSNotFound;
 }
 
@@ -652,7 +655,14 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
     [req setValue:aq_basic(user, pet) forHTTPHeaderField:@"Authorization"];
     NSData *auth = aq_send(owner, req, &response, error);
     if (!auth) return nil;
-    if (![[[original URL] path] isEqual:@"/setup/login_or_create_account"] || [response statusCode] != 200)
+    if ([response statusCode] != 200)
+        syslog(LOG_NOTICE, "AquaTransport iCloud token exchange failed (HTTP %ld, adapter 5)", (long)[response statusCode]);
+    /* The pane validates an already-signed-in account by sending its password to
+     * get_account_settings. Such a request must receive the settings document,
+     * not the authenticate reply, so both spellings complete the exchange. */
+    BOOL wantsSettings = [[[original URL] path] isEqual:@"/setup/login_or_create_account"] ||
+        [[[original URL] path] isEqual:@"/setup/get_account_settings"];
+    if (!wantsSettings || [response statusCode] != 200)
         return aq_result(response, auth);
     NSDictionary *account = aq_plist(auth);
     NSString *dsid = aq_string([aq_dict([account objectForKey:@"appleAccountInfo"]) objectForKey:@"dsid"]);
@@ -665,6 +675,8 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
     }
     [req setValue:@"false" forHTTPHeaderField:@"X-Aos-Accept-Tos"];
     NSData *data = aq_send(owner, req, &response, error);
+    if (data && [response statusCode] != 200)
+        syslog(LOG_NOTICE, "AquaTransport iCloud account settings rejected (HTTP %ld, adapter 5)", (long)[response statusCode]);
     return data ? aq_result(response, data) : nil;
 }
 
@@ -898,7 +910,8 @@ static NSData *aq_mail_initial_response(id self, SEL selector) {
     const unsigned char *bytes = [native bytes];
     NSUInteger length = [native length], separators = 0, tokenOffset = 0;
     for (NSUInteger i = 0; i < length; i++) if (!bytes[i]) { separators++; tokenOffset = i+1; }
-    if (separators != 2 || tokenOffset >= length || bytes[tokenOffset] != 'E') return native;
+    if (separators != 2 || tokenOffset >= length ||
+        (bytes[tokenOffset] != 'E' && bytes[tokenOffset] != 'U')) return native;
     SEL accountSelector = NSSelectorFromString(@"account"), hostSelector = NSSelectorFromString(@"hostname");
     if (![self respondsToSelector:accountSelector]) return native;
     id account = ((id(*)(id,SEL))objc_msgSend)(self, accountSelector);
