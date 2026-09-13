@@ -115,6 +115,25 @@ loopback is what the adapter's URL check permits, and the tunnel provides the
 encryption. `anisette-host.sh` also has `status`, `stop` and `uninstall`
 subcommands.
 
+**Quick start.** Prerequisites: the modern Mac is signed into iCloud (AOSKit
+mints nothing otherwise), and it can `ssh` into the client without a password —
+the tunnel dials *out to the client*, so the key lives on the modern Mac and the
+client runs sshd. Then:
+
+```sh
+# on the modern Mac
+tools/anisette-host.sh install <client-ssh-host>
+tools/anisette-host.sh status        # expect: agents running, HTTP 200
+
+# on the client
+echo http://127.0.0.1:9724/anisette | sudo tee /usr/share/aquatransport/config/gsa-anisette-url.txt
+```
+
+Sign-in, Mail, Calendar/Contacts, iMessage and iCloud Keychain then draw their
+device data from the modern Mac. `anisette-host.sh stop` suspends both agents
+and `uninstall` removes them; in between, the client keeps working from its
+saved tokens until a refresh needs new device data.
+
 **Daemon-free variant.** `gsa-anisette-url.txt` also accepts an `exec:` line:
 the absolute path of a helper that prints the same JSON dictionary on stdout
 and exits. The adapter launches it directly — no shell, no arguments, at most a
