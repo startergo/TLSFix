@@ -26,6 +26,7 @@
 #import <stdarg.h>
 #import <sys/socket.h>
 #import <unistd.h>
+#import <string.h>
 
 static Class gUtility, gAKDevice;
 static SEL gOTP, gSerial;
@@ -103,22 +104,43 @@ static void respond(int fd, int status, const char *reason, NSData *body) {
     }
 }
 
+static BOOL load_minters(void) {
+    void *lib = dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) { logline("dlopen AOSKit: %s", dlerror()); return NO; }
+    dlopen("/System/Library/PrivateFrameworks/AuthKit.framework/AuthKit", RTLD_LAZY | RTLD_LOCAL);
+    gUtility = NSClassFromString(@"AOSUtilities");
+    gAKDevice = NSClassFromString(@"AKDevice");
+    gOTP = NSSelectorFromString(@"retrieveOTPHeadersForDSID:");
+    gSerial = NSSelectorFromString(@"machineSerialNumber");
+    if (![gUtility respondsToSelector:gOTP] || !gAKDevice) {
+        logline("this system cannot mint device authentication data");
+        return NO;
+    }
+    return YES;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
+        /* --once: mint one dictionary, print JSON on stdout, exit. This is the
+         * mode an SSH forced command runs; no listener, no daemon. */
+        if (argc == 2 && !strcmp(argv[1], "--once")) {
+            if (!load_minters()) return 2;
+            NSString *error = nil;
+            NSDictionary *d = mint(&error);
+            if (!d) {
+                fprintf(stderr, "anisette-server: %s\n", [error UTF8String]);
+                return 1;
+            }
+            NSData *body = [NSJSONSerialization dataWithJSONObject:d options:0 error:NULL];
+            if (!body) return 1;
+            fwrite([body bytes], 1, [body length], stdout);
+            fputc('\n', stdout);
+            return 0;
+        }
         int port = argc > 1 ? atoi(argv[1]) : 9724;
         if (port < 1 || port > 65535) { logline("bad port %d", port); return 2; }
 
-        void *lib = dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
-        if (!lib) { logline("dlopen AOSKit: %s", dlerror()); return 2; }
-        dlopen("/System/Library/PrivateFrameworks/AuthKit.framework/AuthKit", RTLD_LAZY | RTLD_LOCAL);
-        gUtility = NSClassFromString(@"AOSUtilities");
-        gAKDevice = NSClassFromString(@"AKDevice");
-        gOTP = NSSelectorFromString(@"retrieveOTPHeadersForDSID:");
-        gSerial = NSSelectorFromString(@"machineSerialNumber");
-        if (![gUtility respondsToSelector:gOTP] || !gAKDevice) {
-            logline("this system cannot mint device authentication data");
-            return 2;
-        }
+        if (!load_minters()) return 2;
 
         signal(SIGPIPE, SIG_IGN);
         int s = socket(AF_INET, SOCK_STREAM, 0);

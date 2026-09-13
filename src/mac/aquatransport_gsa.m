@@ -234,13 +234,7 @@ static NSString *aq_device_uuid(void) {
     return device;
 }
 
-static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLRequest *req, NSError **error) {
-    NSHTTPURLResponse *r = nil;
-    NSData *d = aq_send(owner, req, &r, error);
-    if (!d) return nil;
-    if ([r statusCode] != 200) {
-        *error = aq_error(11, [NSString stringWithFormat:@"The anisette server returned HTTP %ld.", (long)[r statusCode]]); return nil;
-    }
+static NSDictionary *aq_json_anisette(NSData *d, NSError **error) {
     NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]);
     if (!json) { *error = aq_error(11, @"The anisette server did not return a JSON dictionary."); return nil; }
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
@@ -256,12 +250,83 @@ static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLReques
     return headers;
 }
 
+static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLRequest *req, NSError **error) {
+    NSHTTPURLResponse *r = nil;
+    NSData *d = aq_send(owner, req, &r, error);
+    if (!d) return nil;
+    if ([r statusCode] != 200) {
+        *error = aq_error(11, [NSString stringWithFormat:@"The anisette server returned HTTP %ld.", (long)[r statusCode]]); return nil;
+    }
+    return aq_json_anisette(d, error);
+}
+
+/* A local helper named by an exec: line in gsa-anisette-url.txt replaces the
+ * HTTP provider: the adapter launches it, reads the same JSON dictionary from
+ * stdout, and applies the same field whitelist. The helper is an absolute
+ * executable path with nothing else on the line -- typically a one-line ssh
+ * forced command that mints anisette on another Mac, so no server or tunnel
+ * runs anywhere. Launching is direct (no shell), output is capped, and a hung
+ * helper is terminated at the same 30-second bound the HTTP path enforces. */
+static NSDictionary *aq_exec_anisette(AQGSAProtocol *owner, NSString *cmd, NSError **error) {
+    if ([cmd length] < 2 || ![cmd hasPrefix:@"/"] ||
+        [cmd rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound) {
+        *error = aq_error(10, @"The anisette helper must be an absolute path with no arguments."); return nil;
+    }
+    NSTask *task = [[[NSTask alloc] init] autorelease];
+    NSPipe *pipe = [NSPipe pipe];
+    [task setLaunchPath:cmd];
+    [task setArguments:[NSArray array]];
+    [task setStandardOutput:pipe];
+    [task setStandardError:pipe];   /* stderr and stdout share the cap; the JSON parser rejects anything before it */
+    [task setEnvironment:[NSDictionary dictionary]];
+    @try { [task launch]; }
+    @catch (NSException *e) { *error = aq_error(10, @"The anisette helper could not be launched."); return nil; }
+
+    NSMutableData *out = [[[NSMutableData alloc] initWithCapacity:4096] autorelease];
+    __block BOOL done = NO;
+    dispatch_semaphore_t eof = dispatch_semaphore_create(0);
+    [[pipe fileHandleForReading] setReadabilityHandler:^(NSFileHandle *h) {
+        NSData *chunk = [h availableData];
+        if ([chunk length]) {
+            if ([out length]+[chunk length] <= 64*1024) [out appendData:chunk];
+        } else {
+            [h setReadabilityHandler:nil];
+            done = YES;
+            dispatch_semaphore_signal(eof);
+        }
+    }];
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 30LL*NSEC_PER_SEC);
+    BOOL complete = !dispatch_semaphore_wait(eof, deadline) && done;
+    if (!complete) {
+        [[pipe fileHandleForReading] setReadabilityHandler:nil];
+        [task terminate];
+    }
+    @try { [task waitUntilExit]; } @catch (NSException *e) {}
+    if (!complete) {
+        *error = [owner isStopped] ? aq_error(NSUserCancelledError, @"Sign-in cancelled.")
+                                   : aq_error(11, @"The anisette helper timed out."); return nil;
+    }
+    int status = [task terminationStatus];
+    if (status != 0) {
+        *error = aq_error(11, [NSString stringWithFormat:@"The anisette helper exited with status %d.", status]); return nil;
+    }
+    if ([out length] == 0 || [out length] > 64*1024) {
+        *error = aq_error(11, @"The anisette helper did not return usable data."); return nil;
+    }
+    return aq_json_anisette(out, error);
+}
+
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
     NSString *path = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-url.txt"];
     NSString *endpoint = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL]
                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if ([endpoint length]) {
+        if ([endpoint hasPrefix:@"exec:"]) {
+            NSDictionary *local = aq_exec_anisette(owner, [endpoint substringFromIndex:5], error);
+            if (!local) return nil;
+            [headers addEntriesFromDictionary:local];
+        } else {
         NSURL *url = [NSURL URLWithString:endpoint];
         /* NSURL renders an IPv6 loopback authority differently across releases:
          * the systems this adapter targets expose the host as "::1" without the
@@ -277,6 +342,7 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
         NSDictionary *remote = aq_remote_anisette(owner, [NSMutableURLRequest requestWithURL:url], error);
         if (!remote) return nil;
         [headers addEntriesFromDictionary:remote];
+        }
     } else {
         dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
         Class utility = NSClassFromString(@"AOSUtilities");
@@ -456,25 +522,36 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
         if (!reply) return nil;
         NSData *M2 = aq_data([reply objectForKey:@"M2"]);
         if (!aq_srp_verify(srp, [M2 bytes], [M2 length], key)) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (server proof invalid, code 24)");
             *error = aq_error(24, @"GrandSlam server proof did not verify."); return nil;
         }
         spd = aq_decrypt(aq_data([reply objectForKey:@"spd"]), key);
-        if (!spd) { *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil; }
+        if (!spd) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (session data invalid, code 25)");
+            *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil;
+        }
         NSDictionary *status = aq_dict([reply objectForKey:@"Status"]);
         NSString *secondary = aq_string([status objectForKey:@"au"]);
         if ([secondary isEqual:@"trustedDeviceSecondaryAuth"]) {
             NSString *dsid = aq_string([spd objectForKey:@"adsid"]), *token = aq_string([spd objectForKey:@"GsIdmsToken"]);
-            if (!dsid || !token) { *error = aq_error(26, @"Missing verification session."); return nil; }
+            if (!dsid || !token) {
+                syslog(LOG_NOTICE, "AquaTransport iCloud verification requested without a session (code 26)");
+                *error = aq_error(26, @"Missing verification session."); return nil;
+            }
             NSString *identity = aq_base64([[NSString stringWithFormat:@"%@:%@", dsid, token] dataUsingEncoding:NSUTF8StringEncoding]);
             if (!aq_second_factor(owner, identity, nil, error)) return nil;
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
+            syslog(LOG_NOTICE, "AquaTransport iCloud verification code requested (trusted device, code 401)");
             *error = aq_error(401, @"Approve sign-in on your trusted device, then enter your password followed by the six-digit code."); return nil;
         }
         if (secondary || [[status objectForKey:@"hsc"] integerValue] != 200) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (verification %s, hsc %ld, code 27)",
+                [secondary UTF8String] ?: "none", (long)[[status objectForKey:@"hsc"] integerValue]);
             *error = aq_error(27, @"This account requires an unsupported verification method (such as SMS)."); return nil;
         }
+        syslog(LOG_NOTICE, "AquaTransport iCloud proof accepted (adapter 5)");
     } @finally { aq_srp_free(srp); OPENSSL_cleanse(key, sizeof key); OPENSSL_cleanse(M, sizeof M); }
     return spd;
 }
