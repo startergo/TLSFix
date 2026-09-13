@@ -215,6 +215,20 @@ explicit Authorization header. A redirected DAV request must pass the host check
 again. General redirect/header rules cannot modify these reserved service hosts.
 The same `disable-icloud-gsa` flag disables the sign-in, DAV and Mail adapters.
 
+**iCloud Keychain** (2026-09-13): the keychain parameter and escrow services
+(`p<digits>-keyvalueservice.icloud.com`, `p<digits>-escrowproxy.icloud.com`)
+carry the same token authentication and are covered by the same streaming
+adapter and host reservation. Their client, `syncdefaultsd`, builds requests
+inside NSURLSession, which none of the request- or message-construction hooks
+observe; the Foundation module is therefore loaded from the TLS peer-name hook
+(the entry Mail uses), arming the adapter in time for the KVS client's retries.
+Daemons where the module cannot arm get device headers injected directly by
+the C rewriter from a loopback-only fetch of the configured anisette provider,
+cached one minute. With this, `syncdefaultsd`'s KVS exchanges return HTTP 200
+and the pane completes iCloud Keychain enablement; the SOS circle itself then
+follows its native approval flow. Find My Mac remains unavailable without a
+Recovery HD, and quota display (`p<digits>-quota.icloud.com`) has no adapter.
+
 ### iMessage profile authentication
 
 Adapter 9 adds default-on handling for HTTPS POST requests to
