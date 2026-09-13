@@ -82,13 +82,14 @@ PLIST
 case "${1:-}" in
 install)
     # The host name is interpolated into a bash -c command inside a launchd
-    # plist, so anything beyond host-name characters would be shell or XML
-    # injection; and there is no universal default -- an ssh alias local to
-    # one machine means nothing on another. Require the argument.
+    # plist, so shell and XML metacharacters must be refused. Legitimate ssh
+    # destinations that are safe there -- IPv6 literals, zone indices,
+    # user@host -- stay allowed; the empty string is not a destination at all.
     [ $# -ge 2 ] || { echo 'usage: anisette-host.sh install <ssh-host-or-alias>'; exit 1; }
     SSH_HOST="$2"
     case "$SSH_HOST" in
-        *[!A-Za-z0-9._-]*) echo "invalid host name: $SSH_HOST"; exit 1 ;;
+        ""|*[\\\"\'\$\`\;\&\|\<\>\(\)\{\}\!]*|*[![:print:]]*)
+            echo "invalid host name: $SSH_HOST"; exit 1 ;;
     esac
     mkdir -p "$DEST" "$AGENTS" "$LOGDIR"
     echo "Building anisette-server..."

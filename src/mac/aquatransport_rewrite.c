@@ -422,17 +422,27 @@ static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
  * The locale is fixed here -- this side has no per-process locale, and en_US
  * is what the adapter's client data carries. */
 static void device_generated(char out[3][64]) {
-    tzset();
     time_t now = time(NULL);
-    struct tm utc, loc;
+    struct tm utc;
     gmtime_r(&now, &utc);
     strftime(out[0], 64, "%Y-%m-%dT%H:%M:%SZ", &utc);
-    const char *tz = getenv("TZ");
-    const char *zone;
-    if (tz && *tz) zone = *tz == ':' ? tz + 1 : tz;
-    else { localtime_r(&now, &loc); zone = tzname[loc.tm_isdst > 0 ? 1 : 0]; }
+    /* Foundation stamps the system time-zone identifier ("Europe/Berlin",
+     * not an abbreviation) and the current locale; CoreFoundation supplies
+     * both without pulling in Objective-C, and this side already links it.
+     * A mismatch would present keychain requests as a different client
+     * class than the adapter's own traffic. */
+    CFTimeZoneRef z = CFTimeZoneCopySystem();
+    CFStringRef zn = z ? CFTimeZoneGetName(z) : NULL;
+    char *zone = zn ? cf_to_c(zn) : NULL;
     snprintf(out[1], 64, "%s", zone && *zone ? zone : "UTC");
-    snprintf(out[2], 64, "en_US");
+    if (zone) free(zone);
+    if (z) CFRelease(z);
+    CFLocaleRef lc = CFLocaleCopyCurrent();
+    CFStringRef ln = lc ? CFLocaleGetIdentifier(lc) : NULL;
+    char *locale = ln ? cf_to_c(ln) : NULL;
+    snprintf(out[2], 64, "%s", locale && *locale ? locale : "en_US");
+    if (locale) free(locale);
+    if (lc) CFRelease(lc);
 }
 
 /* Set the device headers on a CFHTTPMessage for a device-auth URL. Used only

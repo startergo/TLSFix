@@ -33,6 +33,7 @@ if [ ! -f "$BOM" ]
 then
 	echo "No AquaTransport receipt found; the framework is restored and there is nothing else to remove."
 	sudo shutdown -r now
+	exit 0
 fi
 
 # Remove every payload file the BOM records, except the admin's rule files.
