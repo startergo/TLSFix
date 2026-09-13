@@ -32,7 +32,7 @@ BOM="/var/db/receipts/$PKGID.bom"
 if [ ! -f "$BOM" ]
 then
 	echo "No AquaTransport receipt found; the framework is restored and there is nothing else to remove."
-	sudo shutdown -r now
+	sudo shutdown -r now || exit 1
 	exit 0
 fi
 

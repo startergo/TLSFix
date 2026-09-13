@@ -416,11 +416,12 @@ static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
 
 /* The Foundation adapter stamps every anisette use with client time, time zone
  * and locale; the C injection presents the same set so the request does not
- * read as a different client class. The zone takes TZ when the user set it --
- * its value is the identifier form NSTimeZone names -- and the abbreviation
- * tzname carries otherwise, for the zone as it stands right now, DST included.
- * The locale is fixed here -- this side has no per-process locale, and en_US
- * is what the adapter's client data carries. */
+ * read as a different client class. Both come from CoreFoundation: the system
+ * time-zone identifier (what NSTimeZone reports, not an abbreviation) and the
+ * process's current locale. Sending each process's real locale is the point,
+ * not a regression -- it is exactly what the Foundation adapter's own traffic
+ * from that same process would carry, so the two paths stay indistinguishable
+ * even where a daemon's locale differs from a GUI app's. */
 static void device_generated(char out[3][64]) {
     time_t now = time(NULL);
     struct tm utc;
