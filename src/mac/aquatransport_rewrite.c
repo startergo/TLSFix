@@ -151,6 +151,22 @@ void tf_gsa_prepare_mail(const char *host, size_t length) {
     if (adapter && selector && send) send(adapter, selector("install"));
 }
 
+/* Keychain traffic arrives here for the same reason Mail does: syncdefaultsd
+ * builds its KVS requests inside NSURLSession, which passes through none of
+ * the request or message construction points above, so the first this library
+ * learns of the exchange is the TLS peer name. Loading the module here arms
+ * the streaming adapter in time for the next attempt -- the KVS client
+ * retries -- and the direct message injection covers any stream-path callers
+ * the Foundation protocol still cannot see. */
+void tf_gsa_prepare_keychain(const char *host, size_t length) {
+    if (tf_flag("disable-icloud-gsa")) return;
+    if (length < 22) return;
+    int kv = length >= 26 && !strncasecmp(host + length - 26, "keyvalueservice.icloud.com", 26);
+    int escrow = !kv && !strncasecmp(host + length - 22, "escrowproxy.icloud.com", 22);
+    if (!kv && !escrow) return;
+    prepare_gsa();
+}
+
 static int gsa_dav_url(const char *url) {
     if (strncasecmp(url, "https://", 8)) return 0;
     const char *h = url + 8, *end = h + strcspn(h, "/?#");
@@ -166,9 +182,185 @@ static int gsa_dav_url(const char *url) {
     size_t n; const char *legacy;
     if (!strncasecmp(h, "caldav.icloud.com", 17)) { n = 17; legacy = ":8443"; }
     else if (!strncasecmp(h, "contacts.icloud.com", 19)) { n = 19; legacy = ":8843"; }
+    /* iCloud Keychain parameter and escrow traffic carries the same modern
+     * token authentication and needs the same device headers as DAV; the KVS
+     * client (syncdefaultsd) is Foundation and runs the streaming adapter.
+     * These hosts are 443-only. */
+    else if (!strncasecmp(h, "keyvalueservice.icloud.com", 26)) { n = 26; legacy = NULL; }
+    else if (!strncasecmp(h, "escrowproxy.icloud.com", 22)) { n = 22; legacy = NULL; }
     else return 0;
     return h+n == end || (end-(h+n) == 4 && !strncmp(h+n, ":443", 4)) ||
-           (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
+           (legacy && end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
+}
+
+/* iCloud Keychain traffic (secd through syncdefaultsd) is token-authenticated
+ * and needs the same device headers as DAV, but its daemons build requests as
+ * raw CFHTTPMessages on the stream path, where no NSURLProtocol can ever run:
+ * the Foundation module, armed or not, cannot help them. The hosts below get
+ * their headers set directly on the message. The narrower list than the DAV
+ * matcher is deliberate: caldav/contacts clients are Foundation applications
+ * where the streaming adapter owns the request, and a second header pass here
+ * would duplicate what it already added. */
+static int device_auth_url(const char *url) {
+    if (strncasecmp(url, "https://", 8)) return 0;
+    const char *h = url + 8, *end = h + strcspn(h, "/?#");
+    for (const char *p = h; p < end; p++) if (*p == '@') h = p + 1;
+    if (*h == 'p' || *h == 'P') {
+        h++;
+        const char *digits = h;
+        while (*h >= '0' && *h <= '9') h++;
+        if (h == digits || *h++ != '-') return 0;
+    }
+    size_t n;
+    if (!strncasecmp(h, "keyvalueservice.icloud.com", 26)) n = 26;
+    else if (!strncasecmp(h, "escrowproxy.icloud.com", 22)) n = 22;
+    else return 0;
+    return h+n == end || (end-(h+n) == 4 && !strncmp(h+n, ":443", 4));
+}
+
+/* The device data comes from the same provider the GSA module uses, fetched
+ * here with a socket because this side has no HTTP stack it may lean on.
+ * Loopback HTTP only -- the module's own URL check permits exactly that
+ * without a certificate, and this code has nowhere to validate one. Values
+ * are base64, UUID or digit strings, so scanning for the closing quote is a
+ * complete parse; anything else is refused rather than half-trusted. One
+ * fetch per minute; a failure leaves the previous data in place, as the OTP
+ * bucket outlives a brief provider outage. */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <time.h>
+
+static const char *const device_keys[] = {
+    "X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU", "X-Apple-I-MD-RINFO",
+    "X-Mme-Device-Id", "X-Apple-I-SRL-NO", "X-MMe-Client-Info", NULL
+};
+#define DEVICE_VALUES 7
+#define DEVICE_VALUE_MAX 16384
+
+static pthread_mutex_t device_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/gsa-anisette-url.txt", tf_dir());
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char url[512] = "";
+    int have = fgets(url, sizeof url, f) != NULL;
+    fclose(f);
+    if (!have) return 0;
+    char *trim = url + strlen(url);
+    while (trim > url && (trim[-1] == '\n' || trim[-1] == '\r' || trim[-1] == ' ')) *--trim = 0;
+
+    /* http://127.0.0.1:PORT/... or http://localhost:PORT/... only. */
+    const char *prefix = NULL;
+    if (!strncasecmp(url, "http://127.0.0.1:", 17)) prefix = url + 7;
+    else if (!strncasecmp(url, "http://localhost:", 17)) prefix = url + 7;
+    if (!prefix) return 0;
+    const char *slash = strchr(prefix, '/');
+    char authority[256];
+    size_t alen = slash ? (size_t)(slash - prefix) : strlen(prefix);
+    if (!alen || alen >= sizeof authority) return 0;
+    memcpy(authority, prefix, alen); authority[alen] = 0;
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("127.0.0.1", strrchr(authority, ':') ? strrchr(authority, ':')+1 : "80", &hints, &res) || !res)
+        return 0;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return 0; }
+    struct timeval tv = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int connected = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
+    freeaddrinfo(res);
+    if (!connected) { close(fd); return 0; }
+
+    char req[1200];
+    int n = snprintf(req, sizeof req, "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        slash ? slash : "/", authority);
+    if (n <= 0 || n >= (int)sizeof req || write(fd, req, (size_t)n) < 0) { close(fd); return 0; }
+
+    char body[32 * 1024];
+    size_t total = 0;
+    ssize_t got;
+    while (total < sizeof body - 1 && (got = read(fd, body + total, sizeof body - 1 - total)) > 0) total += (size_t)got;
+    close(fd);
+    body[total] = 0;
+
+    char *b = strstr(body, "\r\n\r\n");
+    if (!b || total < 12 || strncmp(body, "HTTP/1.", 7) || strncmp(body + 9, "200", 3)) return 0;
+    b += 4;
+
+    int found = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        out[i][0] = 0;
+        char needle[64];
+        snprintf(needle, sizeof needle, "\"%s\":\"", device_keys[i]);
+        char *v = strstr(b, needle);
+        if (!v) continue;
+        v += strlen(needle);
+        char *endv = strchr(v, '"');
+        if (!endv) continue;
+        size_t len = (size_t)(endv - v);
+        if (!len || len >= DEVICE_VALUE_MAX) continue;
+        memcpy(out[i], v, len); out[i][len] = 0;
+        found++;
+    }
+    /* The one-time password and the machine data are the irreducible pair. */
+    return out[0][0] && out[1][0] && found >= 2;
+}
+
+/* Returns 1 with fresh-enough values in out, locking the cache. */
+static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    static char cache[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    static time_t when;
+    int ok = 0;
+    pthread_mutex_lock(&device_lock);
+    time_t now = time(NULL);
+    if (when && now - when < 60) {
+        memcpy(out, cache, sizeof cache);
+        ok = out[0][0] && out[1][0];
+    } else if (device_fetch(out)) {
+        memcpy(cache, out, sizeof cache);
+        when = now;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&device_lock);
+    return ok;
+}
+
+/* Set the device headers on a CFHTTPMessage for a device-auth URL. Used only
+ * where no NSURLProtocol can be running for this request: the raw stream path,
+ * and request-path processes where the Foundation module could not arm. */
+static void device_headers_message(void *msg) {
+    char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    if (!device_values(values)) return;
+    for (int i = 0; device_keys[i]; i++) {
+        if (!values[i][0]) continue;
+        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
+        if (n && v) p_MsgSetHeader(msg, n, v);
+        if (n) CFRelease(n);
+        if (v) CFRelease(v);
+    }
+    tf_log("device authentication headers added to keychain request");
+}
+
+static void device_headers_request(void *req) {
+    char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    if (!device_values(values)) return;
+    for (int i = 0; device_keys[i]; i++) {
+        if (!values[i][0]) continue;
+        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
+        if (n && v) p_SetHeader(req, n, v);
+        if (n) CFRelease(n);
+        if (v) CFRelease(v);
+    }
+    tf_log("device authentication headers added to keychain request");
 }
 
 /* The reservation shields the GSA exchange from general rules, but only where the
@@ -271,6 +463,14 @@ static int apply_rules(void *m) {
     if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         prepare_gsa();
         if (gsa_armed()) { free(before); return 0; }
+        /* A process where the module could not arm still gets its keychain
+         * traffic through: the rewritten copy carries the device headers, so
+         * report the change and let the caller send it. */
+        if (device_auth_url(before)) {
+            device_headers_request(m);
+            free(before);
+            return 1;
+        }
     }
 
     // One critical section across the redirect, the match, and the use of what matched: the
@@ -378,6 +578,13 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
 
     void *msg = p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, use, (CFStringRef)version);
     if (msg && hr) apply_header_rule(hr, msg, (hdr_set)p_MsgSetHeader);
+    /* No NSURLProtocol exists for this stream: whatever runs here keeps its
+     * native token authentication and gains the device headers directly. Only
+     * when the module is not armed -- an armed process sends its keychain
+     * traffic through the streaming adapter, which has added its own. */
+    if (msg && gsa_possible() && !gsa_armed() && !tf_flag("disable-icloud-gsa") &&
+        device_auth_url(before))
+        device_headers_message(msg);
     tf_rules_unlock();
 
     if (nu) CFRelease(nu);

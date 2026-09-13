@@ -751,11 +751,15 @@ static BOOL aq_dav_url(NSURL *url) {
     if (![[[url scheme] lowercaseString] isEqual:@"https"] || [url password]) return NO;
     NSString *host = [[url host] lowercaseString];
     NSInteger port = [[url port] integerValue];
-    NSInteger legacy = [host hasSuffix:@"caldav.icloud.com"] ? 8443 : 8843;
+    /* The DAV hosts carry legacy alternate ports; keyvalueservice and
+     * escrowproxy (iCloud Keychain parameters and escrow) are 443-only. */
+    NSInteger legacy = 443;
+    if ([host hasSuffix:@"caldav.icloud.com"]) legacy = 8443;
+    else if ([host hasSuffix:@"contacts.icloud.com"]) legacy = 8843;
     if ([url port] && port != 443 && port != legacy) return NO;
     if (!host) return NO;
     NSRegularExpression *pattern = [NSRegularExpression regularExpressionWithPattern:
-        @"^(p[0-9]+-)?(caldav|contacts)\\.icloud\\.com$" options:0 error:NULL];
+        @"^(p[0-9]+-)?(caldav|contacts|keyvalueservice|escrowproxy)\\.icloud\\.com$" options:0 error:NULL];
     return [pattern numberOfMatchesInString:host options:0 range:NSMakeRange(0,[host length])] == 1;
 }
 static NSURL *aq_dav_transport_url(NSURL *url) {
