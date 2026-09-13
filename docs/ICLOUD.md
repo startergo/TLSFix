@@ -248,6 +248,14 @@ not establish that interception failed: the HTTP request runs in the XPC agent.
 Use ASL's `Seq` substring operator to find AquaTransport diagnostics; `C` alone is
 case-folded equality, not a contains query.
 
+On 2026-09-13, with self-hosted AKDevice-paired anisette, a real user sign-in
+completed the full chain on 10.9.5: GrandSlam SRP challenge accepted, adapter 9's
+profile exchange, and adapter 10's Madrid delegate login at
+`/setup/iosbuddy/loginDelegates` returning HTTP 200 with overall status 0 and
+delegate status 0. The user signed into Messages — the first confirmed Apple-side
+acceptance of the PET-to-delegate exchange. Message sending and FaceTime
+activation remain separately unverified.
+
 Adapter 10 passes 98 offline checks, including compressed iMessage sign-in, 2FA,
 failed delegates, missing credentials, malformed statuses, rejected redirects,
 invalid server proofs, decompression limits, endpoint scope and the off flag,
