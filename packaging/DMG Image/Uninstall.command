@@ -21,6 +21,7 @@ sudo mv -f "$SECURITY_BIN.original" "$SECURITY_BIN"
 # the fresh defaults.
 sudo rm -f /usr/share/aquatransport/aquatransport.dylib \
            /usr/share/aquatransport/aquatransport_engine.dylib \
+           /usr/share/aquatransport/aquatransport_gsa.dylib \
            /usr/share/aquatransport/insert_dylib \
            /usr/share/aquatransport/aquatransport.sh \
            /usr/share/aquatransport/uninstall.sh
