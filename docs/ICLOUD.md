@@ -159,11 +159,75 @@ Pieces:
 
 1. **Server.** [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server)
    built from source (the release Docker image predates the POST endpoint) and
-   bound to loopback on any always-on host — a free-tier VM is plenty. Two
-   deployment traps: the ADI library does its own single-level `mkdir` under
-   `$XDG_RUNTIME_DIR/anisette-v3/provisioning`, which must exist first (else
-   `-45054`, see the project's issue #52), and Apple's root CA is absent from
-   Ubuntu's trust store (extract it from the served chain and install it).
+   bound to loopback on any always-on host — a free-tier VM is plenty.
+   Setup, as deployed and verified on 2026-09-14:
+
+   Any always-on Linux host works. Oracle Cloud's Always Free tier (an Ampere
+   A1 instance at up to 4 OCPU / 24 GB, no expiry) is one option; Ubuntu 24.04+
+   on aarch64 or x86_64, with only inbound ssh exposed. Build and install:
+
+   ```sh
+   sudo apt install -y ldc dub libz-dev libssl-dev gcc ca-certificates git
+   git clone https://github.com/Dadoum/anisette-v3-server /opt/anisette-v3
+   cd /opt/anisette-v3
+   DC=ldc2 dub build -c static --build-mode allAtOnce -b release --compiler=ldc2
+   ```
+
+   On first start the server downloads the ADI libraries from Apple's own
+   Music APK; nothing to extract by hand. Ubuntu's trust store lacks Apple's
+   root, which the provisioning requests need — take it from the chain Apple
+   itself serves:
+
+   ```sh
+   echo | openssl s_client -connect gsa.apple.com:443 -servername gsa.apple.com -showcerts 2>/dev/null \
+     | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | awk "/BEGIN/{n++} n==3" | sudo tee \
+     /usr/local/share/ca-certificates/apple-root-g1.crt >/dev/null
+   sudo update-ca-certificates
+   ```
+
+   The ADI library makes its own single-level `mkdir` under
+   `$XDG_RUNTIME_DIR/anisette-v3/provisioning`; the directory must already
+   exist or every provisioning ends in `-45054` (the project's issue #52). A
+   unit that arranges both:
+
+   ```ini
+   [Unit]
+   Description=anisette-v3-server
+   After=network-online.target
+
+   [Service]
+   User=youruser
+   WorkingDirectory=/opt/anisette-v3
+   Environment=XDG_RUNTIME_DIR=/tmp/xdg
+   ExecStartPre=/bin/mkdir -p /tmp/xdg/anisette-v3/provisioning
+   ExecStartPre=/bin/chmod 777 /tmp/xdg/anisette-v3
+   ExecStart=/opt/anisette-v3/anisette-v3-server --host 127.0.0.1 --port 6969
+   Restart=always
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   An idle-always-free Oracle instance can be reclaimed after days of ~zero
+   CPU; a five-minutely crontab that burns a few seconds of CPU prevents that.
+
+   A 10.9 client cannot negotiate with a current sshd, so the tunnel in piece 3
+   needs the legacy algorithms re-enabled additively on the server (modern
+   clients are unaffected):
+
+   ```sh
+   printf "KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha256,ecdh-sha2-nistp256\nHostKeyAlgorithms +ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\nCiphers +aes128-ctr,aes192-ctr,aes256-ctr\n" \
+     | sudo tee /etc/ssh/sshd_config.d/10-legacy-mavericks.conf
+   sudo sshd -t && sudo systemctl reload ssh
+   ```
+
+   Verify before moving on — a POST with a dummy identity must reach the
+   endpoint (a JSON error reply, not an HTML 405 from a stale build):
+
+   ```sh
+   curl -sS -X POST -H "Content-Type: application/json" \
+     -d '{"identifier":"","adi_pb":""}' http://127.0.0.1:6969/v3/get_headers
+   ```
 2. **Identity.** `tools/anisette-v3-provision.py` runs the one-time
    provisioning WebSocket and writes the adapter-ready identity file
    (`adi_identifier`, `adi_pb`, `client-info` — copy it to
