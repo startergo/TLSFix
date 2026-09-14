@@ -162,9 +162,21 @@ Pieces:
    bound to loopback on any always-on host — a free-tier VM is plenty.
    Setup, as deployed and verified on 2026-09-14:
 
-   Any always-on Linux host works. Oracle Cloud's Always Free tier (an Ampere
-   A1 instance at up to 4 OCPU / 24 GB, no expiry) is one option; Ubuntu 24.04+
-   on aarch64 or x86_64, with only inbound ssh exposed. Build and install:
+   Any always-on Linux host works. Oracle Cloud's Always Free tier is one
+   option — an Ampere A1 instance, no expiry. Size it **within the current
+   allowance: 2 OCPU / 12 GB total across all A1 instances** (1,500 OCPU-hours
+   and 9,000 GB-hours per month). Oracle cut this from 4 / 24 in June 2026 by
+   editing only its Always Free page, so re-check it before sizing; an
+   over-limit instance is shut down or terminated, and this server needs a
+   fraction of even one OCPU. The rest of the instance recipe: pick the home
+   region deliberately (it is permanent, and A1 capacity varies by region),
+   aarch64 or x86_64 Ubuntu, public subnet with a public IPv4, your ssh key
+   pasted at creation, and a **budget alert at $1** as the early warning if
+   anything drifts off the free allowance. "Out of host capacity" at creation
+   is region-dependent: retry other availability domains, try a smaller shape
+   first and resize once running, retry off-peak, or loop the launch call via
+   the OCI CLI. Ubuntu 24.04+ on aarch64 or x86_64, with only inbound ssh
+   exposed. Build and install:
 
    ```sh
    sudo apt install -y ldc dub libz-dev libssl-dev gcc ca-certificates git
