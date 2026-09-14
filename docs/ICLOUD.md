@@ -144,6 +144,51 @@ each fetch costs one helper launch. The C-side keychain injection (below)
 understands the same `exec:` line, so DAV, Mail, keychain and sign-in paths all
 keep working when the loopback server is replaced by helpers.
 
+### Anisette V3: a self-contained client identity
+
+V1 is closed to new identities: every freshly provisioned V1 pair — including
+the `GET /` output of omnisette-server, anisette-v3-server, and SideStore's
+own production servers — is refused by Apple's edge with the same bare 503 as
+a mismatched pair (verified 2026-09-14). What still works is **V3**: the
+client holds its own identity (a 16-byte identifier plus an `adi.pb`
+provisioning record), and the server only *derives* one-time passwords from
+it, statelessly, over `POST /v3/get_headers`. No other machine's anisette
+identity is borrowed, so nothing shared can be revoked underneath you.
+
+Pieces:
+
+1. **Server.** [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server)
+   built from source (the release Docker image predates the POST endpoint) and
+   bound to loopback on any always-on host — a free-tier VM is plenty. Two
+   deployment traps: the ADI library does its own single-level `mkdir` under
+   `$XDG_RUNTIME_DIR/anisette-v3/provisioning`, which must exist first (else
+   `-45054`, see the project's issue #52), and Apple's root CA is absent from
+   Ubuntu's trust store (extract it from the served chain and install it).
+2. **Identity.** `tools/anisette-v3-provision.py` runs the one-time
+   provisioning WebSocket and writes the identity. The client info it
+   provisions under **must be akd-flavored** — an identity provisioned in the
+   Xcode AuthKit context is refused outright, while akd-context identities are
+   accepted in every service context (`svct` iMessage or iCloud, with or
+   without hardware headers; verified 2026-09-14 on 10.9.5).
+3. **Client config.** The identity lands in
+   `/usr/share/aquatransport/config/gsa-anisette-v3.json` (`adi_identifier`,
+   `adi_pb`, `client-info`), and `gsa-anisette-url.txt` holds
+   `v3:http://127.0.0.1:PORT/v3/get_headers`. The adapter posts the identity,
+   derives the local-user hash and device UUID from the identifier itself, and
+   presents the provisioning client info. The C-side keychain injection speaks
+   the same `v3:` form, so keychain traffic rides the same identity. The
+   server URL must be loopback on the client — an ssh tunnel from the client
+   (`ssh -N -L 9724:127.0.0.1:6969 user@server`) as a launch daemon is the
+   durable arrangement; a 10.9 client needs the server's sshd to permit its
+   legacy key exchange and RSA signatures.
+
+Sign-in under a new identity invalidates tokens issued under the old one:
+expect one password re-entry after switching, after which sign-in refresh,
+Mail, Calendar/Contacts, iMessage and Keychain all run on the client's own
+identity. Verified end-to-end on 10.9.5 on 2026-09-14: GrandSlam proof
+accepted, account refresh HTTP 200, keyvalueservice HTTP 200, through a
+free-tier VM and the box's own identity.
+
 **The identity fields must pair with the one-time password.** AOSKit's OTP is
 minted under the current machine's AuthKit provisioning, so the accompanying
 fields must come from the same context — exactly the pairing SideStore's

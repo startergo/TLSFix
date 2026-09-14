@@ -342,6 +342,74 @@ static NSDictionary *aq_exec_anisette(AQGSAProtocol *owner, NSString *cmd, NSErr
     return aq_json_anisette(out, error);
 }
 
+/* The V3 provider holds the machine identity on THIS machine: a 16-byte
+ * identifier and the adi.pb provisioning record (minted once through the
+ * server's /v3/provisioning_session relay). Per fetch, the server derives the
+ * one-time password and machine data from that pair; the local-user hash and
+ * device UUID are computed here and never leave the machine. The identity file
+ * sits beside the URL config and carries the client info the identity was
+ * provisioned under -- presenting any other client info with these values
+ * would break the pairing. The provisioning flavor matters: akd-context
+ * identities pass Apple's edge, Xcode-context identities are refused (verified
+ * 2026-09-14); hardware headers are optional either way. */
+static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NSError **error) {
+    NSString *identityPath = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-v3.json"];
+    NSDictionary *identity = aq_dict([NSJSONSerialization JSONObjectWithData:
+        [NSData dataWithContentsOfFile:identityPath] options:0 error:NULL]);
+    /* EVP decode rather than -initWithBase64Encoding: for one code path on
+     * every target, the way aq_credentials already decodes. */
+    NSData *identifier = nil;
+    NSString *idb64 = aq_string([identity objectForKey:@"adi_identifier"]);
+    if (idb64 && [idb64 length] >= 24 && !([idb64 length] % 4)) {
+        const unsigned char *in = (const unsigned char *)[idb64 UTF8String];
+        NSMutableData *dec = [NSMutableData dataWithLength:[idb64 length]];
+        int len = EVP_DecodeBlock([dec mutableBytes], in, (int)[idb64 length]);
+        if (len >= 16) {
+            int pad = ([idb64 characterAtIndex:[idb64 length]-1] == '=') + ([idb64 characterAtIndex:[idb64 length]-2] == '=');
+            [dec setLength:len - pad];
+            identifier = dec;
+        }
+    }
+    NSString *adi = aq_string([identity objectForKey:@"adi_pb"]);
+    if ([identifier length] != 16 || !adi) {
+        *error = aq_error(14, @"The V3 identity file needs a 16-byte adi_identifier and an adi_pb (both base64)."); return nil;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:endpoint]];
+    [req setHTTPMethod:@"POST"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setHTTPBody:[NSJSONSerialization dataWithJSONObject:
+        [NSDictionary dictionaryWithObjectsAndKeys:aq_base64(identifier), @"identifier", adi, @"adi_pb", nil]
+        options:0 error:NULL]];
+    NSHTTPURLResponse *response = nil;
+    NSData *data = aq_send(owner, req, &response, error);
+    if (!data) return nil;
+    NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:data options:0 error:NULL]);
+    NSString *otp = aq_string([json objectForKey:@"X-Apple-I-MD"]), *mid = aq_string([json objectForKey:@"X-Apple-I-MD-M"]);
+    NSString *rinfo = aq_string([json objectForKey:@"X-Apple-I-MD-RINFO"]);
+    if ([response statusCode] != 200 || !otp || !mid) {
+        syslog(LOG_NOTICE, "AquaTransport iCloud V3 anisette failed (HTTP %ld)", (long)[response statusCode]);
+        *error = aq_error(11, @"The V3 anisette server did not return device data."); return nil;
+    }
+    /* LU and the device UUID are pure functions of the identifier; RINFO comes
+     * from the derivation, the client info from the provisioning record. */
+    unsigned char lu[32];
+    if (!HMAC(EVP_sha256(), NULL, 0, [identifier bytes], 16, lu, NULL)) {
+        *error = aq_error(12, @"Could not derive the local user hash."); return nil;
+    }
+    NSMutableString *luHex = [NSMutableString string];
+    for (int i = 0; i < 32; i++) [luHex appendFormat:@"%02x", lu[i]];
+    const unsigned char *b = [identifier bytes];
+    NSString *device = [NSString stringWithFormat:@"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]];
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+        otp, @"X-Apple-I-MD",
+        mid, @"X-Apple-I-MD-M",
+        luHex, @"X-Apple-I-MD-LU",
+        rinfo ?: @"17106176", @"X-Apple-I-MD-RINFO",
+        device, @"X-Mme-Device-Id",
+        aq_string([identity objectForKey:@"client-info"]) ?: @"", @"X-MMe-Client-Info", nil];
+}
+
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
     NSString *path = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-url.txt"];
@@ -352,6 +420,10 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
             NSDictionary *local = aq_exec_anisette(owner, [endpoint substringFromIndex:5], error);
             if (!local) return nil;
             [headers addEntriesFromDictionary:local];
+        } else if ([endpoint hasPrefix:@"v3:"]) {
+            NSDictionary *v3 = aq_v3_anisette(owner, [endpoint substringFromIndex:3], error);
+            if (!v3) return nil;
+            [headers addEntriesFromDictionary:v3];
         } else {
         NSURL *url = [NSURL URLWithString:endpoint];
         /* NSURL renders an IPv6 loopback authority differently across releases:

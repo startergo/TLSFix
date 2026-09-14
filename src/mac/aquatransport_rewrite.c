@@ -236,6 +236,7 @@ static int device_auth_url(const char *url) {
 #include <netinet/in.h>
 #include <netdb.h>
 #include <time.h>
+#include <openssl/sha.h>
 
 static const char *const device_keys[] = {
     "X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU", "X-Apple-I-MD-RINFO",
@@ -337,23 +338,20 @@ static int device_fetch_exec(const char *spec, char out[DEVICE_VALUES][DEVICE_VA
     return device_parse(body, out);
 }
 
-static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
-    char url[512];
-    if (!device_read_line(url, sizeof url)) return 0;
-
-    if (!strncasecmp(url, "exec:", 5)) return device_fetch_exec(url + 5, out);
-
-    /* http://127.0.0.1:PORT/... or http://localhost:PORT/... only: plain HTTP
-     * is permitted exactly on loopback, and this side has no certificate
-     * validation to offer any other transport. */
+/* One plain-HTTP exchange with a loopback provider. Returns the response body
+ * (after the blank line) or NULL. Plain HTTP is permitted exactly on loopback,
+ * and this side has no certificate validation to offer any other transport. */
+static char *device_loopback_http(const char *url, const char *method,
+                                  const char *body, const char *ctype,
+                                  char resp[], size_t resp_size) {
     const char *prefix = NULL;
     if (!strncasecmp(url, "http://127.0.0.1:", 17)) prefix = url + 7;
     else if (!strncasecmp(url, "http://localhost:", 17)) prefix = url + 7;
-    if (!prefix) return 0;
+    if (!prefix) return NULL;
     const char *slash = strchr(prefix, '/');
     char authority[256];
     size_t alen = slash ? (size_t)(slash - prefix) : strlen(prefix);
-    if (!alen || alen >= sizeof authority) return 0;
+    if (!alen || alen >= sizeof authority) return NULL;
     memcpy(authority, prefix, alen); authority[alen] = 0;
 
     struct addrinfo hints, *res = NULL;
@@ -361,31 +359,139 @@ static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo("127.0.0.1", strrchr(authority, ':') ? strrchr(authority, ':')+1 : "80", &hints, &res) || !res)
-        return 0;
+        return NULL;
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return 0; }
+    if (fd < 0) { freeaddrinfo(res); return NULL; }
     struct timeval tv = {10, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     int connected = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
     freeaddrinfo(res);
-    if (!connected) { close(fd); return 0; }
+    if (!connected) { close(fd); return NULL; }
 
-    char req[1200];
-    int n = snprintf(req, sizeof req, "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-        slash ? slash : "/", authority);
-    if (n <= 0 || n >= (int)sizeof req || write(fd, req, (size_t)n) < 0) { close(fd); return 0; }
+    size_t blen = body ? strlen(body) : 0;
+    char req[2048];
+    int n = snprintf(req, sizeof req,
+        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s%s%s%zu\r\n\r\n",
+        method, slash ? slash : "/", authority,
+        body ? "Content-Type: " : "", body ? ctype : "", body ? "\r\nContent-Length: " : "", blen);
+    if (n <= 0 || n >= (int)sizeof req) { close(fd); return NULL; }
+    if (write(fd, req, (size_t)n) < 0 || (blen && write(fd, body, blen) < 0)) { close(fd); return NULL; }
 
-    char body[32 * 1024];
     size_t total = 0;
     ssize_t got;
-    while (total < sizeof body - 1 && (got = read(fd, body + total, sizeof body - 1 - total)) > 0) total += (size_t)got;
+    while (total < resp_size - 1 && (got = read(fd, resp + total, resp_size - 1 - total)) > 0) total += (size_t)got;
     close(fd);
-    body[total] = 0;
+    resp[total] = 0;
 
-    char *b = strstr(body, "\r\n\r\n");
-    if (!b || total < 12 || strncmp(body, "HTTP/1.", 7) || strncmp(body + 9, "200", 3)) return 0;
-    return device_parse(b + 4, out);
+    char *b = strstr(resp, "\r\n\r\n");
+    if (!b || total < 12 || strncmp(resp, "HTTP/1.", 7) || strncmp(resp + 9, "200", 3)) return NULL;
+    return b + 4;
+}
+
+/* Base64 decode of the identity fields, sized for the 16-byte identifier and
+ * the bounded adi.pb; rejects anything that would not fit. */
+static int device_b64(const char *s, unsigned char *out, size_t max, size_t *len) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = 0, acc = 0, bits = 0;
+    for (; *s && *s != '"'; s++) {
+        const char *p = strchr(tbl, *s);
+        if (*s == '=' ) continue;
+        if (!p || *s == '\n' || *s == '\r' || *s == ' ') continue;
+        acc = (acc << 6) | (size_t)(p - tbl);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n >= max) return 0;
+            out[n++] = (unsigned char)((acc >> bits) & 0xFF);
+        }
+    }
+    *len = n;
+    return 1;
+}
+
+/* Read the string value that follows a "key" occurrence in a JSON document:
+ * find the colon, skip whitespace, copy between the quotes. */
+static int device_json_value(const char *keypos, char out[], size_t n) {
+    const char *v = strchr(keypos, ':');
+    if (!v) return 0;
+    v++;
+    while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+    if (*v != '"') return 0;
+    v++;
+    const char *e = strchr(v, '"');
+    if (!e || (size_t)(e - v) >= n) return 0;
+    memcpy(out, v, (size_t)(e - v));
+    out[e - v] = 0;
+    return 1;
+}
+
+/* The V3 form posts the local identity (gsa-anisette-v3.json beside the URL
+ * config) to the derivation server and completes the header set with the same
+ * local derivations as the Foundation provider: the local-user hash is the
+ * raw SHA-256 of the identifier, the device UUID is the identifier bytes in
+ * UUID form. This side has no TLS, so the server URL must be loopback --
+ * the same tunnel arrangement the GET provider uses. */
+static int device_fetch_v3(const char *url, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/gsa-anisette-v3.json", tf_dir());
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char idf[8 * 1024];
+    size_t have = fread(idf, 1, sizeof idf - 1, f);
+    fclose(f);
+    if (have >= sizeof idf - 1) return 0;
+    idf[have] = 0;
+
+    unsigned char ident[16];
+    size_t identlen = 0;
+    char identb64[64], pbb64[8 * 1024], cibuf[512];
+    char *v = strstr(idf, "\"adi_identifier\"");
+    if (!v || !device_json_value(v, identb64, sizeof identb64)) return 0;
+    if (!device_b64(identb64, ident, sizeof ident, &identlen) || identlen != 16) return 0;
+    v = strstr(idf, "\"adi_pb\"");
+    if (!v || !device_json_value(v, pbb64, sizeof pbb64)) return 0;
+    const char *ci = "";
+    v = strstr(idf, "\"client-info\"");
+    if (v && device_json_value(v, cibuf, sizeof cibuf)) ci = cibuf;
+
+    char body[8 * 1024];
+    int n = snprintf(body, sizeof body, "{\"identifier\":\"%s\",\"adi_pb\":\"%s\"}", identb64, pbb64);
+    if (n <= 0 || n >= (int)sizeof body) return 0;
+
+    char resp[32 * 1024];
+    char *jb = device_loopback_http(url, "POST", body, "application/json", resp, sizeof resp);
+    if (!jb) return 0;
+
+    /* Fill the provider fields by key, then the two local derivations. */
+    char tmp[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    if (!device_parse(jb, tmp)) return 0;
+    snprintf(out[0], DEVICE_VALUE_MAX, "%s", tmp[0]);   /* X-Apple-I-MD */
+    snprintf(out[1], DEVICE_VALUE_MAX, "%s", tmp[1]);   /* X-Apple-I-MD-M */
+    unsigned char lu[32];
+    SHA256(ident, 16, lu);
+    for (int i = 0; i < 16; i++) snprintf(out[2] + 2*i, 3, "%02x", lu[i]);
+    snprintf(out[3], DEVICE_VALUE_MAX, "%s",
+             tmp[3][0] ? tmp[3] : "17106176");          /* X-Apple-I-MD-RINFO */
+    const unsigned char *b = ident;
+    snprintf(out[4], DEVICE_VALUE_MAX,
+        "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+    out[5][0] = 0;                                      /* no serial from this path */
+    snprintf(out[6], DEVICE_VALUE_MAX, "%s", ci);       /* X-MMe-Client-Info */
+    return out[0][0] && out[1][0];
+}
+
+static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char url[512];
+    if (!device_read_line(url, sizeof url)) return 0;
+
+    if (!strncasecmp(url, "exec:", 5)) return device_fetch_exec(url + 5, out);
+    if (!strncasecmp(url, "v3:", 3)) return device_fetch_v3(url + 3, out);
+
+    char resp[32 * 1024];
+    char *b = device_loopback_http(url, "GET", NULL, NULL, resp, sizeof resp);
+    return b ? device_parse(b, out) : 0;
 }
 
 /* Returns 1 with fresh-enough values in out, locking the cache. A failed
