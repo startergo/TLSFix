@@ -175,8 +175,7 @@ Pieces:
    anything drifts off the free allowance. "Out of host capacity" at creation
    is region-dependent: retry other availability domains, try a smaller shape
    first and resize once running, retry off-peak, or loop the launch call via
-   the OCI CLI. Ubuntu 24.04+ on aarch64 or x86_64, with only inbound ssh
-   exposed. Build and install:
+   the OCI CLI. Build and install:
 
    ```sh
    sudo apt install -y ldc dub libz-dev libssl-dev gcc ca-certificates git
