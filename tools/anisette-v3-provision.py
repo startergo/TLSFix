@@ -17,7 +17,7 @@ Environment:
   ANISERVER   anisette-v3-server base URL. HTTPS, or plain HTTP only on
               loopback -- the derivation request carries the reusable
               identity (default http://127.0.0.1:6969).
-  ANISTATE    where to write the identity JSON (default ./anisette-identity.json)
+  ANISTATE    where to write the identity JSON (default ./gsa-anisette-v3.json)
   ANICI       client info to provision under. MUST be an akd-flavor identity:
               Apple's edge refuses identities provisioned in other contexts
               (the Xcode AuthKit flavor is refused outright; verified
@@ -123,6 +123,9 @@ async def main():
     # the process umask until a later chmod, and a crash between the two would
     # leave it exposed for good.
     fd = os.open(STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_CREAT's mode applies only to files it creates; a pre-existing file
+    # keeps its own bits, so tighten explicitly before the identity lands.
+    os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({"adi_identifier": b64(IDENT), "adi_pb": b64(adi_pb),
                    "client-info": CLIENT_INFO}, f)

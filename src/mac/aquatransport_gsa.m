@@ -380,7 +380,8 @@ static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NS
     NSURL *url = [NSURL URLWithString:endpoint];
     BOOL loopback = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] ||
         [[url host] isEqual:@"::1"] || [[url host] isEqual:@"[::1]"];
-    if (![[url scheme] isEqual:@"https"] && !(loopback && [[url scheme] isEqual:@"http"])) {
+    if ((![[url scheme] isEqual:@"https"] && !(loopback && [[url scheme] isEqual:@"http"])) ||
+        ![url host] || [url user] || [url password] || [url fragment]) {
         *error = aq_error(10, @"The V3 anisette server must use HTTPS (HTTP is allowed only on loopback)."); return nil;
     }
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
