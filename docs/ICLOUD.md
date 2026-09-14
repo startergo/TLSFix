@@ -13,6 +13,18 @@ device headers. The user confirmed both Calendar and Contacts work with the nati
 Mail failed with the account-helper fixes alone; the user confirmed it works after
 installing the six-field ATOKEN adapter on 2026-09-09. All 63 offline checks passed
 for that build, including native MailCore tests with synthetic credentials.**
+
+**2026-09-13 update:** Apple's edge stopped accepting the shared GSAPort anisette
+identity, and its password-equivalent exchange began issuing `U`-prefixed
+(144-char) MME tokens in place of `E`-prefixed ones. Both required adapter
+changes (self-hosted anisette with AKDevice-paired identity; `E`/`U` token
+acceptance). With those, a real pane sign-in, saved-token refresh and the Mail
+adapter all work end-to-end on 10.9.5: `account refresh completed (HTTP 200)`
+repeatedly, no password re-prompt. The pane's setup spinner can outlast the
+account creation because Apple's modern responses carry no setup transaction
+ID; the account is nevertheless written and functional — close and reopen the
+pane. `p402-quota.icloud.com` quota lookups still fail natively (no adapter,
+no device authentication) and only affect the storage display.
 The mock tests pass through the installed AOSKit framework's actual
 `AOSRequest` / `CFURLConnection` path. They cannot establish that Apple's current
 servers accept this client identity, issue the required tokens, or return an account
@@ -91,6 +103,184 @@ request. The server still sees the connecting IP and supplies device identity
 material. [SideStore documents why shared older anisette identities can cause
 account locks](https://docs.sidestore.io/docs/advanced/anisette).
 
+### Self-hosted anisette from a modern Mac
+
+A Mac that is itself signed into iCloud can mint properly paired anisette through
+its own AOSKit, and `tools/anisette-server.m` serves it over the GET-JSON contract
+above. `tools/anisette-host.sh` builds it and installs two launch agents on the
+modern Mac: the server, bound to `127.0.0.1:9724`, and a reverse SSH tunnel that
+binds the same port on the client's loopback. The client's
+`gsa-anisette-url.txt` then holds `http://127.0.0.1:9724/anisette`; plain HTTP on
+loopback is what the adapter's URL check permits, and the tunnel provides the
+encryption. `anisette-host.sh` also has `status`, `stop` and `uninstall`
+subcommands.
+
+**Quick start.** Prerequisites: the modern Mac is signed into iCloud (AOSKit
+mints nothing otherwise), and it can `ssh` into the client without a password —
+the tunnel dials *out to the client*, so the key lives on the modern Mac and the
+client runs sshd. Then:
+
+```sh
+# on the modern Mac
+tools/anisette-host.sh install <client-ssh-host>
+tools/anisette-host.sh status        # expect: agents running, HTTP 200
+
+# on the client
+echo http://127.0.0.1:9724/anisette | sudo tee /usr/share/aquatransport/config/gsa-anisette-url.txt
+```
+
+Sign-in, Mail, Calendar/Contacts, iMessage and iCloud Keychain then draw their
+device data from the modern Mac. `anisette-host.sh stop` suspends both agents
+and `uninstall` removes them; in between, the client keeps working from its
+saved tokens until a refresh needs new device data.
+
+**Daemon-free variant.** `gsa-anisette-url.txt` also accepts an `exec:` line:
+the absolute path of a helper that prints the same JSON dictionary on stdout
+and exits. The adapter launches it directly — no shell, no arguments, at most a
+64 KiB response, killed at the HTTP path's 30-second bound — so the natural
+form is a one-line wrapper, e.g. an `ssh` forced command running
+`anisette-server --once` on the minting Mac. Nothing runs resident anywhere;
+each fetch costs one helper launch. The C-side keychain injection (below)
+understands the same `exec:` line, so DAV, Mail, keychain and sign-in paths all
+keep working when the loopback server is replaced by helpers.
+
+### Anisette V3: a self-contained client identity
+
+V1 is closed to new identities: every freshly provisioned V1 pair — including
+the `GET /` output of omnisette-server, anisette-v3-server, and SideStore's
+own production servers — is refused by Apple's edge with the same bare 503 as
+a mismatched pair (verified 2026-09-14). What still works is **V3**: the
+client holds its own identity (a 16-byte identifier plus an `adi.pb`
+provisioning record), and the server only *derives* one-time passwords from
+it, statelessly, over `POST /v3/get_headers`. No other machine's anisette
+identity is borrowed, so nothing shared can be revoked underneath you.
+
+Pieces:
+
+1. **Server.** [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server)
+   built from source (the release Docker image predates the POST endpoint) and
+   bound to loopback on any always-on host — a free-tier VM is plenty.
+   Setup, as deployed and verified on 2026-09-14:
+
+   Any always-on Linux host works. Oracle Cloud's Always Free tier is one
+   option — an Ampere A1 instance, no expiry. Size it **within the current
+   allowance: 2 OCPU / 12 GB total across all A1 instances** (1,500 OCPU-hours
+   and 9,000 GB-hours per month). Oracle cut this from 4 / 24 in June 2026 by
+   editing only its Always Free page, so re-check it before sizing; an
+   over-limit instance is shut down or terminated, and this server needs a
+   fraction of even one OCPU. The rest of the instance recipe: pick the home
+   region deliberately (it is permanent, and A1 capacity varies by region),
+   aarch64 or x86_64 Ubuntu, public subnet with a public IPv4, your ssh key
+   pasted at creation, and a **budget alert at $1** as the early warning if
+   anything drifts off the free allowance. "Out of host capacity" at creation
+   is region-dependent: retry other availability domains, try a smaller shape
+   first and resize once running, retry off-peak, or loop the launch call via
+   the OCI CLI. Build and install:
+
+   ```sh
+   sudo apt install -y ldc dub libz-dev libssl-dev gcc ca-certificates git
+   git clone https://github.com/Dadoum/anisette-v3-server /opt/anisette-v3
+   cd /opt/anisette-v3
+   DC=ldc2 dub build -c static --build-mode allAtOnce -b release --compiler=ldc2
+   ```
+
+   On first start the server downloads the ADI libraries from Apple's own
+   Music APK; nothing to extract by hand. Ubuntu's trust store lacks Apple's
+   root, which the provisioning requests need — take it from the chain Apple
+   itself serves:
+
+   ```sh
+   echo | openssl s_client -connect gsa.apple.com:443 -servername gsa.apple.com -showcerts 2>/dev/null \
+     | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | awk "/BEGIN/{n++} n==3" | sudo tee \
+     /usr/local/share/ca-certificates/apple-root-g1.crt >/dev/null
+   sudo update-ca-certificates
+   ```
+
+   The ADI library makes its own single-level `mkdir` under
+   `$XDG_RUNTIME_DIR/anisette-v3/provisioning`; the directory must already
+   exist or every provisioning ends in `-45054` (the project's issue #52). A
+   unit that arranges both:
+
+   ```ini
+   [Unit]
+   Description=anisette-v3-server
+   After=network-online.target
+
+   [Service]
+   User=youruser
+   WorkingDirectory=/opt/anisette-v3
+   Environment=XDG_RUNTIME_DIR=/tmp/xdg
+   ExecStartPre=/bin/mkdir -p /tmp/xdg/anisette-v3/provisioning
+   ExecStartPre=/bin/chmod 777 /tmp/xdg/anisette-v3
+   ExecStart=/opt/anisette-v3/anisette-v3-server --host 127.0.0.1 --port 6969
+   Restart=always
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   An idle-always-free Oracle instance can be reclaimed after days of ~zero
+   CPU; a five-minutely crontab that burns a few seconds of CPU prevents that.
+
+   A 10.9 client cannot negotiate with a current sshd, so the tunnel in piece 3
+   needs the legacy algorithms re-enabled additively on the server (modern
+   clients are unaffected):
+
+   ```sh
+   printf "KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha256,ecdh-sha2-nistp256\nHostKeyAlgorithms +ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\nCiphers +aes128-ctr,aes192-ctr,aes256-ctr\n" \
+     | sudo tee /etc/ssh/sshd_config.d/10-legacy-mavericks.conf
+   sudo sshd -t && sudo systemctl reload ssh
+   ```
+
+   Verify before moving on — a POST with a dummy identity must reach the
+   endpoint (a JSON error reply, not an HTML 405 from a stale build):
+
+   ```sh
+   curl -sS -X POST -H "Content-Type: application/json" \
+     -d '{"identifier":"","adi_pb":""}' http://127.0.0.1:6969/v3/get_headers
+   ```
+2. **Identity.** `tools/anisette-v3-provision.py` runs the one-time
+   provisioning WebSocket and writes the adapter-ready identity file
+   (`adi_identifier`, `adi_pb`, `client-info` — copy it to
+   `/usr/share/aquatransport/config/gsa-anisette-v3.json`). The client info it
+   provisions under **must be akd-flavored** — an identity provisioned in the
+   Xcode AuthKit context is refused outright, while akd-context identities are
+   accepted in every service context (`svct` iMessage or iCloud, with or
+   without hardware headers; verified 2026-09-14 on 10.9.5). The tool talks to
+   the server over HTTPS or loopback HTTP only, the way the adapter does.
+3. **Client config.** `gsa-anisette-url.txt` holds
+   `v3:http://127.0.0.1:PORT/v3/get_headers`. The adapter posts the identity,
+   derives the local-user hash and device UUID from the identifier itself, and
+   presents the provisioning client info. The C-side keychain injection speaks
+   the same `v3:` form, so keychain traffic rides the same identity. The
+   server URL must be loopback on the client — an ssh tunnel from the client
+   (`ssh -N -L 9724:127.0.0.1:6969 user@server`) as a launch daemon is the
+   durable arrangement; a 10.9 client needs the server's sshd to permit its
+   legacy key exchange and RSA signatures.
+
+Sign-in under a new identity invalidates tokens issued under the old one:
+expect one password re-entry after switching, after which sign-in refresh,
+Mail, Calendar/Contacts, iMessage and Keychain all run on the client's own
+identity. Verified end-to-end on 10.9.5 on 2026-09-14: GrandSlam proof
+accepted, account refresh HTTP 200, keyvalueservice HTTP 200, through a
+free-tier VM and the box's own identity.
+
+**The identity fields must pair with the one-time password.** AOSKit's OTP is
+minted under the current machine's AuthKit provisioning, so the accompanying
+fields must come from the same context — exactly the pairing SideStore's
+[MacAnisette](https://github.com/SideStore/MacAnisette) uses: client info from
+`AKDevice.currentDevice.serverFriendlyDescription`, device ID from
+`uniqueDeviceIdentifier`, local user from `localUserUUID`, routing info `0`, and
+`AOSUtilities machineSerialNumber` for the optional serial field. A mismatched
+pair — for example OTP from one machine paired with a different or hand-written
+client identity, as with the legacy local-AOSKit mapping — is rejected by
+Apple's edge as a **bare HTTP 503 with an nginx error page and no GrandSlam
+status at all**. That response is widely misread as an IP block or an Apple
+outage (see SideStore's 2026 sign-in issues); varying the client info, user
+agent, IP address or network does not change it. Only a correctly paired, fresh
+one-time password is accepted, and such a request is answered with a structured
+GrandSlam response even from datacenter IPs.
+
 ## Install and try a sign-in
 
 Install or update the built libraries with:
@@ -147,7 +337,7 @@ The module intercepts HTTPS requests on `setup.icloud.com`, port 443, for:
 * `/setup/login_or_create_account`
 * `/setup/iosbuddy/loginDelegates`
 * `/setup/authenticate/<Apple ID>` (including the literal `$APPLE_ID$` placeholder)
-* `/setup/get_account_settings` with a numeric DSID and a modern `E`-prefixed MME token
+* `/setup/get_account_settings` with a numeric DSID and a modern `E`- or `U`-prefixed MME token
 
 It recognizes preemptive Basic authentication or a plist body containing
 `username`/`apple-id` and `password`. It lowercases the account identifier before
@@ -174,6 +364,20 @@ client after device headers are removed; cross-origin redirects also lose any
 explicit Authorization header. A redirected DAV request must pass the host check
 again. General redirect/header rules cannot modify these reserved service hosts.
 The same `disable-icloud-gsa` flag disables the sign-in, DAV and Mail adapters.
+
+**iCloud Keychain** (2026-09-13): the keychain parameter and escrow services
+(`p<digits>-keyvalueservice.icloud.com`, `p<digits>-escrowproxy.icloud.com`)
+carry the same token authentication and are covered by the same streaming
+adapter and host reservation. Their client, `syncdefaultsd`, builds requests
+inside NSURLSession, which none of the request- or message-construction hooks
+observe; the Foundation module is therefore loaded from the TLS peer-name hook
+(the entry Mail uses), arming the adapter in time for the KVS client's retries.
+Daemons where the module cannot arm get device headers injected directly by
+the C rewriter from a loopback-only fetch of the configured anisette provider,
+cached one minute. With this, `syncdefaultsd`'s KVS exchanges return HTTP 200
+and the pane completes iCloud Keychain enablement; the SOS circle itself then
+follows its native approval flow. Find My Mac remains unavailable without a
+Recovery HD, and quota display (`p<digits>-quota.icloud.com`) has no adapter.
 
 ### iMessage profile authentication
 
@@ -220,6 +424,14 @@ not establish that interception failed: the HTTP request runs in the XPC agent.
 Use ASL's `Seq` substring operator to find AquaTransport diagnostics; `C` alone is
 case-folded equality, not a contains query.
 
+On 2026-09-13, with self-hosted AKDevice-paired anisette, a real user sign-in
+completed the full chain on 10.9.5: GrandSlam SRP challenge accepted, adapter 9's
+profile exchange, and adapter 10's Madrid delegate login at
+`/setup/iosbuddy/loginDelegates` returning HTTP 200 with overall status 0 and
+delegate status 0. The user signed into Messages — the first confirmed Apple-side
+acceptance of the PET-to-delegate exchange. Message sending and FaceTime
+activation remain separately unverified.
+
 Adapter 10 passes 98 offline checks, including compressed iMessage sign-in, 2FA,
 failed delegates, missing credentials, malformed statuses, rejected redirects,
 invalid server proofs, decompression limits, endpoint scope and the off flag,
@@ -256,7 +468,7 @@ The C engine loads the adapter during `SSLSetPeerDomainName`, before taking a TL
 context lock, only for exact iCloud IMAP/SMTP hosts and with legacy MailCore already
 present. The adapter replaces `_MCAppleTokenSaslClient initialResponse` in memory.
 It preserves native credential retrieval and appends device fields only to an
-existing three-field response with an `E`-prefixed token and an iCloud account
+existing three-field response with an `E`- or `U`-prefixed token and an iCloud account
 hostname. IMAP and SMTP hosts under `mail.me.com` and `mail.icloud.com`, including
 their `p<digits>-` shards, are recognized. Other accounts and older tokens retain
 native behavior. Device data is cached for 60 seconds per Mail process; credentials

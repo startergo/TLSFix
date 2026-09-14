@@ -191,6 +191,7 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
     // Mail's authenticator keys on the peer name as set; the dotless form still names the
     // same host, and is what its matcher expects (see tf_gsa_prepare_mail).
     tf_gsa_prepare_mail(name, nlen);
+    tf_gsa_prepare_keychain(name, nlen);
     OSStatus r = o_SSLSetPeerDomainName(c, name, nlen);
     // Recorded only when the stock call accepted it. A set the stock stack refused must leave
     // the shadow as it was: re-initialising on a refused set would discard a handshake already

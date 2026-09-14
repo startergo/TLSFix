@@ -8,6 +8,8 @@
 #import <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <syslog.h>
+#include <signal.h>
+#include <unistd.h>
 #include <zlib.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -119,8 +121,11 @@ static BOOL aq_settings_request(NSURLRequest *req, NSArray *credentials) {
         [credentials count] != 2) return NO;
     NSString *dsid = [credentials objectAtIndex:0], *token = [credentials objectAtIndex:1];
     /* Modern MME tokens require device authentication on subsequent refreshes.
-     * These are DSID/token requests, never another password/SRP exchange. */
-    return [dsid length] && [token hasPrefix:@"E"] &&
+     * These are DSID/token requests, never another password/SRP exchange.
+     * Apple issued E-prefixed tokens through 2026-09-09; since 2026-09-13 the
+     * password-equivalent exchange returns U-prefixed tokens instead, and both
+     * spellings need the same device-authenticated refresh handling. */
+    return [dsid length] && ([token hasPrefix:@"E"] || [token hasPrefix:@"U"]) &&
         [dsid rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location == NSNotFound;
 }
 
@@ -234,13 +239,7 @@ static NSString *aq_device_uuid(void) {
     return device;
 }
 
-static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLRequest *req, NSError **error) {
-    NSHTTPURLResponse *r = nil;
-    NSData *d = aq_send(owner, req, &r, error);
-    if (!d) return nil;
-    if ([r statusCode] != 200) {
-        *error = aq_error(11, [NSString stringWithFormat:@"The anisette server returned HTTP %ld.", (long)[r statusCode]]); return nil;
-    }
+static NSDictionary *aq_json_anisette(NSData *d, NSError **error) {
     NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]);
     if (!json) { *error = aq_error(11, @"The anisette server did not return a JSON dictionary."); return nil; }
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
@@ -256,12 +255,190 @@ static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLReques
     return headers;
 }
 
+static NSDictionary *aq_remote_anisette(AQGSAProtocol *owner, NSMutableURLRequest *req, NSError **error) {
+    NSHTTPURLResponse *r = nil;
+    NSData *d = aq_send(owner, req, &r, error);
+    if (!d) return nil;
+    if ([r statusCode] != 200) {
+        *error = aq_error(11, [NSString stringWithFormat:@"The anisette server returned HTTP %ld.", (long)[r statusCode]]); return nil;
+    }
+    return aq_json_anisette(d, error);
+}
+
+/* A local helper named by an exec: line in gsa-anisette-url.txt replaces the
+ * HTTP provider: the adapter launches it, reads the same JSON dictionary from
+ * stdout, and applies the same field whitelist. The helper is an absolute
+ * executable path with nothing else on the line -- a config line is not a
+ * shell, and the documented form is a one-line wrapper (an ssh forced command
+ * that mints anisette on another Mac, so no server or tunnel runs anywhere).
+ * Launching is direct, output is capped, a hung helper is killed at the same
+ * 30-second bound the HTTP path enforces, and a stopped request abandons the
+ * wait at once rather than holding the serial queue. */
+static NSDictionary *aq_exec_anisette(AQGSAProtocol *owner, NSString *cmd, NSError **error) {
+    if ([cmd length] < 2 || ![cmd hasPrefix:@"/"] ||
+        [cmd rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound) {
+        *error = aq_error(10, @"The anisette helper must be an absolute path with no arguments; use a wrapper script."); return nil;
+    }
+    NSTask *task = [[[NSTask alloc] init] autorelease];
+    NSPipe *pipe = [NSPipe pipe];
+    [task setLaunchPath:cmd];
+    [task setArguments:[NSArray array]];
+    [task setStandardOutput:pipe];
+    [task setStandardError:pipe];   /* stderr and stdout share the cap; the JSON parser rejects anything before it */
+    [task setEnvironment:[NSDictionary dictionary]];
+    @try { [task launch]; }
+    @catch (NSException *e) { *error = aq_error(10, @"The anisette helper could not be launched."); return nil; }
+
+    NSMutableData *out = [[[NSMutableData alloc] initWithCapacity:4096] autorelease];
+    __block BOOL done = NO;
+    dispatch_semaphore_t eof = dispatch_semaphore_create(0);
+    [[pipe fileHandleForReading] setReadabilityHandler:^(NSFileHandle *h) {
+        NSData *chunk = [h availableData];
+        if ([chunk length]) {
+            if ([out length]+[chunk length] <= 64*1024) [out appendData:chunk];
+        } else {
+            [h setReadabilityHandler:nil];
+            done = YES;
+            dispatch_semaphore_signal(eof);
+        }
+    }];
+    /* Wait in slices so a cancelled request is noticed immediately instead of
+     * blocking the serial authentication queue for the full bound. */
+    NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + 30.0;
+    BOOL complete = NO, stopped = NO;
+    while (!complete) {
+        stopped = [owner isStopped];
+        if (stopped) break;
+        if (dispatch_semaphore_wait(eof, dispatch_time(DISPATCH_TIME_NOW, 250LL*NSEC_PER_MSEC))) {
+            if ([NSDate timeIntervalSinceReferenceDate] >= deadline) break;
+            continue;
+        }
+        complete = done;
+    }
+    if (!complete) {
+        [[pipe fileHandleForReading] setReadabilityHandler:nil];
+        [task terminate];
+        /* terminate is SIGTERM; a helper that handles or ignores it would
+         * otherwise hang waitUntilExit past every bound. */
+        NSDate *grace = [NSDate dateWithTimeIntervalSinceNow:2.0];
+        while ([task isRunning] && [grace timeIntervalSinceNow] > 0) usleep(50000);
+        if ([task isRunning]) kill([task processIdentifier], SIGKILL);
+    }
+    /* The readability handler is gone in both paths -- it removed itself at
+     * EOF, or the block above removed it -- so nothing signals after this. */
+    dispatch_release(eof);
+    @try { [task waitUntilExit]; } @catch (NSException *e) {}
+    if (!complete) {
+        *error = stopped ? aq_error(NSUserCancelledError, @"Sign-in cancelled.")
+                         : aq_error(11, @"The anisette helper timed out."); return nil;
+    }
+    int status = [task terminationStatus];
+    if (status != 0) {
+        *error = aq_error(11, [NSString stringWithFormat:@"The anisette helper exited with status %d.", status]); return nil;
+    }
+    if ([out length] == 0 || [out length] > 64*1024) {
+        *error = aq_error(11, @"The anisette helper did not return usable data."); return nil;
+    }
+    return aq_json_anisette(out, error);
+}
+
+/* The V3 provider holds the machine identity on THIS machine: a 16-byte
+ * identifier and the adi.pb provisioning record (minted once through the
+ * server's /v3/provisioning_session relay). Per fetch, the server derives the
+ * one-time password and machine data from that pair; the local-user hash and
+ * device UUID are computed here and never leave the machine. The identity file
+ * sits beside the URL config and carries the client info the identity was
+ * provisioned under -- presenting any other client info with these values
+ * would break the pairing. The provisioning flavor matters: akd-context
+ * identities pass Apple's edge, Xcode-context identities are refused (verified
+ * 2026-09-14); hardware headers are optional either way. */
+static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NSError **error) {
+    NSString *identityPath = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-v3.json"];
+    NSDictionary *identity = aq_dict([NSJSONSerialization JSONObjectWithData:
+        [NSData dataWithContentsOfFile:identityPath] options:0 error:NULL]);
+    /* EVP decode rather than -initWithBase64Encoding: for one code path on
+     * every target, the way aq_credentials already decodes. */
+    NSData *identifier = nil;
+    NSString *idb64 = aq_string([identity objectForKey:@"adi_identifier"]);
+    if (idb64 && [idb64 length] >= 24 && !([idb64 length] % 4)) {
+        const unsigned char *in = (const unsigned char *)[idb64 UTF8String];
+        NSMutableData *dec = [NSMutableData dataWithLength:[idb64 length]];
+        int len = EVP_DecodeBlock([dec mutableBytes], in, (int)[idb64 length]);
+        if (len >= 16) {
+            int pad = ([idb64 characterAtIndex:[idb64 length]-1] == '=') + ([idb64 characterAtIndex:[idb64 length]-2] == '=');
+            [dec setLength:len - pad];
+            identifier = dec;
+        }
+    }
+    NSString *adi = aq_string([identity objectForKey:@"adi_pb"]);
+    if ([identifier length] != 16 || !adi) {
+        *error = aq_error(14, @"The V3 identity file needs a 16-byte adi_identifier and an adi_pb (both base64)."); return nil;
+    }
+    /* The derivation request carries the reusable identity, so the endpoint is
+     * held to the same transport rule as every other provider: HTTPS, or plain
+     * HTTP exactly on loopback. */
+    NSURL *url = [NSURL URLWithString:endpoint];
+    BOOL loopback = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] ||
+        [[url host] isEqual:@"::1"] || [[url host] isEqual:@"[::1]"];
+    if ((![[url scheme] isEqual:@"https"] && !(loopback && [[url scheme] isEqual:@"http"])) ||
+        ![url host] || [url user] || [url password] || [url fragment]) {
+        *error = aq_error(10, @"The V3 anisette server must use HTTPS (HTTP is allowed only on loopback)."); return nil;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    [req setHTTPMethod:@"POST"];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setHTTPBody:[NSJSONSerialization dataWithJSONObject:
+        [NSDictionary dictionaryWithObjectsAndKeys:aq_base64(identifier), @"identifier", adi, @"adi_pb", nil]
+        options:0 error:NULL]];
+    NSHTTPURLResponse *response = nil;
+    NSData *data = aq_send(owner, req, &response, error);
+    if (!data) return nil;
+    /* The same whitelist, size and control-character checks every provider
+     * response passes, applied to the derivation reply. */
+    NSDictionary *json = aq_json_anisette(data, error);
+    NSString *otp = aq_string([json objectForKey:@"X-Apple-I-MD"]), *mid = aq_string([json objectForKey:@"X-Apple-I-MD-M"]);
+    NSString *rinfo = aq_string([json objectForKey:@"X-Apple-I-MD-RINFO"]);
+    if ([response statusCode] != 200 || !otp || !mid) {
+        syslog(LOG_NOTICE, "AquaTransport iCloud V3 anisette failed (HTTP %ld)", (long)[response statusCode]);
+        *error = aq_error(11, @"The V3 anisette server did not return device data."); return nil;
+    }
+    /* LU is the raw SHA-256 of the identifier -- the same derivation the
+     * provisioning tool and the C side use; RINFO comes from the derivation,
+     * the client info from the provisioning record. */
+    unsigned char lu[32];
+    unsigned int lulen = 0;
+    if (!EVP_Digest([identifier bytes], [identifier length], lu, &lulen, EVP_sha256(), NULL) || lulen != 32) {
+        *error = aq_error(12, @"Could not derive the local user hash."); return nil;
+    }
+    NSMutableString *luHex = [NSMutableString string];
+    for (int i = 0; i < 32; i++) [luHex appendFormat:@"%02x", lu[i]];
+    const unsigned char *b = [identifier bytes];
+    NSString *device = [NSString stringWithFormat:@"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]];
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+        otp, @"X-Apple-I-MD",
+        mid, @"X-Apple-I-MD-M",
+        luHex, @"X-Apple-I-MD-LU",
+        rinfo ?: @"17106176", @"X-Apple-I-MD-RINFO",
+        device, @"X-Mme-Device-Id",
+        aq_string([identity objectForKey:@"client-info"]) ?: @"", @"X-MMe-Client-Info", nil];
+}
+
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
     NSString *path = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-url.txt"];
     NSString *endpoint = [[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL]
                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if ([endpoint length]) {
+        if ([endpoint hasPrefix:@"exec:"]) {
+            NSDictionary *local = aq_exec_anisette(owner, [endpoint substringFromIndex:5], error);
+            if (!local) return nil;
+            [headers addEntriesFromDictionary:local];
+        } else if ([endpoint hasPrefix:@"v3:"]) {
+            NSDictionary *v3 = aq_v3_anisette(owner, [endpoint substringFromIndex:3], error);
+            if (!v3) return nil;
+            [headers addEntriesFromDictionary:v3];
+        } else {
         NSURL *url = [NSURL URLWithString:endpoint];
         /* NSURL renders an IPv6 loopback authority differently across releases:
          * the systems this adapter targets expose the host as "::1" without the
@@ -277,6 +454,7 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
         NSDictionary *remote = aq_remote_anisette(owner, [NSMutableURLRequest requestWithURL:url], error);
         if (!remote) return nil;
         [headers addEntriesFromDictionary:remote];
+        }
     } else {
         dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
         Class utility = NSClassFromString(@"AOSUtilities");
@@ -456,25 +634,36 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
         if (!reply) return nil;
         NSData *M2 = aq_data([reply objectForKey:@"M2"]);
         if (!aq_srp_verify(srp, [M2 bytes], [M2 length], key)) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (server proof invalid, code 24)");
             *error = aq_error(24, @"GrandSlam server proof did not verify."); return nil;
         }
         spd = aq_decrypt(aq_data([reply objectForKey:@"spd"]), key);
-        if (!spd) { *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil; }
+        if (!spd) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (session data invalid, code 25)");
+            *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil;
+        }
         NSDictionary *status = aq_dict([reply objectForKey:@"Status"]);
         NSString *secondary = aq_string([status objectForKey:@"au"]);
         if ([secondary isEqual:@"trustedDeviceSecondaryAuth"]) {
             NSString *dsid = aq_string([spd objectForKey:@"adsid"]), *token = aq_string([spd objectForKey:@"GsIdmsToken"]);
-            if (!dsid || !token) { *error = aq_error(26, @"Missing verification session."); return nil; }
+            if (!dsid || !token) {
+                syslog(LOG_NOTICE, "AquaTransport iCloud verification requested without a session (code 26)");
+                *error = aq_error(26, @"Missing verification session."); return nil;
+            }
             NSString *identity = aq_base64([[NSString stringWithFormat:@"%@:%@", dsid, token] dataUsingEncoding:NSUTF8StringEncoding]);
             if (!aq_second_factor(owner, identity, nil, error)) return nil;
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
+            syslog(LOG_NOTICE, "AquaTransport iCloud verification code requested (trusted device, code 401)");
             *error = aq_error(401, @"Approve sign-in on your trusted device, then enter your password followed by the six-digit code."); return nil;
         }
         if (secondary || [[status objectForKey:@"hsc"] integerValue] != 200) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (verification %s, hsc %ld, code 27)",
+                [secondary UTF8String] ?: "none", (long)[[status objectForKey:@"hsc"] integerValue]);
             *error = aq_error(27, @"This account requires an unsupported verification method (such as SMS)."); return nil;
         }
+        syslog(LOG_NOTICE, "AquaTransport iCloud proof accepted (adapter 5)");
     } @finally { aq_srp_free(srp); OPENSSL_cleanse(key, sizeof key); OPENSSL_cleanse(M, sizeof M); }
     return spd;
 }
@@ -575,7 +764,14 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
     [req setValue:aq_basic(user, pet) forHTTPHeaderField:@"Authorization"];
     NSData *auth = aq_send(owner, req, &response, error);
     if (!auth) return nil;
-    if (![[[original URL] path] isEqual:@"/setup/login_or_create_account"] || [response statusCode] != 200)
+    if ([response statusCode] != 200)
+        syslog(LOG_NOTICE, "AquaTransport iCloud token exchange failed (HTTP %ld, adapter 5)", (long)[response statusCode]);
+    /* The pane validates an already-signed-in account by sending its password to
+     * get_account_settings. Such a request must receive the settings document,
+     * not the authenticate reply, so both spellings complete the exchange. */
+    BOOL wantsSettings = [[[original URL] path] isEqual:@"/setup/login_or_create_account"] ||
+        [[[original URL] path] isEqual:@"/setup/get_account_settings"];
+    if (!wantsSettings || [response statusCode] != 200)
         return aq_result(response, auth);
     NSDictionary *account = aq_plist(auth);
     NSString *dsid = aq_string([aq_dict([account objectForKey:@"appleAccountInfo"]) objectForKey:@"dsid"]);
@@ -588,6 +784,8 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
     }
     [req setValue:@"false" forHTTPHeaderField:@"X-Aos-Accept-Tos"];
     NSData *data = aq_send(owner, req, &response, error);
+    if (data && [response statusCode] != 200)
+        syslog(LOG_NOTICE, "AquaTransport iCloud account settings rejected (HTTP %ld, adapter 5)", (long)[response statusCode]);
     return data ? aq_result(response, data) : nil;
 }
 
@@ -662,11 +860,15 @@ static BOOL aq_dav_url(NSURL *url) {
     if (![[[url scheme] lowercaseString] isEqual:@"https"] || [url password]) return NO;
     NSString *host = [[url host] lowercaseString];
     NSInteger port = [[url port] integerValue];
-    NSInteger legacy = [host hasSuffix:@"caldav.icloud.com"] ? 8443 : 8843;
+    /* The DAV hosts carry legacy alternate ports; keyvalueservice and
+     * escrowproxy (iCloud Keychain parameters and escrow) are 443-only. */
+    NSInteger legacy = 443;
+    if ([host hasSuffix:@"caldav.icloud.com"]) legacy = 8443;
+    else if ([host hasSuffix:@"contacts.icloud.com"]) legacy = 8843;
     if ([url port] && port != 443 && port != legacy) return NO;
     if (!host) return NO;
     NSRegularExpression *pattern = [NSRegularExpression regularExpressionWithPattern:
-        @"^(p[0-9]+-)?(caldav|contacts)\\.icloud\\.com$" options:0 error:NULL];
+        @"^(p[0-9]+-)?(caldav|contacts|keyvalueservice|escrowproxy)\\.icloud\\.com$" options:0 error:NULL];
     return [pattern numberOfMatchesInString:host options:0 range:NSMakeRange(0,[host length])] == 1;
 }
 static NSURL *aq_dav_transport_url(NSURL *url) {
@@ -821,7 +1023,8 @@ static NSData *aq_mail_initial_response(id self, SEL selector) {
     const unsigned char *bytes = [native bytes];
     NSUInteger length = [native length], separators = 0, tokenOffset = 0;
     for (NSUInteger i = 0; i < length; i++) if (!bytes[i]) { separators++; tokenOffset = i+1; }
-    if (separators != 2 || tokenOffset >= length || bytes[tokenOffset] != 'E') return native;
+    if (separators != 2 || tokenOffset >= length ||
+        (bytes[tokenOffset] != 'E' && bytes[tokenOffset] != 'U')) return native;
     SEL accountSelector = NSSelectorFromString(@"account"), hostSelector = NSSelectorFromString(@"hostname");
     if (![self respondsToSelector:accountSelector]) return native;
     id account = ((id(*)(id,SEL))objc_msgSend)(self, accountSelector);
