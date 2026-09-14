@@ -371,10 +371,16 @@ static char *device_loopback_http(const char *url, const char *method,
 
     size_t blen = body ? strlen(body) : 0;
     char req[2048];
-    int n = snprintf(req, sizeof req,
-        "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s%s%s%zu\r\n\r\n",
-        method, slash ? slash : "/", authority,
-        body ? "Content-Type: " : "", body ? ctype : "", body ? "\r\nContent-Length: " : "", blen);
+    /* The content headers exist only when there is a body: with the format
+     * string emitting %zu unconditionally, a GET would end in a bare "0"
+     * header line, which the provider answers with an error. */
+    int n = body
+        ? snprintf(req, sizeof req,
+            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
+            method, slash ? slash : "/", authority, ctype, blen)
+        : snprintf(req, sizeof req,
+            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+            method, slash ? slash : "/", authority);
     if (n <= 0 || n >= (int)sizeof req) { close(fd); return NULL; }
     if (write(fd, req, (size_t)n) < 0 || (blen && write(fd, body, blen) < 0)) { close(fd); return NULL; }
 
@@ -470,7 +476,7 @@ static int device_fetch_v3(const char *url, char out[DEVICE_VALUES][DEVICE_VALUE
     snprintf(out[1], DEVICE_VALUE_MAX, "%s", tmp[1]);   /* X-Apple-I-MD-M */
     unsigned char lu[32];
     SHA256(ident, 16, lu);
-    for (int i = 0; i < 16; i++) snprintf(out[2] + 2*i, 3, "%02x", lu[i]);
+    for (int i = 0; i < 32; i++) snprintf(out[2] + 2*i, 3, "%02x", lu[i]);
     snprintf(out[3], DEVICE_VALUE_MAX, "%s",
              tmp[3][0] ? tmp[3] : "17106176");          /* X-Apple-I-MD-RINFO */
     const unsigned char *b = ident;

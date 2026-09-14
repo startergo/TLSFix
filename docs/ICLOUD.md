@@ -165,14 +165,15 @@ Pieces:
    `-45054`, see the project's issue #52), and Apple's root CA is absent from
    Ubuntu's trust store (extract it from the served chain and install it).
 2. **Identity.** `tools/anisette-v3-provision.py` runs the one-time
-   provisioning WebSocket and writes the identity. The client info it
+   provisioning WebSocket and writes the adapter-ready identity file
+   (`adi_identifier`, `adi_pb`, `client-info` — copy it to
+   `/usr/share/aquatransport/config/gsa-anisette-v3.json`). The client info it
    provisions under **must be akd-flavored** — an identity provisioned in the
    Xcode AuthKit context is refused outright, while akd-context identities are
    accepted in every service context (`svct` iMessage or iCloud, with or
-   without hardware headers; verified 2026-09-14 on 10.9.5).
-3. **Client config.** The identity lands in
-   `/usr/share/aquatransport/config/gsa-anisette-v3.json` (`adi_identifier`,
-   `adi_pb`, `client-info`), and `gsa-anisette-url.txt` holds
+   without hardware headers; verified 2026-09-14 on 10.9.5). The tool talks to
+   the server over HTTPS or loopback HTTP only, the way the adapter does.
+3. **Client config.** `gsa-anisette-url.txt` holds
    `v3:http://127.0.0.1:PORT/v3/get_headers`. The adapter posts the identity,
    derives the local-user hash and device UUID from the identifier itself, and
    presents the provisioning client info. The C-side keychain injection speaks

@@ -374,7 +374,16 @@ static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NS
     if ([identifier length] != 16 || !adi) {
         *error = aq_error(14, @"The V3 identity file needs a 16-byte adi_identifier and an adi_pb (both base64)."); return nil;
     }
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:endpoint]];
+    /* The derivation request carries the reusable identity, so the endpoint is
+     * held to the same transport rule as every other provider: HTTPS, or plain
+     * HTTP exactly on loopback. */
+    NSURL *url = [NSURL URLWithString:endpoint];
+    BOOL loopback = [[url host] isEqual:@"127.0.0.1"] || [[url host] isEqual:@"localhost"] ||
+        [[url host] isEqual:@"::1"] || [[url host] isEqual:@"[::1]"];
+    if (![[url scheme] isEqual:@"https"] && !(loopback && [[url scheme] isEqual:@"http"])) {
+        *error = aq_error(10, @"The V3 anisette server must use HTTPS (HTTP is allowed only on loopback)."); return nil;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     [req setHTTPMethod:@"POST"];
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [req setHTTPBody:[NSJSONSerialization dataWithJSONObject:
@@ -383,17 +392,21 @@ static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NS
     NSHTTPURLResponse *response = nil;
     NSData *data = aq_send(owner, req, &response, error);
     if (!data) return nil;
-    NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:data options:0 error:NULL]);
+    /* The same whitelist, size and control-character checks every provider
+     * response passes, applied to the derivation reply. */
+    NSDictionary *json = aq_json_anisette(data, error);
     NSString *otp = aq_string([json objectForKey:@"X-Apple-I-MD"]), *mid = aq_string([json objectForKey:@"X-Apple-I-MD-M"]);
     NSString *rinfo = aq_string([json objectForKey:@"X-Apple-I-MD-RINFO"]);
     if ([response statusCode] != 200 || !otp || !mid) {
         syslog(LOG_NOTICE, "AquaTransport iCloud V3 anisette failed (HTTP %ld)", (long)[response statusCode]);
         *error = aq_error(11, @"The V3 anisette server did not return device data."); return nil;
     }
-    /* LU and the device UUID are pure functions of the identifier; RINFO comes
-     * from the derivation, the client info from the provisioning record. */
+    /* LU is the raw SHA-256 of the identifier -- the same derivation the
+     * provisioning tool and the C side use; RINFO comes from the derivation,
+     * the client info from the provisioning record. */
     unsigned char lu[32];
-    if (!HMAC(EVP_sha256(), NULL, 0, [identifier bytes], 16, lu, NULL)) {
+    unsigned int lulen = 0;
+    if (!EVP_Digest([identifier bytes], [identifier length], lu, &lulen, EVP_sha256(), NULL) || lulen != 32) {
         *error = aq_error(12, @"Could not derive the local user hash."); return nil;
     }
     NSMutableString *luHex = [NSMutableString string];

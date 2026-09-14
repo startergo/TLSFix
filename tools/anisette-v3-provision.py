@@ -10,10 +10,13 @@ one-time passwords from them, on demand, statelessly.
 Usage (requires python3 with `websockets`; run from anywhere that can reach
 the server -- the box itself, a Mac, or the server host):
 
-    ANISERVER=http://server:port python3 anisette-v3-provision.py
+    # through an ssh tunnel, then on the client:
+    ANISERVER=http://127.0.0.1:6969 python3 anisette-v3-provision.py
 
 Environment:
-  ANISERVER   anisette-v3-server base URL (default http://127.0.0.1:6969)
+  ANISERVER   anisette-v3-server base URL. HTTPS, or plain HTTP only on
+              loopback -- the derivation request carries the reusable
+              identity (default http://127.0.0.1:6969).
   ANISTATE    where to write the identity JSON (default ./anisette-identity.json)
   ANICI       client info to provision under. MUST be an akd-flavor identity:
               Apple's edge refuses identities provisioned in other contexts
@@ -22,21 +25,27 @@ Environment:
   ANIUA       akd User-Agent used for the provisioning requests.
   ANIEXTRA    JSON object of extra headers (e.g. hardware headers).
 
-The output file feeds the adapter as gsa-anisette-v3.json (see
-docs/ICLOUD.md): adi_identifier and adi_pb are base64, client-info is the
-provisioning identity.
+The output file is the adapter's identity file (see docs/ICLOUD.md):
+adi_identifier and adi_pb are base64, client-info is the provisioning
+identity. Copy it to /usr/share/aquatransport/config/gsa-anisette-v3.json.
 """
 import asyncio, base64, hashlib, json, os, plistlib, urllib.request, urllib.error, uuid
 from datetime import datetime, timezone
 
 SERVER = os.environ.get("ANISERVER", "http://127.0.0.1:6969")
-STATE = os.environ.get("ANISTATE", "anisette-identity.json")
+STATE = os.environ.get("ANISTATE", "gsa-anisette-v3.json")
 CLIENT_INFO = os.environ.get("ANICI",
     "<Mac16,8> <macOS;26.5;25F71> <com.apple.AuthKit/1 (com.apple.akd/1.0)>")
 USER_AGENT = os.environ.get("ANIUA", "akd/1.0 CFNetwork/1568.200.51 Darwin/25.5.0")
 EXTRA = json.loads(os.environ["ANIEXTRA"]) if os.environ.get("ANIEXTRA") else {}
 
-IDENT = bytes.fromhex(json.load(open(STATE))["identifier"]) if os.path.exists(STATE) else os.urandom(16)
+IDENT = base64.b64decode(json.load(open(STATE))["adi_identifier"]) if os.path.exists(STATE) else os.urandom(16)
+
+from urllib.parse import urlparse
+_p = urlparse(SERVER)
+if _p.scheme == "http" and _p.hostname not in ("127.0.0.1", "localhost", "::1"):
+    raise SystemExit("ANISERVER must be HTTPS, or plain HTTP only on loopback "
+                     "(the request carries the reusable device identity)")
 
 def lu(): return hashlib.sha256(IDENT).hexdigest()
 def devid(): return str(uuid.UUID(bytes=IDENT)).upper()
@@ -110,10 +119,14 @@ async def main():
                 raise RuntimeError(f"provisioning failed: {msg}")
     if not adi_pb: raise RuntimeError("no adi_pb")
 
-    json.dump({"identifier": IDENT.hex(), "adi_pb": b64(adi_pb)}, open(STATE, "w"))
-    os.chmod(STATE, 0o600)
+    # Created 0600 in one step: a plain write would expose the identity under
+    # the process umask until a later chmod, and a crash between the two would
+    # leave it exposed for good.
+    fd = os.open(STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"adi_identifier": b64(IDENT), "adi_pb": b64(adi_pb),
+                   "client-info": CLIENT_INFO}, f)
     print(f"identity saved to {STATE}: identifier={IDENT.hex()} adi_pb={len(adi_pb)} bytes")
-    print(f"adapter file fields: adi_identifier={b64(IDENT)} client-info={CLIENT_INFO!r}")
 
     status, data = http("POST", SERVER + "/v3/get_headers",
                         js={"identifier": b64(IDENT), "adi_pb": b64(adi_pb)})
