@@ -61,7 +61,10 @@ TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 sdk_usable() {
   [ -d "$1" ] || return 1
   local archs
-  archs="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib" 2>/dev/null)" || return 1
+  # Scrub the environment in a subshell rather than with `env -u`: 10.9's env has no
+  # -u option, and the probe must work on the machines this builds for, not just
+  # the modern one it was written on.
+  archs="$( (unset SDKROOT DEVELOPER_DIR; /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib") 2>/dev/null)" || return 1
   grep -qw x86_64 <<<"$archs" && grep -qw i386 <<<"$archs"
 }
 
@@ -271,7 +274,9 @@ if [ ${#gsa_slices[@]} -gt 0 ]; then
   gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
   gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
   [ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
-  printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc status=none
+  # stderr discarded rather than dd's status=none: 10.9's dd lacks the flag, and its
+  # transfer statistics are the only thing this wants silenced.
+  printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc 2>/dev/null
 else
   echo "==> GSA module skipped: no GC toolchain or no 10.7-era SDK (docs/ICLOUD.md)"
 fi
