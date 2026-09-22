@@ -17,7 +17,7 @@ static int providerCalls;
     assert([[[r URL] absoluteString] isEqual:@"http://127.0.0.1:9/anisette"]);
     assert(![r valueForHTTPHeaderField:@"Authorization"] && ![r HTTPBody]);
     providerCalls++;
-    NSDictionary *h = [mode hasPrefix:@"missing"] ? @{} : @{
+    NSDictionary *h = [mode isEqual:@"missing"] ? @{} : @{
         @"X-Apple-I-MD":@"fixture-otp", @"X-Apple-I-MD-M":@"fixture-machine",
         @"X-Apple-I-MD-LU":@"fixture-user", @"X-Apple-I-MD-RINFO":@"1",
         @"X-Mme-Device-Id":@"fixture-device", @"X-MMe-Client-Info":@"<fixture-client>"};
@@ -63,25 +63,24 @@ int main(int argc, char **argv) {
     assert(dlopen("/System/Library/PrivateFrameworks/MailCore.framework/MailCore", RTLD_NOW));
     [NSURLProtocol registerClass:[MailMock class]];
     MailAccountFixture *a = [[[MailAccountFixture alloc] init] autorelease];
-    NSString *token = [mode hasSuffix:@"-opaque"] ? @"opaque-fixture-token" : @"E-fixture-token";
-    a->host = @"p32-imap.mail.me.com"; a->token = token;
-    NSData *native = joined(@[@"123456789", @"123456789", token]);
+    a->host = @"p32-imap.mail.me.com"; a->token = @"E-fixture-token";
+    NSData *native = joined(@[@"123456789", @"123456789", @"E-fixture-token"]);
     assert([response(clientFor(a)) isEqual:native]);
     for (NSString *host in @[@"example.invalid", @"p-imap.mail.me.com", @"p32-imap.mail.me.com.evil.invalid",
             @"imap.mail.me.com:993", @"user@imap.mail.me.com", @"smtp.mail.me.com/", @"p32-other.mail.me.com"])
         prepare(host);
     assert(!NSClassFromString(@"AQMailTokenAdapter"));
     prepare(a->host);
-    if ([mode hasPrefix:@"disabled"]) {
+    if ([mode isEqual:@"disabled"]) {
         assert(!NSClassFromString(@"AQMailTokenAdapter") && [response(clientFor(a)) isEqual:native]);
         assert(providerCalls == 0);
-    } else if ([mode hasPrefix:@"missing"]) {
+    } else if ([mode isEqual:@"missing"]) {
         id c = clientFor(a); assert(!response(c));
         assert(((NSInteger(*)(id,SEL))objc_msgSend)(c, NSSelectorFromString(@"authenticationState")) == 3);
         assert(providerCalls == 1);
     } else {
         assert(NSClassFromString(@"AQMailTokenAdapter"));
-        NSData *expected = joined(@[@"123456789", @"123456789", token,
+        NSData *expected = joined(@[@"123456789", @"123456789", @"E-fixture-token",
             @"fixture-machine", @"fixture-otp", @"<fixture-client>"]);
         for (NSString *host in @[@"p32-imap.mail.me.com", @"p32-smtp.mail.me.com", @"imap.mail.me.com",
                 @"smtp.mail.me.com", @"imap.mail.icloud.com", @"smtp.mail.icloud.com", @"P32-IMAP.MAIL.ME.COM"]) {
@@ -91,14 +90,13 @@ int main(int argc, char **argv) {
         assert(providerCalls == 1); // IMAP, SMTP and challenge replies share device data.
         a->host = @"imap.mail.me.com.evil.invalid";
         assert([response(clientFor(a)) isEqual:native]);
-        a->host = @"imap.mail.me.com"; a->token = @"another-opaque-token";
-        assert([response(clientFor(a)) isEqual:joined(@[@"123456789", @"123456789", @"another-opaque-token",
-            @"fixture-machine", @"fixture-otp", @"<fixture-client>"])]);
+        a->host = @"imap.mail.me.com"; a->token = @"legacy-fixture-token";
+        assert([response(clientFor(a)) isEqual:joined(@[@"123456789", @"123456789", @"legacy-fixture-token"])]);
         assert(providerCalls == 1);
         NSString *flags = [[NSString stringWithUTF8String:getenv("AQUATRANSPORT_DIR")] stringByAppendingPathComponent:@"flags.txt"];
         [NSThread sleepForTimeInterval:1.1]; // The shared config checks mtime once a second.
         assert([@"disable-icloud-gsa\n" writeToFile:flags atomically:YES encoding:NSUTF8StringEncoding error:NULL]);
-        a->token = token;
+        a->token = @"E-fixture-token";
         assert([response(clientFor(a)) isEqual:native] && providerCalls == 1);
         assert([@"" writeToFile:flags atomically:YES encoding:NSUTF8StringEncoding error:NULL]);
     }

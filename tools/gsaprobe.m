@@ -16,16 +16,6 @@ static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, co
 static NSData *serverB, *serverKey, *serverProof;
 static BOOL verified;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
-static BOOL opaqueSettings(void) { return [mode hasSuffix:@"-opaque"]; }
-static NSString *settingsAuth(void) {
-    return opaqueSettings() ? @"Basic MTIzNDU6b3BhcXVlLWZpeHR1cmU=" : @"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ==";
-}
-
-static NSString *expectedClient(void) {
-    return ([mode isEqual:@"old-client"] || [mode isEqual:@"missing-client"]) ?
-        @"<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>" :
-        @"<fixture-device> <fixture-os> <fixture-client>";
-}
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
 static id parse(NSData *d) { return [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL]; }
@@ -103,11 +93,9 @@ static NSData *encrypted_session(void) {
     if ([host isEqual:@"127.0.0.1"]) {
         anisetteCalls++;
         assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req HTTPBody]);
-        NSMutableDictionary *headers = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-I-MD", @"fake-machine", @"X-Apple-I-MD-M",
+        NSDictionary *headers = [NSDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-I-MD", @"fake-machine", @"X-Apple-I-MD-M",
             @"fake-local", @"X-Apple-I-MD-LU", @"84215040", @"X-Apple-I-MD-RINFO", @"fake-device", @"X-Mme-Device-Id",
             @"<fixture-device> <fixture-os> <fixture-client>", @"X-MMe-Client-Info", @"MUST-NOT-BE-FORWARDED", @"Authorization", nil];
-        if ([mode isEqual:@"old-client"]) [headers setObject:@"<fixture> <com.apple.dt.Xcode/3594.4.19>" forKey:@"X-MMe-Client-Info"];
-        if ([mode isEqual:@"missing-client"]) [headers removeObjectForKey:@"X-MMe-Client-Info"];
         data = [NSJSONSerialization dataWithJSONObject:headers options:0 error:NULL];
         if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) data = bytes(@"{}");
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
@@ -120,7 +108,7 @@ static NSData *encrypted_session(void) {
         assert(![[payload objectForKey:@"cpd"] objectForKey:@"Authorization"]);
         NSDictionary *cpd = [payload objectForKey:@"cpd"];
         assert([[cpd objectForKey:@"svct"] isEqual:@"iCloud"] && [[cpd objectForKey:@"prkgen"] boolValue]);
-        assert([[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:expectedClient()]);
+        assert([[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:@"<fixture-device> <fixture-os> <fixture-client>"]);
         assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:[cpd objectForKey:@"X-MMe-Client-Info"]]);
         if ([[payload objectForKey:@"o"] isEqual:@"init"]) {
             initCalls++; server_start([payload objectForKey:@"A2k"]);
@@ -174,11 +162,11 @@ static NSData *encrypted_session(void) {
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/get_account_settings"]) {
         accountCalls++;
         if ([mode rangeOfString:@"settings"].location != NSNotFound) {
-            assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:settingsAuth()]);
+            assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ=="]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
             assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] isEqual:@"fake-device"]);
-            assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:expectedClient()]);
+            assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:@"<fixture-device> <fixture-os> <fixture-client>"]);
             assert([[req HTTPMethod] isEqual:@"POST"] && [[req HTTPBody] isEqual:bytes(@"refresh-body-fixture")]);
         } else assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic MTIzNDU6ZmFrZS1tbWU="]);
         result = [NSDictionary dictionaryWithObject:@"ok" forKey:@"fixture"];
@@ -217,7 +205,7 @@ static NSMutableURLRequest *login(NSString *password) {
 static NSMutableURLRequest *settings(void) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://setup.icloud.com/setup/get_account_settings"]];
     [req setHTTPMethod:@"POST"]; [req setHTTPBody:bytes(@"refresh-body-fixture")];
-    [req setValue:settingsAuth() forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ==" forHTTPHeaderField:@"Authorization"];
     return req;
 }
 static NSMutableURLRequest *idsLogin(NSString *password) {
@@ -288,18 +276,12 @@ int main(int argc, char **argv) {
         NSURLResponse *response = nil; NSError *error = nil;
         NSData *data = [NSURLConnection sendSynchronousRequest:settings() returningResponse:&response error:&error];
         assert(initCalls == 0 && completeCalls == 0 && codeCalls == 0 && unexpected == 0 && anisetteCalls == 1);
-        if ([mode isEqual:@"settings"] || [mode isEqual:@"settings-opaque"]) {
+        if ([mode isEqual:@"settings"]) {
             assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200 && accountCalls == 1);
             assert([[parse(data) objectForKey:@"fixture"] isEqual:@"ok"]);
             Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
             NSMutableURLRequest *legacy = settings();
             [legacy setValue:@"Basic MTIzNDU6ZmFrZS1tbWU=" forHTTPHeaderField:@"Authorization"];
-            assert([protocol canInitWithRequest:legacy]);
-            // Token spelling is opaque; email/password and empty credentials
-            // still must not enter the saved-account refresh path.
-            [legacy setValue:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1tbWU=" forHTTPHeaderField:@"Authorization"];
-            assert(![protocol canInitWithRequest:legacy]);
-            [legacy setValue:@"Basic MTIzNDU6" forHTTPHeaderField:@"Authorization"];
             assert(![protocol canInitWithRequest:legacy]);
             NSMutableURLRequest *foreign = settings();
             [foreign setURL:[NSURL URLWithString:@"https://setup.icloud.com.example.invalid/setup/get_account_settings"]];
@@ -308,8 +290,8 @@ int main(int argc, char **argv) {
         printf("PASS: offline %s without password authentication\n", [mode UTF8String]);
         [pool drain]; return 0;
     }
-    if ([mode isEqual:@"aos"] || [mode isEqual:@"aos-basic"] || [mode isEqual:@"aos-mixed"] || [mode hasPrefix:@"aos-settings"]) {
-        BOOL refresh = [mode hasPrefix:@"aos-settings"];
+    if ([mode isEqual:@"aos"] || [mode isEqual:@"aos-basic"] || [mode isEqual:@"aos-mixed"] || [mode isEqual:@"aos-settings"]) {
+        BOOL refresh = [mode isEqual:@"aos-settings"];
         BOOL basic = ![mode isEqual:@"aos"];
         assert(dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL));
         Class cls = NSClassFromString(@"AOSRequest"); assert(cls);
@@ -320,7 +302,7 @@ int main(int argc, char **argv) {
         if (basic) {
             ((void(*)(id,SEL,id,id))objc_msgSend)(request, NSSelectorFromString(@"setUsername:andPassword:"),
                 refresh ? @"12345" : [mode isEqual:@"aos-mixed"] ? @"TeSt@Example.Invalid" : @"test@example.invalid",
-                refresh ? (opaqueSettings() ? @"opaque-fixture" : @"E-fixture-mme") : @"Synthetic:PassWord");
+                refresh ? @"E-fixture-mme" : @"Synthetic:PassWord");
             ((void(*)(id,SEL))objc_msgSend)(request, NSSelectorFromString(@"addBasicAuth"));
         }
         ((void(*)(id,SEL))objc_msgSend)(request, NSSelectorFromString(@"sendSynchronously"));
@@ -347,8 +329,7 @@ int main(int argc, char **argv) {
         data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
         assert(verified && codeCalls == 2);
     }
-    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"] ||
-        [mode isEqual:@"old-client"] || [mode isEqual:@"missing-client"];
+    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"];
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);

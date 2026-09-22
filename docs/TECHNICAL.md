@@ -23,6 +23,9 @@ skipped there), both `x86_64` and `i386`.
 ./tools/selftest.sh       # per-process tests, installs nothing
 ```
 
+Building the installer itself (pkg and DMG) is described in
+[PACKAGING.md](PACKAGING.md).
+
 OpenSSL is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream).
 The iCloud authentication module also needs a GC-capable compiler;
 see [ICLOUD.md](ICLOUD.md) for toolchain setup, configuration, and its experimental
@@ -174,7 +177,7 @@ If a patched Security ever stops the machine from booting, the original is a har
 it. From another volume or single-user mode:
 
 ```
-ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatransport-original \
+ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.original \
       /System/Library/Frameworks/Security.framework/Versions/A/Security
 ```
 
@@ -885,6 +888,23 @@ correctly once modern roots are installed, so no OpenSSL-side verifier is needed
 In practice CFNetwork sets `kSSLSessionOptionBreakOnServerAuth` on nearly every
 connection, so the app-verified path (`sh_build_trust` → CFNetwork evaluates) is the
 common one, not an edge case for pinning apps.
+
+**The cert-request break.** `kSSLSessionOptionBreakOnCertRequested` — the on-demand
+identity flow, where the caller supplies its certificate only after the server asks — is
+honoured too. `client_cert_cb` suspends there whatever identity is installed
+(`SSL_ERROR_WANT_X509_LOOKUP`, the same pause point the server-auth break uses), and
+`SSLSetCertificate` at the pause keeps the suspended handshake rather than
+re-initialising it: that call is exactly what the contract names, and restarting would
+send a fresh ClientHello down a socket that has already consumed the server's flight.
+With both breaks set, stock reports the server-auth pause before the cert-request one —
+the server's Certificate message precedes its CertificateRequest — and the engine reports
+them in that order too, each resume re-entering the other pause.
+`SSLGetClientCertificateState` answers from whether the server actually asked — recorded the
+moment the client-certificate callback runs, since that callback fires exactly at the server's
+`CertificateRequest` — not from whether an identity happens to be installed:
+`kSSLClientCertRequested` while the request is unanswered, `kSSLClientCertSent` after a
+handshake that answered it with a certificate. `selftest.sh` runs the flow against `mtlssrv`
+with the identity supplied only at the pause.
 
 **mTLS.** `SecKeyRawSign` and `SecKeyDecrypt` exist on both 10.6 and 10.9 (exported but
 absent from the OS X headers, so declared in `aquatransport.h`), so the private key never

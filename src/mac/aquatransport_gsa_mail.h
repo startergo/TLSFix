@@ -22,5 +22,6 @@ static inline int aq_mail_host(const char *host, size_t length) {
 }
 
 void tf_gsa_prepare_mail(const char *host, size_t length);
+void tf_gsa_prepare_keychain(const char *host, size_t length);
 
 #endif

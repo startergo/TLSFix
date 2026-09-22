@@ -63,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 typedef void *(*fn6)(void *, void *, void *, void *, void *, void *);
 
@@ -154,6 +155,24 @@ void tf_gsa_prepare_mail(const char *host, size_t length) {
     if (adapter && selector && send) send(adapter, selector("install"));
 }
 
+/* Keychain traffic arrives here for the same reason Mail does: syncdefaultsd
+ * builds its KVS requests inside NSURLSession, which passes through none of
+ * the request or message construction points above, so the first this library
+ * learns of the exchange is the TLS peer name. Loading the module here arms
+ * the streaming adapter in time for the next attempt -- the KVS client
+ * retries -- and the direct message injection covers any stream-path callers
+ * the Foundation protocol still cannot see. */
+void tf_gsa_prepare_keychain(const char *host, size_t length) {
+    if (tf_flag("disable-icloud-gsa")) return;
+    /* Reached from the SSLSetPeerDomainName hook before Secure Transport has
+     * validated anything, so a NULL name arrives exactly as the caller sent it. */
+    if (!host || length < 22) return;
+    int kv = length >= 26 && !strncasecmp(host + length - 26, "keyvalueservice.icloud.com", 26);
+    int escrow = !kv && !strncasecmp(host + length - 22, "escrowproxy.icloud.com", 22);
+    if (!kv && !escrow) return;
+    prepare_gsa();
+}
+
 static int gsa_dav_url(const char *url) {
     if (strncasecmp(url, "https://", 8)) return 0;
     const char *h = url + 8, *end = h + strcspn(h, "/?#");
@@ -169,9 +188,475 @@ static int gsa_dav_url(const char *url) {
     size_t n; const char *legacy;
     if (!strncasecmp(h, "caldav.icloud.com", 17)) { n = 17; legacy = ":8443"; }
     else if (!strncasecmp(h, "contacts.icloud.com", 19)) { n = 19; legacy = ":8843"; }
+    /* iCloud Keychain parameter and escrow traffic carries the same modern
+     * token authentication and needs the same device headers as DAV; the KVS
+     * client (syncdefaultsd) is Foundation and runs the streaming adapter.
+     * These hosts are 443-only. */
+    else if (!strncasecmp(h, "keyvalueservice.icloud.com", 26)) { n = 26; legacy = NULL; }
+    else if (!strncasecmp(h, "escrowproxy.icloud.com", 22)) { n = 22; legacy = NULL; }
     else return 0;
     return h+n == end || (end-(h+n) == 4 && !strncmp(h+n, ":443", 4)) ||
-           (end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
+           (legacy && end-(h+n) == 5 && !strncmp(h+n, legacy, 5));
+}
+
+/* iCloud Keychain traffic (secd through syncdefaultsd) is token-authenticated
+ * and needs the same device headers as DAV, but its daemons build requests as
+ * raw CFHTTPMessages on the stream path, where no NSURLProtocol can ever run:
+ * the Foundation module, armed or not, cannot help them. The hosts below get
+ * their headers set directly on the message. The narrower list than the DAV
+ * matcher is deliberate: caldav/contacts clients are Foundation applications
+ * where the streaming adapter owns the request, and a second header pass here
+ * would duplicate what it already added. */
+static int device_auth_url(const char *url) {
+    if (strncasecmp(url, "https://", 8)) return 0;
+    const char *h = url + 8, *end = h + strcspn(h, "/?#");
+    for (const char *p = h; p < end; p++) if (*p == '@') h = p + 1;
+    if (*h == 'p' || *h == 'P') {
+        h++;
+        const char *digits = h;
+        while (*h >= '0' && *h <= '9') h++;
+        if (h == digits || *h++ != '-') return 0;
+    }
+    size_t n;
+    if (!strncasecmp(h, "keyvalueservice.icloud.com", 26)) n = 26;
+    else if (!strncasecmp(h, "escrowproxy.icloud.com", 22)) n = 22;
+    else return 0;
+    return h+n == end || (end-(h+n) == 4 && !strncmp(h+n, ":443", 4));
+}
+
+/* The device data comes from the same provider the GSA module uses, fetched
+ * here with a socket because this side has no HTTP stack it may lean on.
+ * Loopback HTTP only -- the module's own URL check permits exactly that
+ * without a certificate, and this code has nowhere to validate one -- or an
+ * exec: helper, the same arrangement the Foundation adapter accepts. Values
+ * are base64, UUID or digit strings, so scanning for the closing quote is a
+ * complete parse; anything else is refused rather than half-trusted. One
+ * fetch per minute; a failed refresh serves the previous data for up to five
+ * minutes, as the OTP bucket outlives a brief provider outage. */
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <time.h>
+#include <openssl/sha.h>
+
+static const char *const device_keys[] = {
+    "X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-LU", "X-Apple-I-MD-RINFO",
+    "X-Mme-Device-Id", "X-Apple-I-SRL-NO", "X-MMe-Client-Info", NULL
+};
+#define DEVICE_VALUES 7
+#define DEVICE_VALUE_MAX 16384
+
+static pthread_mutex_t device_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Values are base64, UUID or digit strings, so scanning to the closing quote
+ * is a complete parse; the needle carries both quotes so a key can never match
+ * a longer sibling (X-Apple-I-MD vs X-Apple-I-MD-M). Whitespace between the
+ * colon and the value's opening quote is accepted -- pretty-printed providers
+ * are legal JSON. */
+static int device_parse(const char *body, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int found = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        out[i][0] = 0;
+        char needle[64];
+        snprintf(needle, sizeof needle, "\"%s\"", device_keys[i]);
+        const char *v = strstr(body, needle);
+        if (!v) continue;
+        v += strlen(needle);
+        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != ':') continue;
+        v++;
+        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+        if (*v != '"') continue;
+        v++;
+        const char *endv = strchr(v, '"');
+        if (!endv) continue;
+        size_t len = (size_t)(endv - v);
+        if (!len || len >= DEVICE_VALUE_MAX) continue;
+        memcpy(out[i], v, len); out[i][len] = 0;
+        found++;
+    }
+    /* The one-time password and the machine data are the irreducible pair. */
+    return out[0][0] && out[1][0] && found >= 2;
+}
+
+/* The provider line, trimmed at both ends: an indented line would otherwise
+ * silently disable injection by failing the prefix checks. */
+static int device_read_line(char *url, size_t n) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/gsa-anisette-url.txt", tf_dir());
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int have = fgets(url, (int)n, f) != NULL;
+    fclose(f);
+    if (!have) return 0;
+    char *end = url + strlen(url);
+    while (end > url && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+    char *start = url;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+    if (start != url) memmove(url, start, strlen(start) + 1);
+    return url[0] != 0;
+}
+
+/* The exec form runs the same helpers the Foundation side accepts: an absolute
+ * path and nothing else on the line. No arguments and no shell, the identical
+ * restriction aq_exec_anisette applies, so one config line behaves the same
+ * for both. The child's stdout is capped at 64 KiB and read under the same
+ * ten-second bound as the HTTP fetch, counted from launch; a helper that
+ * overruns it is killed rather than left holding the pipe. */
+static int device_fetch_exec(const char *spec, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    if (spec[0] != '/' || strcspn(spec, " \t\r\n") != strlen(spec)) return 0;
+    int fds[2];
+    if (pipe(fds)) return 0;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 1);
+        close(fds[1]);
+        execl(spec, spec, (char *)NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    char body[64 * 1024];
+    size_t total = 0;
+    int eof = 0;
+    time_t deadline = time(NULL) + 10;
+    struct pollfd pfd = {fds[0], POLLIN, 0};
+    while (total < sizeof body - 1) {
+        time_t left = deadline - time(NULL);
+        if (left <= 0) break;
+        if (poll(&pfd, 1, (int)(left * 1000)) <= 0) break;
+        ssize_t got = read(fds[0], body + total, sizeof body - 1 - total);
+        if (got <= 0) { eof = got == 0; break; }
+        total += (size_t)got;
+    }
+    close(fds[0]);
+    int status = 0;
+    if (eof) waitpid(pid, &status, 0);          /* output closed: the exit follows it */
+    else { kill(pid, SIGKILL); waitpid(pid, &status, 0); }   /* wedged, or overran the cap */
+    if (!eof || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 0;
+    body[total] = 0;
+    return device_parse(body, out);
+}
+
+/* One plain-HTTP exchange with a loopback provider. Returns the response body
+ * (after the blank line) or NULL. Plain HTTP is permitted exactly on loopback,
+ * and this side has no certificate validation to offer any other transport. */
+static char *device_loopback_http(const char *url, const char *method,
+                                  const char *body, const char *ctype,
+                                  char resp[], size_t resp_size) {
+    const char *prefix = NULL;
+    if (!strncasecmp(url, "http://127.0.0.1:", 17)) prefix = url + 7;
+    else if (!strncasecmp(url, "http://localhost:", 17)) prefix = url + 7;
+    if (!prefix) return NULL;
+    const char *slash = strchr(prefix, '/');
+    char authority[256];
+    size_t alen = slash ? (size_t)(slash - prefix) : strlen(prefix);
+    if (!alen || alen >= sizeof authority) return NULL;
+    memcpy(authority, prefix, alen); authority[alen] = 0;
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo("127.0.0.1", strrchr(authority, ':') ? strrchr(authority, ':')+1 : "80", &hints, &res) || !res)
+        return NULL;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return NULL; }
+    struct timeval tv = {10, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int connected = connect(fd, res->ai_addr, res->ai_addrlen) == 0;
+    freeaddrinfo(res);
+    if (!connected) { close(fd); return NULL; }
+
+    size_t blen = body ? strlen(body) : 0;
+    char req[2048];
+    /* The content headers exist only when there is a body: with the format
+     * string emitting %zu unconditionally, a GET would end in a bare "0"
+     * header line, which the provider answers with an error. */
+    int n = body
+        ? snprintf(req, sizeof req,
+            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
+            method, slash ? slash : "/", authority, ctype, blen)
+        : snprintf(req, sizeof req,
+            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+            method, slash ? slash : "/", authority);
+    if (n <= 0 || n >= (int)sizeof req) { close(fd); return NULL; }
+    if (write(fd, req, (size_t)n) < 0 || (blen && write(fd, body, blen) < 0)) { close(fd); return NULL; }
+
+    size_t total = 0;
+    ssize_t got;
+    while (total < resp_size - 1 && (got = read(fd, resp + total, resp_size - 1 - total)) > 0) total += (size_t)got;
+    close(fd);
+    resp[total] = 0;
+
+    char *b = strstr(resp, "\r\n\r\n");
+    if (!b || total < 12 || strncmp(resp, "HTTP/1.", 7) || strncmp(resp + 9, "200", 3)) return NULL;
+    return b + 4;
+}
+
+/* Base64 decode of the identity fields, sized for the 16-byte identifier and
+ * the bounded adi.pb; rejects anything that would not fit. */
+static int device_b64(const char *s, unsigned char *out, size_t max, size_t *len) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = 0, acc = 0, bits = 0;
+    for (; *s && *s != '"'; s++) {
+        const char *p = strchr(tbl, *s);
+        if (*s == '=' ) continue;
+        if (!p || *s == '\n' || *s == '\r' || *s == ' ') continue;
+        acc = (acc << 6) | (size_t)(p - tbl);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (n >= max) return 0;
+            out[n++] = (unsigned char)((acc >> bits) & 0xFF);
+        }
+    }
+    *len = n;
+    return 1;
+}
+
+/* Read the string value that follows a "key" occurrence in a JSON document:
+ * find the colon, skip whitespace, copy between the quotes. */
+static int device_json_value(const char *keypos, char out[], size_t n) {
+    const char *v = strchr(keypos, ':');
+    if (!v) return 0;
+    v++;
+    while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+    if (*v != '"') return 0;
+    v++;
+    const char *e = strchr(v, '"');
+    if (!e || (size_t)(e - v) >= n) return 0;
+    memcpy(out, v, (size_t)(e - v));
+    out[e - v] = 0;
+    return 1;
+}
+
+/* The V3 form posts the local identity (gsa-anisette-v3.json beside the URL
+ * config) to the derivation server and completes the header set with the same
+ * local derivations as the Foundation provider: the local-user hash is the
+ * raw SHA-256 of the identifier, the device UUID is the identifier bytes in
+ * UUID form. This side has no TLS, so the server URL must be loopback --
+ * the same tunnel arrangement the GET provider uses. */
+static int device_fetch_v3(const char *url, char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/gsa-anisette-v3.json", tf_dir());
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char idf[8 * 1024];
+    size_t have = fread(idf, 1, sizeof idf - 1, f);
+    fclose(f);
+    if (have >= sizeof idf - 1) return 0;
+    idf[have] = 0;
+
+    unsigned char ident[16];
+    size_t identlen = 0;
+    char identb64[64], pbb64[8 * 1024], cibuf[512];
+    char *v = strstr(idf, "\"adi_identifier\"");
+    if (!v || !device_json_value(v, identb64, sizeof identb64)) return 0;
+    if (!device_b64(identb64, ident, sizeof ident, &identlen) || identlen != 16) return 0;
+    v = strstr(idf, "\"adi_pb\"");
+    if (!v || !device_json_value(v, pbb64, sizeof pbb64)) return 0;
+    const char *ci = "";
+    v = strstr(idf, "\"client-info\"");
+    if (v && device_json_value(v, cibuf, sizeof cibuf)) ci = cibuf;
+
+    char body[8 * 1024];
+    int n = snprintf(body, sizeof body, "{\"identifier\":\"%s\",\"adi_pb\":\"%s\"}", identb64, pbb64);
+    if (n <= 0 || n >= (int)sizeof body) return 0;
+
+    char resp[32 * 1024];
+    char *jb = device_loopback_http(url, "POST", body, "application/json", resp, sizeof resp);
+    if (!jb) return 0;
+
+    /* Fill the provider fields by key, then the two local derivations. */
+    char tmp[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    if (!device_parse(jb, tmp)) return 0;
+    snprintf(out[0], DEVICE_VALUE_MAX, "%s", tmp[0]);   /* X-Apple-I-MD */
+    snprintf(out[1], DEVICE_VALUE_MAX, "%s", tmp[1]);   /* X-Apple-I-MD-M */
+    unsigned char lu[32];
+    SHA256(ident, 16, lu);
+    for (int i = 0; i < 32; i++) snprintf(out[2] + 2*i, 3, "%02x", lu[i]);
+    snprintf(out[3], DEVICE_VALUE_MAX, "%s",
+             tmp[3][0] ? tmp[3] : "17106176");          /* X-Apple-I-MD-RINFO */
+    const unsigned char *b = ident;
+    snprintf(out[4], DEVICE_VALUE_MAX,
+        "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+    out[5][0] = 0;                                      /* no serial from this path */
+    snprintf(out[6], DEVICE_VALUE_MAX, "%s", ci);       /* X-MMe-Client-Info */
+    return out[0][0] && out[1][0];
+}
+
+static int device_fetch(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    char url[512];
+    if (!device_read_line(url, sizeof url)) return 0;
+
+    if (!strncasecmp(url, "exec:", 5)) return device_fetch_exec(url + 5, out);
+    if (!strncasecmp(url, "v3:", 3)) return device_fetch_v3(url + 3, out);
+
+    char resp[32 * 1024];
+    char *b = device_loopback_http(url, "GET", NULL, NULL, resp, sizeof resp);
+    return b ? device_parse(b, out) : 0;
+}
+
+/* Returns 1 with fresh-enough values in out, locking the cache. A failed
+ * refresh falls back to the previous data for as long as it is plausibly
+ * still live: the one-time password is bucketed well beyond a minute, and a
+ * brief provider outage must not strip device headers from keychain traffic.
+ * Five minutes bounds how stale a served value may be. */
+static int device_values(char out[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    static char cache[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    static time_t when;
+    int ok = 0;
+    pthread_mutex_lock(&device_lock);
+    time_t now = time(NULL);
+    if (when && now - when < 60) {
+        memcpy(out, cache, sizeof cache);
+        ok = out[0][0] && out[1][0];
+    } else if (device_fetch(out)) {
+        memcpy(cache, out, sizeof cache);
+        when = now;
+        ok = 1;
+    } else if (when && now - when < 300) {
+        memcpy(out, cache, sizeof cache);
+        ok = out[0][0] && out[1][0];
+    }
+    pthread_mutex_unlock(&device_lock);
+    return ok;
+}
+
+/* The Foundation adapter stamps every anisette use with client time, time zone
+ * and locale; the C injection presents the same set so the request does not
+ * read as a different client class. Both come from CoreFoundation: the system
+ * time-zone identifier (what NSTimeZone reports, not an abbreviation) and the
+ * process's current locale. Sending each process's real locale is the point,
+ * not a regression -- it is exactly what the Foundation adapter's own traffic
+ * from that same process would carry, so the two paths stay indistinguishable
+ * even where a daemon's locale differs from a GUI app's. */
+static void device_generated(char out[3][64]) {
+    time_t now = time(NULL);
+    struct tm utc;
+    gmtime_r(&now, &utc);
+    strftime(out[0], 64, "%Y-%m-%dT%H:%M:%SZ", &utc);
+    /* Foundation stamps the system time-zone identifier ("Europe/Berlin",
+     * not an abbreviation) and the current locale; CoreFoundation supplies
+     * both without pulling in Objective-C, and this side already links it.
+     * A mismatch would present keychain requests as a different client
+     * class than the adapter's own traffic. */
+    CFTimeZoneRef z = CFTimeZoneCopySystem();
+    CFStringRef zn = z ? CFTimeZoneGetName(z) : NULL;
+    char *zone = zn ? cf_to_c(zn) : NULL;
+    snprintf(out[1], 64, "%s", zone && *zone ? zone : "UTC");
+    if (zone) free(zone);
+    if (z) CFRelease(z);
+    CFLocaleRef lc = CFLocaleCopyCurrent();
+    CFStringRef ln = lc ? CFLocaleGetIdentifier(lc) : NULL;
+    char *locale = ln ? cf_to_c(ln) : NULL;
+    snprintf(out[2], 64, "%s", locale && *locale ? locale : "en_US");
+    if (locale) free(locale);
+    if (lc) CFRelease(lc);
+}
+
+/* Set the device headers on a CFHTTPMessage for a device-auth URL. Used only
+ * where no NSURLProtocol can be running for this request: the raw stream path,
+ * and request-path processes where the Foundation module could not arm. The
+ * values arrive pre-fetched -- the message call runs under the rules lock, and
+ * the fetch can take seconds. Returns the number of headers set. The generated
+ * fields ride along only with provider data: alone, they would present a
+ * request as anisette-authenticated that carries no credentials. */
+static int device_headers_message(void *msg, const char values[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int set = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        if (!values[i][0]) continue;
+        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
+        if (n && v) { p_MsgSetHeader(msg, n, v); set++; }
+        if (n) CFRelease(n);
+        if (v) CFRelease(v);
+    }
+    if (set) {
+        char gen[3][64];
+        device_generated(gen);
+        static const char *const genkeys[3] = {"X-Apple-I-Client-Time", "X-Apple-I-TimeZone", "X-Apple-Locale"};
+        for (int i = 0; i < 3; i++) {
+            CFStringRef n = CFStringCreateWithCString(NULL, genkeys[i], kCFStringEncodingUTF8);
+            CFStringRef v = CFStringCreateWithCString(NULL, gen[i], kCFStringEncodingUTF8);
+            if (n && v) { p_MsgSetHeader(msg, n, v); set++; }
+            if (n) CFRelease(n);
+            if (v) CFRelease(v);
+        }
+    }
+    if (set) tf_log("device authentication headers added to keychain request");
+    return set;
+}
+
+static int device_headers_request(void *req, const char values[DEVICE_VALUES][DEVICE_VALUE_MAX]) {
+    int set = 0;
+    for (int i = 0; device_keys[i]; i++) {
+        if (!values[i][0]) continue;
+        CFStringRef n = CFStringCreateWithCString(NULL, device_keys[i], kCFStringEncodingUTF8);
+        CFStringRef v = CFStringCreateWithCString(NULL, values[i], kCFStringEncodingUTF8);
+        if (n && v) { p_SetHeader(req, n, v); set++; }
+        if (n) CFRelease(n);
+        if (v) CFRelease(v);
+    }
+    if (set) {
+        char gen[3][64];
+        device_generated(gen);
+        static const char *const genkeys[3] = {"X-Apple-I-Client-Time", "X-Apple-I-TimeZone", "X-Apple-Locale"};
+        for (int i = 0; i < 3; i++) {
+            CFStringRef n = CFStringCreateWithCString(NULL, genkeys[i], kCFStringEncodingUTF8);
+            CFStringRef v = CFStringCreateWithCString(NULL, gen[i], kCFStringEncodingUTF8);
+            if (n && v) { p_SetHeader(req, n, v); set++; }
+            if (n) CFRelease(n);
+            if (v) CFRelease(v);
+        }
+    }
+    if (set) tf_log("device authentication headers added to keychain request");
+    return set;
+}
+
+/* The reservation shields the GSA exchange from general rules, but only where the
+ * module can actually run: on Snow Leopard (which load_gsa_once below gates out by
+ * the same Darwin-11 check), and on a Lion-or-newer install built without the optional
+ * module, there is no exchange to protect, and holding its hosts out of the configured
+ * rules would only discard the admin's redirect and header settings. Both facts are
+ * settled once: the kernel release, and whether the module image sits beside this
+ * library where load_gsa_once will look for it. */
+static int gsa_possible(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        struct utsname os;
+        int darwin = !uname(&os) && atoi(os.release) >= 11;
+        int present = 0;
+        Dl_info info;
+        if (darwin && dladdr((void *)&gsa_possible, &info) && info.dli_fname) {
+            const char *slash = strrchr(info.dli_fname, '/');
+            char path[1024];
+            if (slash && snprintf(path, sizeof path, "%.*s/aquatransport_gsa.dylib",
+                    (int)(slash-info.dli_fname), info.dli_fname) < sizeof path)
+                present = access(path, R_OK) == 0;
+        }
+        ok = darwin && present;
+    }
+    return ok;
+}
+
+/* Armed means the module is actually running in this process: its principal class
+ * resolves. Presence on disk is not enough -- an image that exists but would not load
+ * (the wrong slice for this process, a broken dependency) protects nothing, and
+ * holding reserved URLs out of the configured rules beside it is exactly the harm the
+ * reservation was tightened to avoid. The request path below attempts the load before
+ * asking; the message-path sites ask without attempting, so a process that never loads
+ * the module keeps its rules there. */
+static int gsa_armed(void) {
+    void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    return get_class && get_class("AQGSAProtocol") != NULL;
 }
 
 /* Find My uses numbered shards, not a fixed p166 endpoint. */
@@ -213,6 +698,8 @@ static int gsa_reserved_url(const char *url) {
            !strncasecmp(url, "https://setup.icloud.com:443/", 29);
 }
 
+// Caller holds tf_rules_lock: the rule returned points into the array a concurrent reload
+// frees, so it is valid only until the caller releases it.
 static const tf_headerrule *match_headers(const char *url) {
     const tf_headerrule *rules = NULL;
     int n = tf_headerrules(&rules);
@@ -262,18 +749,32 @@ static int apply_rules(void *m) {
         free(before);
         return changed;
     }
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         prepare_gsa();
-        free(before);
-        return 0;
+        if (gsa_armed()) { free(before); return 0; }
+        /* A process where the module could not arm still gets its keychain
+         * traffic through: the rewritten copy carries the device headers, so
+         * report the change and let the caller send it. */
+        if (device_auth_url(before)) {
+            char values[DEVICE_VALUES][DEVICE_VALUE_MAX];
+            if (device_values(values) && device_headers_request(m, values) > 0) {
+                free(before);
+                return 1;
+            }
+            /* A failed fetch must not strand the request: fall through so the
+             * configured rules still apply to it. */
+        }
     }
 
+    // One critical section across the redirect, the match, and the use of what matched: the
+    // rule points into an array a concurrent reload frees.
+    tf_rules_lock();
     char *after = tf_maps_rewrite_url(before);
     int maps = after != NULL;
     if (!after) after = tf_apply_redirect(before);
     const char *effective = after ? after : before;
     const tf_headerrule *hr = match_headers(effective);
-    if (!after && !hr) { free(before); return 0; }
+    if (!after && !hr) { tf_rules_unlock(); free(before); return 0; }
 
     if (after) {
         CFStringRef s = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
@@ -297,6 +798,7 @@ static int apply_rules(void *m) {
         else tf_log("rewrite %s -> %s", before, after);
     }
     if (hr) apply_header_rule(hr, m, (hdr_set)p_SetHeader);
+    tf_rules_unlock();
     free(before); free(after);
     return 1;
 }
@@ -353,11 +855,20 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
     char *before = cf_to_c(CFURLGetString((CFURLRef)url));
     if (!before) return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method,
                                     (CFURLRef)url, (CFStringRef)version);
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && gsa_armed() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(before);
         return p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, (CFURLRef)url, (CFStringRef)version);
     }
 
+    /* The device fetch runs before the rules lock: it can take seconds on a
+     * stalled provider, and holding the lock across it would freeze every
+     * other request in the process. Only the header writes happen locked. */
+    char device_vals[DEVICE_VALUES][DEVICE_VALUE_MAX];
+    int have_device = gsa_possible() && !gsa_armed() && !tf_flag("disable-icloud-gsa") &&
+        device_auth_url(before) && device_values(device_vals);
+
+    // Held across match and use, as in apply_rules: the rule points into an array a reload frees.
+    tf_rules_lock();
     char *after = tf_maps_rewrite_url(before);
     int maps = after != NULL;
     if (!after) after = tf_apply_redirect(before);
@@ -374,6 +885,13 @@ static void *my_MsgCreate(void *alloc, void *method, void *url, void *version, v
 
     void *msg = p_MsgCreate((CFAllocatorRef)alloc, (CFStringRef)method, use, (CFStringRef)version);
     if (msg && hr) apply_header_rule(hr, msg, (hdr_set)p_MsgSetHeader);
+    /* No NSURLProtocol exists for this stream: whatever runs here keeps its
+     * native token authentication and gains the device headers directly. Only
+     * when the module is not armed -- an armed process sends its keychain
+     * traffic through the streaming adapter, which has added its own. */
+    if (msg && have_device)
+        device_headers_message(msg, device_vals);
+    tf_rules_unlock();
 
     if (nu) CFRelease(nu);
     if (ns) CFRelease(ns);
@@ -411,13 +929,15 @@ static void my_MsgSetHeader(void *msg, void *name, void *value, void *d, void *e
     char *before = url ? cf_to_c(CFURLGetString(url)) : NULL;
     if (url) CFRelease(url);
     if (!hn || !before) { free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return; }
-    if (!tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
+    if (gsa_possible() && gsa_armed() && !tf_flag("disable-icloud-gsa") && gsa_reserved_url(before)) {
         free(hn); free(before); p_MsgSetHeader(msg, (CFStringRef)name, (CFStringRef)value); return;
     }
 
+    tf_rules_lock();                     // the rule is read below, still under the lock
     char *after = tf_apply_redirect(before);
     const tf_headerrule *hr = match_headers(after ? after : before);
     int ours = (hr && rule_sets_header(hr, hn));
+    tf_rules_unlock();
     if (ours) tf_log("header %s kept from rule, caller overruled", hn);
     free(hn); free(before); free(after);
 

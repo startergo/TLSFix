@@ -8,12 +8,19 @@
 // every connection, and because the test CA is not in the system trust store. It also puts
 // the interesting path under test: with the break set, the engine must suspend before
 // sending the client certificate, hand the server chain to us, and only then continue.
-// errSSLPeerAuthCompleted (-9841) is that pause; calling SSLHandshake again resumes.
+// errSSLServerAuthCompleted (-9841) is that pause; calling SSLHandshake again resumes.
+//
+// A fifth argument "late" exercises the on-demand identity flow instead: no certificate is
+// installed up front, kSSLSessionOptionBreakOnCertRequested is set, and the identity is
+// handed to SSLSetCertificate only once the handshake has paused with
+// errSSLClientCertRequested (-9842) -- the exact call sequence SSLSetCertificate's contract
+// names. The server is still the one asked whether the certificate arrived, because a
+// client that sends an empty Certificate message completes its side of the handshake anyway.
 //
 //   clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
 //       -o mtlsprobe tools/mtlsprobe.c -framework Security -framework CoreFoundation
 //
-//   ./mtlsprobe 127.0.0.1 4443 client.p12 test123
+//   ./mtlsprobe 127.0.0.1 4443 client.p12 test123 [late]
 
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -50,6 +57,11 @@ static OSStatus sock_write(SSLConnectionRef c, const void *data, size_t *len) {
 }
 
 // Import into a scratch keychain so the user's own keychain is never touched.
+// SecKeychainItemImport rather than SecPKCS12Import: the latter can only be aimed at a
+// keychain through kSecImportExportKeychain, a symbol 10.6's Security does not export, and
+// without a destination the private key has nowhere to land. This is the call a 10.6-era app
+// would have made, and it imports the .p12 into the keychain handed to it, returning the
+// identity directly.
 static SecIdentityRef load_identity(const char *p12path, const char *pass, SecKeychainRef *out_kc) {
     char kcpath[1024];
     snprintf(kcpath, sizeof(kcpath), "/tmp/aqmtls-%d.keychain", (int)getpid());
@@ -70,32 +82,35 @@ static SecIdentityRef load_identity(const char *p12path, const char *pass, SecKe
     if (!blob) { fprintf(stderr, "could not read %s\n", p12path); return NULL; }
 
     CFStringRef pw = CFStringCreateWithCString(NULL, pass, kCFStringEncodingUTF8);
-    const void *k[] = { kSecImportExportPassphrase, kSecImportExportKeychain };
-    const void *v[] = { pw, kc };
-    CFDictionaryRef opts = CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks,
-                                              &kCFTypeDictionaryValueCallBacks);
+    SecExternalFormat format = kSecFormatPKCS12;
+    SecExternalItemType itemType = kSecItemTypeUnknown;
+    SecKeyImportExportParameters kp;
+    memset(&kp, 0, sizeof kp);
+    kp.version = SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION;
+    kp.passphrase = pw;                         // the passphrase rides in here, not as an argument
     CFArrayRef items = NULL;
-    OSStatus st = SecPKCS12Import(blob, opts, &items);
-    CFRelease(opts); CFRelease(pw); CFRelease(blob);
+    OSStatus st = SecKeychainItemImport(blob, NULL, &format, &itemType, 0, &kp, kc, &items);
+    CFRelease(pw); CFRelease(blob);
     if (st != errSecSuccess || !items || CFArrayGetCount(items) < 1) {
-        fprintf(stderr, "SecPKCS12Import failed: %d\n", (int)st);
+        fprintf(stderr, "SecKeychainItemImport failed: %d\n", (int)st);
+        if (items) CFRelease(items);
         return NULL;
     }
-    CFDictionaryRef item = CFArrayGetValueAtIndex(items, 0);
-    SecIdentityRef ident = (SecIdentityRef)CFDictionaryGetValue(item, kSecImportItemIdentity);
-    if (ident) CFRetain(ident);
+    SecIdentityRef ident = (SecIdentityRef)CFRetain(CFArrayGetValueAtIndex(items, 0));
     CFRelease(items);
     return ident;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "usage: mtlsprobe <host> <port> <p12> <password>\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "usage: mtlsprobe <host> <port> <p12|none> <password> [late]\n"); return 2; }
     const char *host = argv[1];
     int port = atoi(argv[2]);
 
     // "none" as the p12 path skips SSLSetCertificate entirely, which is the control case:
     // same probe, same server, no client identity in play.
     int use_cert = strcmp(argv[3], "none") != 0;
+    // "late": the identity is held back until the server asks for it.
+    int late = use_cert && argc > 5 && strcmp(argv[5], "late") == 0;
     SecKeychainSetUserInteractionAllowed(false);   // never prompt; fail instead
     SecKeychainRef kc = NULL;
     SecIdentityRef ident = NULL;
@@ -119,23 +134,35 @@ int main(int argc, char **argv) {
     SSLSetConnection(ctx, (SSLConnectionRef)(long)fd);
     SSLSetPeerDomainName(ctx, "localhost", strlen("localhost"));
     SSLSetSessionOption(ctx, kSSLSessionOptionBreakOnServerAuth, true);
+    if (late) SSLSetSessionOption(ctx, kSSLSessionOptionBreakOnCertRequested, true);
 
     OSStatus st = noErr;
-    if (use_cert) {
+    if (use_cert && !late) {
         CFArrayRef certs = CFArrayCreate(NULL, (const void **)&ident, 1, &kCFTypeArrayCallBacks);
         st = SSLSetCertificate(ctx, certs);
+        CFRelease(certs);                     // ours; Secure Transport keeps its own reference
         if (st != errSecSuccess) fprintf(stderr, "SSLSetCertificate: %d\n", (int)st);
     }
 
     int breaks = 0;
     do {
         st = SSLHandshake(ctx);
-        if (st == errSSLPeerAuthCompleted) {   // -9841: server cert is ours to judge
+        if (st == errSSLServerAuthCompleted) {   // -9841: server cert is ours to judge
             breaks++;
             SSLProtocol p = 0; SSLGetNegotiatedProtocolVersion(ctx, &p);
             printf("  server auth break (app would verify the chain here)\n");
         }
-    } while ((st == errSSLPeerAuthCompleted || st == errSSLWouldBlock) && breaks < 8);
+        if (st == errSSLClientCertRequested) { // -9842: the server asked; the identity goes in now
+            breaks++;
+            SSLClientCertificateState ccs = kSSLClientCertNone;
+            SSLGetClientCertificateState(ctx, &ccs);
+            printf("  cert request break (app supplies the identity here; clientState=%d)\n", (int)ccs);
+            CFArrayRef certs = CFArrayCreate(NULL, (const void **)&ident, 1, &kCFTypeArrayCallBacks);
+            OSStatus ss = SSLSetCertificate(ctx, certs);
+            CFRelease(certs);
+            if (ss != noErr) { printf("SSLSetCertificate at the pause: %d\n", (int)ss); break; }
+        }
+    } while ((st == errSSLServerAuthCompleted || st == errSSLClientCertRequested || st == errSSLWouldBlock) && breaks < 8);
 
     if (st != noErr) {
         printf("HANDSHAKE FAILED: OSStatus %d\n", (int)st);
