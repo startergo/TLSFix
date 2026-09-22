@@ -14,4 +14,3 @@ tools/*/work/
 # misc
 .DS_Store
 .claude/
-AquaTransport.pkg
