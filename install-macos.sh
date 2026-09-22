@@ -1,13 +1,18 @@
 #!/bin/bash
+
+# THIS INSTALLER WAS BUILT BY THE LLM AND IS INTENDED FOR QUICK TESTING DURING DEVELOPMENT
+# IT IS _NOT_ THE RECOMMENDED/OFFICIAL WAY TO INSTALL AQUATRANSPORT USE THE PKG FOR THAT!
+#
+#
 # Installs AquaTransport on Mac OS X 10.6 - 10.9.
 #
 #   sudo ./install-macos.sh install
-#   sudo ./install-macos.sh uninstall
+#   Remove using packaging/DMG Image/Uninstall.command
 #
 # Security.framework is given a weak load command naming the library, so every process that
 # loads Security loads it too, at launch, before it can complete a handshake. Security is what
 # exports SSLHandshake and the rest, so those are exactly the processes that could use Secure
-# Transport. Nothing is injected and no daemon runs.
+# Transport. The optional Mavericks AirDrop adapter uses a socket-activated radio helper.
 #
 # The flip side is that a library which crashes in its constructor takes down everything that
 # loads Security, loginwindow included. If that happens, boot from another volume or into
@@ -28,7 +33,7 @@ SEC="${AQ_SECURITY_PATH:-/System/Library/Frameworks/Security.framework/Versions/
 BACKUP="$SEC.original"
 INSERT="${AQ_INSERT_DYLIB:-/usr/local/bin/insert_dylib}"
 
-case "${1:-}" in install|uninstall) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;; esac
+case "${1:-}" in install) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;; esac
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
 case "$1" in
@@ -41,9 +46,9 @@ install)
       { echo "Security backup exists but the AquaTransport load command is missing"; exit 1; }
     updating=1
   fi
-  # Require the core payload before replacing any library; the GSA module is optional,
-  # so a build made without its GC toolchain installs the loader and engine alone and a
-  # GSA-less build neither fails here nor over an absent third library below. Package
+  # Require the core payload before replacing any library; the GSA and Maps modules are
+  # optional, so a build made without its GC toolchain installs the loader and engine alone
+  # and a GSA-less build neither fails here nor over an absent third library below. Package
   # installations can supply any of these in LIBDIR instead of the build stage.
   for lib in aquatransport_engine.dylib aquatransport.dylib; do
     [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
@@ -61,27 +66,39 @@ install)
   # the stale-GSA prune below run, and publication is the final step, because a rename
   # inside one directory is the step that cannot leave a partial file behind.
   staged=""
-  for lib in aquatransport_gsa.dylib aquatransport_engine.dylib aquatransport.dylib; do
+  for lib in aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport_engine.dylib aquatransport.dylib; do
     if [ -f "$SRC/$lib" ]; then
       cp "$SRC/$lib" "$LIBDIR/$lib.new"
       chown root:wheel "$LIBDIR/$lib.new"; chmod 0644 "$LIBDIR/$lib.new"
       staged="$staged $lib"
     fi
   done
-  # A complete build without the GSA module supersedes an install that had one: the
-  # rewriter dlopens whatever file it finds beside the engine, so an image left behind
-  # would run stale GSA code against a newer engine. The prune runs after staging
+  # A complete build without the GSA or Maps module supersedes an install that had one:
+  # the rewriter dlopens whatever file it finds beside the engine, so an image left behind
+  # would run stale module code against a newer engine. The prune runs after staging
   # succeeded and before the staged core is published, so no process starts in the
   # window between and pairs a stale module with the new engine. Completeness is the
   # marker -- a stage that lacks the engine and loader is a botched build whose install
   # falls back to the already-installed libraries, and those are not this run's to prune.
-  if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ] &&
-     [ ! -f "$SRC/aquatransport_gsa.dylib" ]; then
-    rm -f "$LIBDIR/aquatransport_gsa.dylib"
+  if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ]; then
+    [ -f "$SRC/aquatransport_gsa.dylib" ] || rm -f "$LIBDIR/aquatransport_gsa.dylib"
+    [ -f "$SRC/aquatransport_maps.dylib" ] || rm -f "$LIBDIR/aquatransport_maps.dylib"
   fi
   for lib in $staged; do
     mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
   done
+  # The optional AirDrop radio payload is staged by tools/build-airdrop.sh beside the
+  # libraries; its LaunchDaemon is socket-activated, so nothing is loaded here.
+  if [ -f "$SRC/aquatransport_airdrop.dylib" ]; then
+    install -d -o root -g wheel -m 755 "$LIBDIR/airdrop"
+    install -o root -g wheel -m 755 "$SRC/airdrop/ad_ble_wake" "$SRC/airdrop/org.aquatransport.airdrop" "$SRC/airdrop/owl" "$LIBDIR/airdrop/"
+    install -o root -g wheel -m 644 "$SRC/airdrop/org.aquatransport.airdrop.plist" "$LIBDIR/airdrop/"
+    install -o root -g wheel -m 755 "$SRC/aquatransport_airdrop.dylib" "$LIBDIR/"
+  fi
+  if [ -f "$SRC/aquatransport-bootstrap" ]; then
+    install -o root -g wheel -m 755 "$SRC/aquatransport-bootstrap" "$LIBDIR/"
+    install -o root -g wheel -m 644 "$DIR/build/stage/Library/LaunchDaemons/org.aquatransport.bootstrap.plist" /Library/LaunchDaemons/
+  fi
   [ -f "$DYLIB" ] || { echo "no library at $DYLIB -- run ./build-macos.sh first"; exit 1; }
   [ -f "$ENGINE" ] || { echo "no engine at $ENGINE -- run ./build-macos.sh first"; exit 1; }
   # Seed each rule file from the shipped default when it is not already present, so a reinstall
@@ -97,16 +114,19 @@ install)
   # root:wheel because the library loads into root daemons.
   chown root:wheel "$LIBDIR" "$DYLIB" "$ENGINE"
   chmod 0755 "$LIBDIR"; chmod 0644 "$DYLIB" "$ENGINE"
-  if [ -f "$LIBDIR/aquatransport_gsa.dylib" ]; then
-    chown root:wheel "$LIBDIR/aquatransport_gsa.dylib"
-    chmod 0644 "$LIBDIR/aquatransport_gsa.dylib"
-  fi
-
-  # insert_dylib and the installer scripts are run as programs, not read as data, so they keep the
-  # execute bit. Still world-readable, which is all the /usr/share grant asks for.
-  for t in insert_dylib aquatransport.sh uninstall.sh; do
-    [ -e "$LIBDIR/$t" ] && { chown root:wheel "$LIBDIR/$t"; chmod 0755 "$LIBDIR/$t"; }
+  for lib in aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport_airdrop.dylib; do
+    if [ -f "$LIBDIR/$lib" ]; then
+      chown root:wheel "$LIBDIR/$lib"
+      chmod 0644 "$LIBDIR/$lib"
+    fi
   done
+
+# The rule files sit in their own group-writable directory so an admin can edit them in a GUI
+# editor -- whose save replaces the file, needing write on the directory -- without write to the
+# directory that holds the dylibs. root:admin 0775 on the directory and 0664 on the files, still
+# world-readable for the sandbox; the subpath grant reaches this depth under /usr/share.
+chown root:admin "$CONFDIR"; chmod 0775 "$CONFDIR"
+chown root:admin "$CONFDIR"/*; chmod 0664 "$CONFDIR"/*
 
   # The rule files sit in their own group-writable directory so an admin can edit them in a GUI
   # editor -- whose save replaces the file, needing write on the directory -- without write to the
@@ -143,8 +163,13 @@ uninstall)
   # them here would quietly revert that tuning on an uninstall/reinstall cycle. Remove what
   # the package owns; keep the config directory when it holds anything, and the directories
   # above it only when they are empty.
-  rm -f "$DYLIB" "$ENGINE" "$LIBDIR/aquatransport_gsa.dylib" \
+  rm -f "$DYLIB" "$ENGINE" "$LIBDIR/aquatransport_gsa.dylib" "$LIBDIR/aquatransport_maps.dylib" \
+        "$LIBDIR/aquatransport_airdrop.dylib" "$LIBDIR/aquatransport-bootstrap" \
         "$LIBDIR/insert_dylib" "$LIBDIR/aquatransport.sh" "$LIBDIR/uninstall.sh"
+  launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist 2>/dev/null || true
+  launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist 2>/dev/null || true
+  rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
+  rm -rf "$LIBDIR/airdrop"
   rmdir "$CONFDIR" 2>/dev/null || true
   rmdir "$LIBDIR" 2>/dev/null || true
   echo "Uninstalled. Restart your computer."

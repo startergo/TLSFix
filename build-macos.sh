@@ -154,13 +154,14 @@ fi
 # ---- 2. the dylib ----------------------------------------------------------
 echo "==> building aquatransport.dylib (min $MIN)"
 SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c" "$DIR/src/mac/aquatransport_config.c"
-      "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
+      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
 
 slices=()
 loader_slices=()
 gsa_slices=()
+maps_slices=()
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -216,13 +217,20 @@ for a in "${ARCHS[@]}"; do
     cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
     clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
       -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
-      -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
+      -c "$DIR/src/aquatransport_gsa_crypto.c" -o "$cobj"
     gout="$OBJDIR/aquatransport_gsa-$a.dylib"
     clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -dynamiclib -o "$gout" \
       -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
       "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
       -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
     gsa_slices+=("$gout")
+    # The Maps module rides the same GC toolchain and 10.7-era SDK Foundation as GSA.
+    mout="$OBJDIR/aquatransport_maps-$a.dylib"
+    "$GSA_CC" -arch "$a" -mmacosx-version-min=10.9 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
+      -fobjc-gc -Wall -dynamiclib "$DIR/src/mac/aquatransport_maps.m" \
+      -framework Foundation -install_name /usr/share/aquatransport/aquatransport_maps.dylib \
+      -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$mout"
+    maps_slices+=("$mout")
   fi
   echo "    $a ok"
 done
@@ -267,6 +275,13 @@ if [ ${#gsa_slices[@]} -gt 0 ]; then
 else
   echo "==> GSA module skipped: no GC toolchain or no 10.7-era SDK (docs/ICLOUD.md)"
 fi
+if [ ${#maps_slices[@]} -gt 0 ]; then
+  lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
+fi
+
+# AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
+bash "$DIR/tools/build-airdrop.sh"
+
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
 # and has no Objective-C dependency. The GSA image is loaded at request time.
@@ -280,8 +295,8 @@ fi
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib; do
-# A build without the GC toolchain stages no GSA image at all; verify what exists.
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib; do
+# A build without the GC toolchain stages no GSA or Maps image at all; verify what exists.
 [ -f "$ST/$img" ] || continue
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
@@ -309,6 +324,11 @@ if [ -f "$ST/aquatransport_gsa.dylib" ]; then
   otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
     { echo "FATAL: GSA x86_64 does not support Objective-C garbage collection"; exit 1; }
   echo "    GSA: GC-compatible, deployment target 10.7"
+fi
+if [ -f "$ST/aquatransport_maps.dylib" ]; then
+  otool -arch x86_64 -ov "$ST/aquatransport_maps.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||
+    { echo "FATAL: maps module does not support Objective-C garbage collection"; exit 1; }
+  echo "    Maps: GC-compatible, deployment target 10.9"
 fi
 
 ls -lh "$ST/aquatransport.dylib" "$ST/aquatransport_engine.dylib" | awk '{print "    "$9": "$5}'

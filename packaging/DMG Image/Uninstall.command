@@ -12,6 +12,10 @@ fi
 echo "Please type in your password and press return. No characters will appear as you type."
 sudo true || exit 1
 
+sudo launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist
+sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
+sudo rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
+
 SECURITY_BIN="/System/Library/Frameworks/Security.framework/Versions/A/Security"
 # The framework patch is restored first, unconditionally of anything below: a
 # receipt that is missing or already forgotten must not leave the system patched.
@@ -70,5 +74,12 @@ then
 fi
 sudo pkgutil --forget "$PKGID"
 sudo pkgutil --forget "Wowfunhappy.AquaTransport.ModernRootCertificates" 2>/dev/null
+
+# The AirDrop radio uses a tun/tap kext some installs added by hand (tuntaposx,
+# via Homebrew -- see deps/owl/README.md). Remove it only when it is there.
+sudo launchctl unload /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist 2>/dev/null || true
+sudo rm -f /Library/LaunchDaemons/net.sf.tuntaposx.tap.plist
+sudo rm -rf /Library/Extensions/tap.kext
+sudo pkgutil --forget net.sf.tuntaposx.tap 2>/dev/null || true
 
 sudo shutdown -r now
