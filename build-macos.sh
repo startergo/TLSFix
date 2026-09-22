@@ -220,7 +220,7 @@ for a in "${ARCHS[@]}"; do
     cobj="$OBJDIR/aquatransport_gsa_crypto-$a.o"
     clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
       -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
-      -c "$DIR/src/aquatransport_gsa_crypto.c" -o "$cobj"
+      -c "$DIR/src/mac/aquatransport_gsa_crypto.c" -o "$cobj"
     gout="$OBJDIR/aquatransport_gsa-$a.dylib"
     clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -dynamiclib -o "$gout" \
       -install_name /usr/share/aquatransport/aquatransport_gsa.dylib \
