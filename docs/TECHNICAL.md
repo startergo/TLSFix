@@ -23,6 +23,9 @@ skipped there), both `x86_64` and `i386`.
 ./tools/selftest.sh       # per-process tests, installs nothing
 ```
 
+Building the installer itself (pkg and DMG) is described in
+[PACKAGING.md](PACKAGING.md).
+
 OpenSSL is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream).
 The iCloud authentication module also needs a GC-capable compiler;
 see [ICLOUD.md](ICLOUD.md) for toolchain setup, configuration, and its experimental

@@ -37,13 +37,14 @@ STAGE="$REPO/build/stage/usr/share/aquatransport"
 mkdir -p "$W/x"
 (cd "$W/x" && xar -xf "$OLDPKG")
 
-# Stage the AquaTransport payload: new dylibs, current default rule files. The GSA module
-# rides along when the build produced it; a 10.6-only build without the GC toolchain
-# ships an installer without it just as cleanly.
+# Stage the AquaTransport payload: new dylibs, current default rule files. The GSA and
+# Maps modules ride along when the build produced them; a 10.6-only build without the GC
+# toolchain ships an installer without them just as cleanly.
 R="$W/root/usr/share/aquatransport"
 mkdir -p "$R/config"
 cp "$STAGE/aquatransport.dylib" "$STAGE/aquatransport_engine.dylib" "$R/"
 [ -f "$STAGE/aquatransport_gsa.dylib" ] && cp "$STAGE/aquatransport_gsa.dylib" "$R/"
+[ -f "$STAGE/aquatransport_maps.dylib" ] && cp "$STAGE/aquatransport_maps.dylib" "$R/"
 cp "$REPO/packaging/Default Configuration/disabled.txt" \
    "$REPO/packaging/Default Configuration/headers.txt" \
    "$REPO/packaging/Default Configuration/redirects.txt" "$R/config/"
@@ -51,6 +52,26 @@ chmod 0755 "$W/root" "$R"
 chmod 0775 "$W/root/usr" "$W/root/usr/share" "$R/config"
 chmod 0644 "$R/"*.dylib
 chmod 0664 "$R/config/"*.txt
+# The AirDrop runtime, present only when tools/build-airdrop.sh ran (it is invoked by
+# build-macos.sh): the adapter dylib, the socket-activated radio helpers it spawns, and
+# the bootstrap LaunchDaemon that starts the whole thing. Modes mirror the Packages-app
+# project (packaging/Package/AquaTransport.pkgproj), which this script replicates:
+# executables 0755, plists and the maps dylib 0644. The 0644 glob above runs first, so
+# the executables staged here keep their mode.
+if [ -f "$STAGE/aquatransport_airdrop.dylib" ]; then
+    cp "$STAGE/aquatransport_airdrop.dylib" "$STAGE/aquatransport-bootstrap" "$R/"
+    mkdir -p "$R/airdrop"
+    cp "$STAGE/airdrop/ad_ble_wake" "$STAGE/airdrop/org.aquatransport.airdrop" \
+       "$STAGE/airdrop/owl" "$STAGE/airdrop/org.aquatransport.airdrop.plist" "$R/airdrop/"
+    mkdir -p "$W/root/Library/LaunchDaemons"
+    cp "$REPO/build/stage/Library/LaunchDaemons/org.aquatransport.bootstrap.plist" \
+       "$W/root/Library/LaunchDaemons/"
+    chmod 0755 "$R/aquatransport_airdrop.dylib" "$R/aquatransport-bootstrap" "$R/airdrop"
+    chmod 0755 "$R/airdrop/ad_ble_wake" "$R/airdrop/org.aquatransport.airdrop" "$R/airdrop/owl"
+    chmod 0644 "$R/airdrop/org.aquatransport.airdrop.plist" \
+               "$W/root/Library/LaunchDaemons/org.aquatransport.bootstrap.plist"
+    chmod 0755 "$W/root/Library/LaunchDaemons"
+fi
 run_root chown -R root:wheel "$W/root"
 run_root chgrp admin "$R/config" "$R/config/"*.txt
 
