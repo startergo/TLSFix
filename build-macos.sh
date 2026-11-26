@@ -18,6 +18,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.7}"
 MIN="${AQUATRANSPORT_MIN_OS:-10.6}"
 ARCHS=(x86_64 i386)
+# Apple's nm, by path. The verification below needs its -arch, and a binutils install puts a
+# different nm first on the PATH -- whose failure there, with its stderr discarded, reads as
+# "no exports": a check that passes by saying nothing.
+NM=/usr/bin/nm
 
 BUILD="$DIR/build"
 mkdir -p "$BUILD"
@@ -284,23 +288,29 @@ mkdir -p "$ST"
 # is written straight into the x86_64 slice at the section's file offset: the fat header
 # gives the slice's base, the section header the offset within it, and byte 4 of the
 # 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
-# use retain/release, and the verifier below only demands the bit of x86_64.
+# use retain/release, and the verifier below only demands the bit of x86_64. It is done to
+# both GC images: what the linker does to the GSA module's bit it does to the Maps module's.
+restore_gc_bit() {
+  local base off
+  base=$(lipo -detailed_info "$1" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
+  off=$(otool -arch x86_64 -l "$1" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
+  [ -n "$base" ] && [ -n "$off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $1"; exit 1; }
+  # stderr discarded rather than dd's status=none: 10.9's dd lacks the flag, and its
+  # transfer statistics are the only thing this wants silenced.
+  printf '\x02' | dd of="$1" bs=1 seek=$((base + off + 4)) conv=notrunc 2>/dev/null
+}
 
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 if [ ${#gsa_slices[@]} -gt 0 ]; then
   lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
-
-  GSADY="$ST/aquatransport_gsa.dylib"
-  gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
-  gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
-  [ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
-  printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc 2>/dev/null
+  restore_gc_bit "$ST/aquatransport_gsa.dylib"
 else
   echo "==> GSA module skipped: no GC toolchain or no 10.7-era SDK (docs/ICLOUD.md)"
 fi
 if [ ${#maps_slices[@]} -gt 0 ]; then
   lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
+  restore_gc_bit "$ST/aquatransport_maps.dylib"
 fi
 if [ ${#anisette_slices[@]} -gt 0 ]; then
   # The generator is an executable and its job definition a data file. The bootstrap
@@ -311,8 +321,9 @@ if [ ${#anisette_slices[@]} -gt 0 ]; then
   cp "$DIR/src/mac/org.aquatransport.anisette.plist" "$ST/"
 fi
 
-# AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
-bash "$DIR/tools/build-airdrop.sh"
+# AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate. It gets
+# the SDK chosen above: its bootstrap links an i386 slice, which the default SDK cannot do.
+AQUATRANSPORT_SDK="$SDK" bash "$DIR/tools/build-airdrop.sh"
 
 
 # The URL rewriter is pure C compiled into the dylib above (src/mac/aquatransport_rewrite.c),
@@ -344,12 +355,12 @@ floor="$MIN"; banned="$POST106"
 }
 for a in "${ARCHS[@]}"; do
   echo "$have" | grep -qw "$a" || { echo "FATAL: $img missing $a slice; $a processes would go unpatched"; exit 1; }
-  exports=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -E " (T|D|B|S) _" | awk '{print $NF}')
+  exports=$("$NM" -arch "$a" -g "$ST/$img" 2>/dev/null | grep -E " (T|D|B|S) _" | awk '{print $NF}')
   # The one permitted export in any image is the engine's WebKit hook; see engine.exp.
   [ "$img" = aquatransport_engine.dylib ] && exports=$(printf '%s\n' "$exports" | grep -vxF '_WKExternalURLRewrite' || true)
   [ -z "$exports" ] || { echo "FATAL: $img $a exports symbols beyond the WebKit hook (OpenSSL namespace would leak):"
                         echo "$exports" | sed 's/^/      /'; exit 1; }
-  bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$banned" || true)
+  bad=$("$NM" -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$banned" || true)
   [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $floor (would crash on first use):"
                      echo "$bad" | sed 's/^/      /'; exit 1; }
 done
