@@ -28,10 +28,12 @@ no device authentication) and only affect the storage display.
 
 **2026-11-26 update:** Apple now refuses, at the first step of the exchange, the
 device data that `anisette-v3-server` derives (`ec -22410`, whatever the client
-identity), and drops the `local:` generator's at the edge with a bare 503. The
-source it answered with a challenge that day is a modern Mac's own AOSKit
-(*Self-hosted anisette from a modern Mac*) -- the source the sign-ins of
-2026-09-13 ran on. The details and the comparison are under *Anisette V3*.
+identity). The Mac's own generator (*Local Anisette*) is accepted. For most of
+that day it looked refused too, with a bare 503 at Apple's edge; that was this
+adapter, not Apple. The generator's identity was stored under a key the
+GrandSlam envelope did not read, so the request described an Xcode MacBook on
+the outside and carried the Mac's own one-time password inside. Fixed the same
+day; the comparison is under *Anisette V3*.
 
 The mock tests pass through the installed AOSKit framework's actual
 `AOSRequest` / `CFURLConnection` path. They cannot establish that Apple's current
@@ -88,10 +90,11 @@ from is decided by the one line in
 - a bare `http(s)://…` URL — a server that answers an unauthenticated GET with
   the JSON dictionary below.
 
-Which of them Apple accepts changes. On 2026-11-26 it was the last one, served
-by a modern Mac, and neither `local:` nor a `v3:` identity; the `exec:` form of
-the same Mac was not tried that day. Each source has its status under its own
-heading.
+Which of them Apple accepts changes, and costs one request to learn (the
+pairing probe, under *Validation*). On 2026-11-26 `local:` was accepted and a
+`v3:` identity served by `anisette-v3-server` was not; the bare URL was
+accepted as served by a modern Mac, and its `exec:` form was not tried. Each
+source has its status under its own heading.
 
 With no file, or an empty one, the adapter asks `+[AOSUtilities
 retrieveOTPHeadersForDSID:@"-2"]` from the system's AOSKit first — it returned
@@ -156,17 +159,16 @@ tools/anisette-host.sh status        # expect: agents running, HTTP 200
 echo http://127.0.0.1:9724/anisette | sudo tee /usr/share/aquatransport/config/gsa-anisette-url.txt
 ```
 
-**On 2026-11-26 this was the one source Apple accepted.** While the `v3:`
-identity and the client's own `local:` generator were refused at the first
-step of the exchange (under *Anisette V3* and *Local Anisette*), device data
-minted here was
-answered with a challenge every time: from a `Mac16,8` on macOS 26, as minted
-and with two other client identities substituted, and twice from the 10.9.5
-machine over a reverse tunnel to it. It was accepted as minted, `macOS;`
-spelled that way, although Apple's edge had been dropping that spelling for
-others since 2026-11-20; so the pairing of the one-time password with the
-identity fields is what matters, and that month's client-identity rules are
-not worth reproducing here.
+**Tried on 2026-11-26: accepted.** Device data minted here was answered with a
+challenge every time: from a `Mac16,8` on macOS 26, as minted and with two other
+client identities substituted, and twice from the 10.9.5 machine over a reverse
+tunnel to it. It was accepted as minted, `macOS;` spelled that way, although
+Apple's edge had been dropping that spelling for others since 2026-11-20; so
+the pairing of the one-time password with the identity fields is what matters,
+and that month's client-identity rules are not worth reproducing here. The
+client's own generator is accepted as well (*Local Anisette*) and needs no
+second machine; this arrangement is for a client whose AOSKit cannot mint, as
+on 2026-09-13.
 
 Sign-in, Mail, Calendar/Contacts, iMessage and iCloud Keychain then draw their
 device data from the modern Mac -- on every request, since a saved token is
@@ -174,8 +176,8 @@ only accepted when the request carries device data. `anisette-host.sh stop`
 suspends both agents and `uninstall` removes them. While the Mac is asleep or
 away the adapter has nothing to send, so no request reaches Apple and the
 saved tokens are not spent. That dependence on the Mac is the one condition
-the `v3:` identity never had, and the thing to weigh before choosing this
-source.
+the client's own generator does not have, and the thing to weigh before
+choosing this source.
 
 **Daemon-free variant.** `gsa-anisette-url.txt` also accepts an `exec:` line:
 the absolute path of a helper that prints the same JSON dictionary on stdout
@@ -201,8 +203,9 @@ identity is borrowed, so nothing shared can be revoked underneath you.
 **Status on 2026-11-26: refused by Apple.** The identity this section set up on
 2026-09-14 still derives headers, and Apple's edge still takes the request, but
 the first step of the sign-in exchange is answered `ec -22410` every time, with
-the identity as provisioned and with four other client identities tried on top
-of it (under *When sign-in fails at its first step*). The server's maintainer
+the identity as provisioned and with four other client identities, each on the
+envelope and in the body together (under *When sign-in fails at its first
+step*). The server's maintainer
 gives the reason in the project's
 [issue #61](https://github.com/Dadoum/anisette-v3-server/issues/61): since
 2026-10-12 Apple refuses at GrandSlam the one-time passwords that server
@@ -213,7 +216,8 @@ fresh provisioning through a self-hosted instance failing at Apple's
 `finishMachineProvisioning` (`-29003`, "possible environment mismatch"), while
 servers running a Mac's own ADI pass. A new identity on the same server is
 therefore not worth provisioning until that changes. What Apple accepted that
-day is under
+day, in the same minutes, was device data minted by a Mac's own AOSKit: the
+machine's own generator (*Local Anisette*) and the server under
 [Self-hosted anisette from a modern Mac](#self-hosted-anisette-from-a-modern-mac).
 The rest of this section stands as the record of how such an identity is built.
 
@@ -346,7 +350,8 @@ not sent at this step, so a wrong one cannot be what is refused.
 
 The `-22410` is about the device data and not about how the device describes
 itself. With the `v3:` identity on that machine, the pairing probe was answered
-`-22410` for each of five presentations: the identity as provisioned
+`-22410` for each of five presentations, each with the client identity on the
+envelope and in the body together: the identity as provisioned
 (`<Mac16,8> <macOS;26.5;25F71>`, akd's token); the same with `Mac OS X;` in
 place of `macOS;`; the pair that restored sign-in for SideStore's users that
 week (`<MacBookPro13,3> <Mac OS X;26.6;25F84>` with `akd/1.0 CFNetwork/811.5.4
@@ -354,18 +359,36 @@ Darwin/16.7.0`, [SideStore #1745](https://github.com/SideStore/SideStore/issues/
 a current one (`<Mac14,15> <Mac OS X;27.0.1;26A434>` with `akd/1.0
 CFNetwork/3896.100.1.1.1 Darwin/27.0.0`); and the identity with the user agent
 it was provisioned under. The host `gsd.apple.com`, which the server's
-maintainer suggested in issue #61, answered both presentations with HTTP 403
-and no GrandSlam status. So it is the identity's one-time passwords, as that
-server derives them, that Apple refuses (see the status note at the head of
-this section); no client identity tried changed the answer, and a fresh
-identity on that server is not worth provisioning. The `local:` generator was
-dropped at the edge instead, with a bare 503, in every form tried.
+maintainer suggested in issue #61, answered with HTTP 403 and no GrandSlam
+status. So it is the identity's one-time passwords, as that server derives
+them, that Apple refuses (see the status note at the head of this section); no
+client identity tried changed the answer, and a fresh identity on that server
+is not worth provisioning.
 
-What was accepted, within the same hour and for the same account: the same
-probe with device data minted by a Mac of its own, a `Mac16,8` on macOS 26 --
-as minted, with either of the two substituted client identities above, from
-that Mac, and twice from the 10.9.5 machine over a reverse tunnel. The source
-is under
+**A bare 503 at the same step is a third thing, and was read wrongly here for
+most of a day.** The `local:` generator's requests were dropped at Apple's
+edge while a `v3:` identity's were answered with a status, and that was taken
+for Apple refusing the generator's device data. It was not: it was this
+adapter. The generator's set stored the machine's client identity under
+`X-Mme-Client-Info`, with a lower-case `mme`, and the request builders read
+`X-MMe-Client-Info`, with a capital one. So the body of the request said
+`<MacPro5,1> <Mac OS X;10.9.5;13F1911>` as akd, and its envelope said
+`<MacBookPro13,2> <macOS;13.1;22C65>` under Xcode, with a Mojave-era user
+agent: one device outside, another's one-time password inside. Wowfunhappy's
+adapter, which stores the identity under the other spelling and so sends a
+consistent request, was accepted on the same machine in the same minutes; that
+is how the difference was found. With the key put right and the generator's
+user agent carried on the envelope, the probe's first step with `local:` was
+answered with a challenge three times in three. The tests hold it there now:
+`gsaprobe`'s `local` mode checks, on the wire, that the body names the identity
+once and the envelope carries that same one.
+
+What was accepted, in the same minutes and for the same account: that probe
+with `local:`, the machine's own generator; and with device data minted by
+another Mac, a `Mac16,8` on macOS 26 -- as minted and with either of the two
+substituted client identities above, from that Mac, and twice from the 10.9.5
+machine over a reverse tunnel. That server spells its key with the capital,
+which is why it passed while `local:` did not. The source is under
 [Self-hosted anisette from a modern Mac](#self-hosted-anisette-from-a-modern-mac).
 One request tells which of these a machine is seeing, without a password:
 
@@ -376,7 +399,7 @@ AQUATRANSPORT_DIR=/usr/share/aquatransport/config build/gsa-pairing-probe '<appl
 It reads `gsa-anisette-url.txt` from the directory it is given, so a candidate
 line can be tried from a scratch directory, with an empty `flags.txt` beside
 it, and the installed one left alone; that is how the five presentations and
-the tunnel above were compared.
+the sources above were compared.
 
 **The identity fields must pair with the one-time password.** AOSKit's OTP is
 minted under the current machine's AuthKit provisioning, so the accompanying
@@ -435,23 +458,28 @@ What to expect when switching to it:
   `/Users/Shared/adi` is created or completed, a persistent change to the machine
   that an uninstall leaves alone. Switching identity invalidates tokens issued
   under the old one, so the iCloud pane asks for the password once more.
-- **Tried live on 10.9.5 on 2026-11-26, and refused by Apple.** The generator did
-  its part: it provisioned the Mac with one exchange against `gsa.apple.com`, and
-  then minted headers on demand. Apple's edge answered the first step of the
-  sign-in exchange with a bare HTTP 503 -- no GrandSlam status at all -- in every
-  form tried: as the machine itself (`<MacPro5,1> <Mac OS X;10.9.5;13F1911>`,
-  akd's token), with a Mojave-era and with a current user agent, and with this
-  adapter's other client identity. So it is the device data this Mac's AOSKit
-  mints that Apple refuses, not the way it is dressed. The `v3:` identity's same
-  step, minutes later, was answered with a GrandSlam status -- a refusal,
-  `-22410`, as it turned out (under *Anisette V3*); the only source accepted
-  that day was a modern Mac's own AOSKit (Self-hosted anisette from a modern
-  Mac). Upstream's own notes mark their November login work "live acceptance
-  remains to be tested", and AltStore's reports of October and November 2026
-  describe Apple's edge dropping GrandSlam requests by client profile. Until
-  Apple answers the local identity, this is not the line to configure, and
-  neither is `v3:`. The sources are one line apart, and the pairing probe
-  (under Validation) says in one request whether Apple is answering a source.
+- **Tried live on 10.9.5 on 2026-11-26: accepted.** The generator did its part
+  from the first: it provisioned the Mac with one exchange against
+  `gsa.apple.com`, and then minted headers on demand. The first requests
+  carrying them were answered with a bare HTTP 503, which looked like Apple's
+  edge refusing the pairing, and was for most of a day written down as that.
+  It was this adapter: the set stored the machine's client identity under a key
+  the GrandSlam envelope did not read, so the envelope described another device
+  (*When sign-in fails at its first step*, under *Anisette V3*). With that put
+  right, the pairing probe's first step was answered with a challenge, three
+  times in three, in the same minutes as a `v3:` identity was refused. A sign-in
+  in the pane with this generator is the last thing not yet confirmed; upstream's
+  own notes mark their November login work "live acceptance remains to be
+  tested". The sources are one line apart, and the pairing probe (under
+  Validation) says in one request whether Apple is answering a source.
+- **The engine's own injection has no local source.** Where the Objective-C
+  module cannot arm in a process making keychain or escrow requests, the engine
+  adds the device headers itself, from the provider line -- and it understands
+  `exec:`, `v3:` and a URL, not `local:`. The keychain client on the 10.9.5
+  machine is `syncdefaultsd`, a Foundation process in which the module does
+  arm, so Keychain should ride the module as under upstream's `local:`-only
+  build; a process where it cannot would send without device headers. Read
+  from the code, not yet seen live.
 - **A missing helper is an error, not a fallback.** With `local:` configured and
   the service absent, sign-in stops with "The local Anisette service is
   unavailable". No other source is consulted.
@@ -790,7 +818,12 @@ for the helper's provisioning and repair exchange, against synthetic Apple repli
 with Apple's routines replaced; `tools/anisette-ipc-test.m` for the socket client's
 framing and error cases, against a fixture server; and `tools/anisette-local-test.m` for
 the provider selection: with `local:` configured and nothing listening, the adapter fails
-closed on the service's error and makes no request. `tools/gsa-diagnose.m` runs the
+closed on the service's error and makes no request -- and then, with the generator
+replaced by the fixture, takes the set the provider itself returns and checks
+that each request builder says what the generator said. `tools/gsaprobe.m` has a
+`local` mode for the whole sign-in exchange with that set, through the module:
+on the wire, the body names the client identity once and the envelope carries
+that same one, with the generator's user agent. `tools/gsa-diagnose.m` runs the
 configured provider for real, without reading credentials or starting Apple sign-in. Run
 it by hand on the machine concerned: with `local:` it makes the provisioning exchange if
 the machine is not provisioned yet, and with a server it sends the device identifier as
