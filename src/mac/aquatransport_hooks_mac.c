@@ -39,7 +39,6 @@
 #include "aquatransport_gsa_mail.h"
 #include "aquatransport_symbols.h"
 #include "aquatransport_maps.h"
-void tf_safari_install(void);
 #include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
@@ -778,7 +777,6 @@ static void install_hooks(int tls_only) {
     if (!tls_only) {
         tf_airdrop_install();
         tf_maps_install();
-        tf_safari_install();
     }
 }
 
