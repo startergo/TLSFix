@@ -30,9 +30,14 @@ static OSStatus (*original_only)(SecTrustRef, Boolean);
 static void connection(const char *host, int expected, int app_verified);
 static OSStatus create_trust(CFTypeRef certificates, CFTypeRef policies, SecTrustRef *trust);
 
-// Production links Security as a lazy framework. Its __lazy_symbol section
-// uses S_LAZY_DYLIB_SYMBOL_POINTERS, which ordinary fishhook intentionally does
-// not visit. Supply the per-trust fixture anchor at that import as well.
+// Upstream links Security as a lazy framework. Its __lazy_symbol section uses
+// S_LAZY_DYLIB_SYMBOL_POINTERS, which ordinary fishhook intentionally does not
+// visit. Supply the per-trust fixture anchor at that import as well.
+//
+// This fork links Security as an ordinary framework (c3777af: the lazy link cannot be
+// made against the 10.6 SDK), which puts the same import in __la_symbol_ptr instead,
+// S_LAZY_SYMBOL_POINTERS. Either kind of lazy pointer is accepted, and the slot is
+// replaced wherever it is found: a stub jumps through it on every call, bound or not.
 static void hook_engine_trust(const char *path) {
 #ifdef __LP64__
     typedef struct mach_header_64 Header;
@@ -82,7 +87,8 @@ static void hook_engine_trust(const char *path) {
                 const Section *sections = (const void *)(segment + 1);
                 for (uint32_t k = 0; k < segment->nsects; ++k) {
                     const Section *section = sections + k;
-                    if ((section->flags & SECTION_TYPE) != S_LAZY_DYLIB_SYMBOL_POINTERS) continue;
+                    uint32_t type = section->flags & SECTION_TYPE;
+                    if (type != S_LAZY_DYLIB_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS) continue;
                     void **slots = (void **)(slide + section->addr);
                     for (size_t n = 0; n < section->size / sizeof(void *); ++n) {
                         uint32_t index = indices[section->reserved1 + n];
