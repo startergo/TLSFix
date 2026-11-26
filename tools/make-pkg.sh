@@ -127,7 +127,10 @@ gzip -9 < "$W/mr.cpio" > "$W/x/Modern_Root_Certificates.pkg/Scripts"
 
 # PackageInfo: add the preinstall reference, refresh the size estimate. The newline in the
 # replacement is a literal backslash-line-continuation, which is how BSD sed spells it.
-sed -e 's|<postinstall file="./postinstall"/>|<postinstall file="./postinstall"/>\
+# Any preinstall reference already there is dropped first: the template is the last build's
+# pkg, and without that every run added one more line to the ones before it.
+sed -e '/<preinstall file="\.\/preinstall"\/>/d' \
+    -e 's|<postinstall file="./postinstall"/>|<postinstall file="./postinstall"/>\
     <preinstall file="./preinstall"/>|' \
     -e "s|installKBytes=\"[0-9]*\"|installKBytes=\"$KB\"|" \
     "$W/x/AquaTransport.pkg/PackageInfo" > "$W/PackageInfo.new"
