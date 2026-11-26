@@ -28,6 +28,11 @@ Environment:
 The output file is the adapter's identity file (see docs/ICLOUD.md):
 adi_identifier and adi_pb are base64, client-info is the provisioning
 identity. Copy it to /usr/share/aquatransport/config/gsa-anisette-v3.json.
+
+Before provisioning, read the status note at the head of "Anisette V3" in
+docs/ICLOUD.md: since 2026-10-12 Apple has refused at GrandSlam the one-time
+passwords anisette-v3-server derives, and a fresh identity does not change
+that.
 """
 import asyncio, base64, hashlib, json, os, plistlib, urllib.request, urllib.error, uuid
 from datetime import datetime, timezone
