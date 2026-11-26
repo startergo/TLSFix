@@ -198,48 +198,6 @@ static NSData *aq_send(AQGSAProtocol *owner, NSMutableURLRequest *req, NSHTTPURL
     return wire->body;
 }
 
-static NSString *aq_md5hex(NSData *data) {
-    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int count = 0;
-    if (!EVP_Digest([data bytes], [data length], digest, &count, EVP_md5(), NULL) || count != 16) return nil;
-    char hex[33];
-    for (unsigned int i = 0; i < count; i++) snprintf(hex+2*i, 3, "%02x", digest[i]);
-    return [NSString stringWithUTF8String:hex];
-}
-
-/* GSAPort's provider authenticates its GET using a public protocol key, an expiry
- * and a device identifier. It does not receive Apple account credentials. MD5 is
- * mandated by that service's request format, unrelated to our SRP/TLS crypto. */
-static NSMutableURLRequest *aq_gsaport_request(NSString *device, NSTimeInterval now) {
-    if (!aq_string(device) || now < 0 || now > UINT32_MAX-180) return nil;
-    const char *key = "674822be7c2573ea82ff68e5579f4e5ea770b36609fe7ffe04d983de57fb9607";
-    uint32_t expiry = (uint32_t)(now+180);
-    unsigned char little[4] = {expiry, expiry >> 8, expiry >> 16, expiry >> 24};
-    NSMutableData *signedData = [NSMutableData dataWithBytes:little length:4];
-    [signedData appendData:[[NSString stringWithFormat:@"icloud.podpod123.com/anisette.php?%@", device] dataUsingEncoding:NSUTF8StringEncoding]];
-    [signedData appendBytes:key length:strlen(key)];
-    unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int len = 0;
-    if (!EVP_Digest([signedData bytes], [signedData length], digest, &len, EVP_md5(), NULL) || len != 16) return nil;
-    NSMutableData *signature = [NSMutableData dataWithBytes:key length:strlen(key)];
-    [signature appendBytes:digest length:len];
-    NSString *signatureHex = aq_md5hex(signature), *deviceHash = aq_md5hex([device dataUsingEncoding:NSUTF8StringEncoding]);
-    if (!signatureHex || !deviceHash) return nil;
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://icloud.podpod123.com/anisette.php"]];
-    [req setValue:device forHTTPHeaderField:@"X-Device-Uuid"];
-    [req setValue:deviceHash forHTTPHeaderField:@"pk"];
-    [req setValue:[NSString stringWithFormat:@"%u_%@", expiry, signatureHex] forHTTPHeaderField:@"podkey"];
-    return req;
-}
-
-static NSString *aq_device_uuid(void) {
-    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
-    if (!service) return nil;
-    CFTypeRef value = IORegistryEntryCreateCFProperty(service, CFSTR("IOPlatformUUID"), kCFAllocatorDefault, 0);
-    IOObjectRelease(service);
-    NSString *device = value && CFGetTypeID(value) == CFStringGetTypeID() ? [NSString stringWithString:(NSString *)value] : nil;
-    if (value) CFRelease(value);
-    return device;
-}
-
 static NSDictionary *aq_json_anisette(NSData *d, NSError **error) {
     NSDictionary *json = aq_dict([NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]);
     if (!json) { *error = aq_error(11, @"The anisette server did not return a JSON dictionary."); return nil; }
@@ -425,6 +383,48 @@ static NSDictionary *aq_v3_anisette(AQGSAProtocol *owner, NSString *endpoint, NS
         aq_string([identity objectForKey:@"client-info"]) ?: @"", @"X-MMe-Client-Info", nil];
 }
 
+/* One field of the local generator's reply: a non-empty string with no control characters,
+ * no longer than a provider's fields are allowed to be. */
+static NSString *aq_device_field(id value) {
+    NSString *s = aq_string(value);
+    return s && [s length] <= 16384 &&
+        [s rangeOfCharacterFromSet:[NSCharacterSet controlCharacterSet]].location == NSNotFound ? s : nil;
+}
+
+/* The local generator's client side: a Unix socket to the root broker that runs Apple's own
+ * AOSKit/CoreADI as the requesting user, so that a sandboxed client needs no access to
+ * Apple's on-disk provisioning. It defines aq_adi_routing and the AQNativeAnisette class
+ * and takes nothing from this file but aq_error, aq_string, aq_plist and the owner's
+ * -isStopped. The broker, the worker and the provisioning exchange live in
+ * aquatransport_anisette_service.m, built as the aquatransport-anisette executable. */
+#include "aquatransport_anisette_client.inc"
+
+/* The generator's reply under the names GrandSlam's request carries. The generator owns
+ * provisioning and identity alike, so a reply missing either is an error rather than
+ * something to complete from elsewhere. Account names, passwords, codes and tokens never
+ * cross that socket: it is asked for device authentication and for nothing else. */
+static NSDictionary *aq_local_anisette(AQGSAProtocol *owner, NSError **error) {
+    if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
+    NSDictionary *reply = nil;
+    @try { reply = aq_dict([AQNativeAnisette headersForOwner:owner error:error]); }
+    @catch (NSException *exception) { *error = aq_error(11, @"Local Anisette failed inside AOSKit."); return nil; }
+    NSString *device = aq_device_field([reply objectForKey:@"device"]);
+    NSString *machine = aq_device_field([reply objectForKey:@"X-Apple-MD-M"]);
+    NSString *oneTime = aq_device_field([reply objectForKey:@"X-Apple-MD"]);
+    NSString *routing = aq_adi_routing([reply objectForKey:@"X-Apple-I-MD-RINFO"]);
+    if (!machine || !oneTime || !routing) {
+        if (!*error) *error = aq_error(12, @"Local Anisette returned no usable device authentication data.");
+        return nil;
+    }
+    /* A helper built before it returned its identity is refused rather than guessed from
+     * this process: the provisioning that made the headers belongs to the hardware UUID
+     * the helper reports. */
+    if (!device) { *error = aq_error(13, @"Local Anisette returned no device identity. Update the helper and restart."); return nil; }
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+        machine, @"X-Apple-I-MD-M", oneTime, @"X-Apple-I-MD", routing, @"X-Apple-I-MD-RINFO",
+        device, @"X-Mme-Device-Id", aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]), @"X-Apple-I-MD-LU", nil];
+}
+
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
     NSMutableDictionary *headers = [NSMutableDictionary dictionary];
     NSString *path = [[NSString stringWithUTF8String:tf_dir()] stringByAppendingPathComponent:@"gsa-anisette-url.txt"];
@@ -439,6 +439,12 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
             NSDictionary *v3 = aq_v3_anisette(owner, [endpoint substringFromIndex:3], error);
             if (!v3) return nil;
             [headers addEntriesFromDictionary:v3];
+        } else if ([endpoint hasPrefix:@"local:"]) {
+            /* This Mac's own generator, over its local socket: no server anywhere, and
+             * nothing after the keyword to configure. */
+            NSDictionary *local = aq_local_anisette(owner, error);
+            if (!local) return nil;
+            [headers addEntriesFromDictionary:local];
         } else {
         NSURL *url = [NSURL URLWithString:endpoint];
         /* NSURL renders an IPv6 loopback authority differently across releases:
@@ -457,6 +463,12 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
         [headers addEntriesFromDictionary:remote];
         }
     } else {
+        /* Nothing configured. AOSKit's own Objective-C wrapper is asked first -- it costs
+         * no request and needs no helper -- and whatever it does not supply comes from this
+         * Mac's generator. Nothing else is tried: an administrator who wants a server names
+         * one above. The shared public provider that used to stand in here sent the hardware
+         * UUID, with the machine's address attached, to a third party; it has not answered
+         * since 2026-09 and it is gone. */
         dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL);
         Class utility = NSClassFromString(@"AOSUtilities");
         SEL otp = NSSelectorFromString(@"retrieveOTPHeadersForDSID:");
@@ -475,11 +487,9 @@ static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
             }
         }
         if (![headers count]) {
-            NSMutableURLRequest *req = aq_gsaport_request(aq_device_uuid(), [[NSDate date] timeIntervalSince1970]);
-            if (!req) { *error = aq_error(13, @"Could not create the device authentication request."); return nil; }
-            NSDictionary *remote = aq_remote_anisette(owner, req, error);
-            if (!remote) return nil;
-            [headers addEntriesFromDictionary:remote];
+            NSDictionary *local = aq_local_anisette(owner, error);
+            if (!local) return nil;
+            [headers addEntriesFromDictionary:local];
         }
     }
     for (NSString *key in [NSArray arrayWithObjects:@"X-Apple-I-MD", @"X-Apple-I-MD-M", @"X-Apple-I-MD-LU", @"X-Apple-I-MD-RINFO", @"X-Mme-Device-Id", nil]) {

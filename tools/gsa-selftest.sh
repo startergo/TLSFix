@@ -44,6 +44,11 @@ CONF=$(mktemp -d /tmp/aquatransport-gsa-test.XXXXXX)
 trap 'rm -rf "$CONF"' EXIT
 : > "$CONF/flags.txt"
 printf 'http://127.0.0.1:9/anisette\n' > "$CONF/gsa-anisette-url.txt"
+# The `local:` provider gets a configuration of its own: the probes that load the engine keep
+# the mock URL above, and the fail-closed case must not fall through to it.
+mkdir -p "$CONF/local"
+: > "$CONF/local/flags.txt"
+printf 'local:\n' > "$CONF/local/gsa-anisette-url.txt"
 # These would break the exchange if authentication were subject to generic rules.
 printf '*\nhttps://gsa.apple.com/\nhttps://example.invalid/\n' > "$CONF/redirects.txt"
 printf '*\nhttps://setup.icloud.com/\nAuthorization: must-not-replace-token\n\n*\nhttps://profile.ess.apple.com/\nAuthorization: must-not-replace-token\n' > "$CONF/headers.txt"
@@ -61,6 +66,23 @@ clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated
     -framework Foundation -framework IOKit -lz -o build/gsa-diagnose
 clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK tools/davprobe.m -framework Foundation -o build/davprobe
 clang -arch x86_64 -mmacosx-version-min=10.7 $GSA_SDK tools/mailprobe.m -framework Foundation -framework Security -o build/mailprobe
+# The local Anisette generator, all offline: the machine-wide state file and the descriptor a
+# worker inherits; the helper's provisioning and repair exchange, against synthetic Apple
+# replies and with Apple's native routines replaced; and the socket client's framing and
+# error cases, against a fixture server on a scratch socket.
+clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK tools/anisette-state-test.c -o build/anisette-state-test
+clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated-declarations \
+    -Ibuild/openssl/include tools/anisette-service-test.m build/openssl/lib/libcrypto.a \
+    -framework Foundation -framework IOKit -o build/anisette-service-test
+clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated-declarations \
+    -Ibuild/openssl/include tools/anisette-ipc-test.m src/mac/aquatransport_gsa_crypto.c \
+    src/mac/aquatransport_config.c build/openssl/lib/libcrypto.a -lz -framework Foundation -framework IOKit -o build/anisette-ipc-test
+# And the provider selection itself. The socket is compiled to a path nothing listens on, so
+# that `local:` fails the same way here whether or not the real service is installed.
+clang -arch x86_64 -arch i386 -mmacosx-version-min=10.7 $GSA_SDK -Wno-deprecated-declarations \
+    -DAQ_ANISETTE_SOCKET='"/tmp/aquatransport-gsa-selftest-no-service.sock"' \
+    -Ibuild/openssl/include tools/anisette-local-test.m src/mac/aquatransport_gsa_crypto.c \
+    src/mac/aquatransport_config.c build/openssl/lib/libcrypto.a -lz -framework Foundation -framework IOKit -o build/anisette-local-test
 # The Mail adapter tests need Mavericks' own MailCore framework (see docs/ICLOUD.md);
 # a host without it -- any non-10.9 build machine -- sets AQUATRANSPORT_SKIP_MAIL=1 to
 # run the rest of the suite. The first probe run below loads the engine, which is what
@@ -82,7 +104,10 @@ for mode in success auth missing native-calendar native-contacts; do
 done
 for a in x86_64 i386; do
     arch -"$a" build/gsacrypto
-    arch -"$a" build/gsa-diagnose --request-vector
+    arch -"$a" build/anisette-state-test
+    AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-service-test
+    AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-ipc-test
+    AQUATRANSPORT_DIR="$CONF/local" arch -"$a" build/anisette-local-test
     for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa aos aos-basic aos-mixed settings settings-missing settings-redirect aos-settings ids-success ids-gzip ids-2fa ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
         AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe "$mode"
     done
