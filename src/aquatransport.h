@@ -25,6 +25,10 @@ typedef enum {
 } SSLConnectionType;
 extern SSLContextRef SSLCreateContext(CFAllocatorRef alloc, SSLProtocolSide protocolSide,
                                       SSLConnectionType connectionType);
+// The third session option, which that header stops short of: the two before it are there,
+// and this one continues their enum (0, 1, 2 -- as the 10.8 SDK declares it). Its value only
+// ever leaves this library inside an SSLSetSessionOption call forwarded to Secure Transport.
+#define kSSLSessionOptionBreakOnClientAuth 2
 #endif
 
 // Secure Transport result codes

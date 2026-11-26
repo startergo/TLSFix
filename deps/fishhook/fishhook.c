@@ -54,6 +54,12 @@ typedef struct nlist nlist_t;
 #define SEG_DATA_CONST  "__DATA_CONST"
 #endif
 
+/* The 10.6 SDK's loader.h predates this load command; counting it is what keeps the
+ * dependency ordinals aligned when such an SDK's headers are used to build. */
+#ifndef LC_LOAD_UPWARD_DYLIB
+#define LC_LOAD_UPWARD_DYLIB (0x23 | LC_REQ_DYLD)
+#endif
+
 struct rebindings_entry {
   struct rebinding *rebindings;
   size_t rebindings_nel;
