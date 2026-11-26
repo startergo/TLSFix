@@ -370,6 +370,22 @@ preference pane/helper process running between attempts. Pending state stores on
 the verification session, not the password, and is bounded to 32 accounts per process.
 Expired entries are removed on the next attempt.
 
+Three things about that exchange are worth knowing. Each comes from upstream's
+work of 2026-11, and each has an offline case of its own (`tools/gsaprobe.m`, the
+`2fa-*` modes):
+
+- Apple has answered `hsc 409` — verification wanted — with no `au` hint at all,
+  with the hint only inside the encrypted session, and under a new name. All three
+  now take this flow. A hint naming `secondaryAuth`, which is SMS, is still refused
+  as unsupported, since there is no adapter for delivering a code that way.
+- The code check, `/grandslam/GsService2/validate`, has answered with its `ec` at
+  the top level rather than in the usual envelope. It is read in either place, and
+  a code counts as accepted only on a numeric `ec` of 0. A refusal there used to
+  pass as approval, and the retry then ran a second password exchange on a code
+  that had never been accepted.
+- If the prompt cannot be delivered to a trusted device, the attempt still goes
+  on: the code can be read off one of them by hand.
+
 The old pane may show a generic authentication failure rather than instructions for
 entering the code. The user completed this two-attempt flow with a real account. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,

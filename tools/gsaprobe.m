@@ -16,6 +16,10 @@ static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, co
 static NSData *serverB, *serverKey, *serverProof;
 static BOOL verified;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
+/* The trusted-device flow and its variants: the hint where Apple usually puts it, where it
+ * has also been seen, under a new name, or nowhere; the code check answered either way it is
+ * answered; and the one method there is no adapter for. */
+static BOOL is2fa(void) { return [mode hasPrefix:@"2fa"] || [mode isEqual:@"ids-2fa"]; }
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
 static id parse(NSData *d) { return [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL]; }
@@ -60,8 +64,11 @@ static void server_start(NSData *clientA) {
     BN_free(A); BN_free(b); BN_free(v); BN_free(B); BN_free(tmp); BN_free(S); BN_free(x); BN_free(k); BN_free(u); BN_CTX_free(ctx);
 }
 static NSData *encrypted_session(void) {
-    NSDictionary *session = [NSDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken",
+    NSMutableDictionary *session = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken",
         [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"], @"t", nil];
+    /* Apple has put the verification hint in the encrypted session instead of Status. As
+     * with the Status-side hint, it is gone once a code has been accepted. */
+    if ([mode isEqual:@"2fa-session-hint"] && !verified) [session setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
     NSData *plain = plist(session); unsigned char aes[32], iv[32]; unsigned int len;
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data key:", 15, aes, &len);
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data iv:", 14, iv, &len);
@@ -125,14 +132,26 @@ static NSData *encrypted_session(void) {
         }
         NSMutableDictionary *r = [[result mutableCopy] autorelease];
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithObjectsAndKeys:@0, @"ec", @200, @"hsc", nil];
-        if (completeCalls && fixture(@"2fa") && !verified) { [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"]; [s setObject:@409 forKey:@"hsc"]; }
+        if (completeCalls && is2fa() && !verified) {
+            /* How the hint arrives. Named in Status is the usual form; the others are the ones
+             * the adapter must not be thrown by, and secondaryAuth, which is SMS. */
+            [s setObject:@409 forKey:@"hsc"];
+            if ([mode isEqual:@"2fa-sms"]) [s setObject:@"secondaryAuth" forKey:@"au"];
+            else if ([mode isEqual:@"2fa-renamed"]) [s setObject:@"trustedDeviceSecondaryAuthV2" forKey:@"au"];
+            else if ([mode isEqual:@"2fa-unlabelled"] || [mode isEqual:@"2fa-session-hint"]) ;
+            else [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
+        }
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
         codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
         result = [NSDictionary dictionary];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/validate"]) {
-        codeCalls++; assert([[req valueForHTTPHeaderField:@"security-code"] isEqual:@"123456"]); verified = YES;
-        result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"];
+        codeCalls++; assert([[req valueForHTTPHeaderField:@"security-code"] isEqual:@"123456"]);
+        /* /validate has answered with its ec at the top level, and a refusal there is one the
+         * adapter once read straight past. */
+        if ([mode isEqual:@"2fa-refused"]) result = [NSDictionary dictionaryWithObject:@-22421 forKey:@"ec"];
+        else if ([mode isEqual:@"2fa-top-level"]) { result = [NSDictionary dictionaryWithObject:@0 forKey:@"ec"]; verified = YES; }
+        else { result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"]; verified = YES; }
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         accountCalls++;
         NSDictionary *body = parse([req HTTPBody]);
@@ -322,14 +341,18 @@ int main(int argc, char **argv) {
         puts("PASS: disable-icloud-gsa preserves native requests and leaves the module unloaded");
         [pool drain]; return 0;
     }
-    if ([mode isEqual:@"2fa"]) {
-        /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. */
+    if (is2fa() && ![mode isEqual:@"2fa-sms"]) {
+        /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. Every
+         * variant but SMS asks for the code the same way, whatever the hint looked like. */
         assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
         error = nil; response = nil;
         data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
-        assert(verified && codeCalls == 2);
+        if ([mode isEqual:@"2fa-refused"]) assert(error && !verified && codeCalls == 2 && accountCalls == 0);
+        else assert(verified && codeCalls == 2);
     }
-    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"2fa"];
+    /* SMS: refused at once as unsupported, with no prompt requested and no code asked for. */
+    if ([mode isEqual:@"2fa-sms"]) assert(error && codeCalls == 0 && accountCalls == 0);
+    BOOL success = [mode isEqual:@"success"] || (is2fa() && ![mode isEqual:@"2fa-refused"] && ![mode isEqual:@"2fa-sms"]);
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);

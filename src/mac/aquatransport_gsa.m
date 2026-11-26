@@ -593,9 +593,21 @@ static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString 
     NSHTTPURLResponse *r = nil;
     NSData *d = aq_send(owner, req, &r, error);
     if (!d) return NO;
-    NSDictionary *status = aq_dict([aq_plist(d) objectForKey:@"Status"]);
+    NSDictionary *body = aq_plist(d);
+    /* The notification is answered in the SRP envelope; /validate carries its ec at the top
+     * level. Read whichever one this reply has. */
+    NSDictionary *status = [body objectForKey:@"ec"] ? body : aq_dict([body objectForKey:@"Status"]);
     id ec = [status objectForKey:@"ec"];
-    if ([r statusCode] != 200 || (ec && (![ec respondsToSelector:@selector(integerValue)] || [ec integerValue] != 0))) {
+    BOOL numeric = [ec isKindOfClass:[NSNumber class]];
+    syslog(LOG_NOTICE, "AquaTransport verification %s response (HTTP %ld, ec %ld, recognized=%d)",
+        code ? "validation" : "notification", (long)[r statusCode], numeric ? (long)[ec integerValue] : -1L, numeric);
+    /* For a code, a numeric ec of zero is what acceptance looks like: no other reply will do.
+     * The old check read ec from Status alone, so a validation that Apple refused with a
+     * top-level ec passed as approved, and the retry went on to a second password exchange
+     * on a code that had never been accepted. */
+    if ([r statusCode] != 200 || (code && !numeric) || (ec && (!numeric || [ec integerValue] != 0))) {
+        syslog(LOG_NOTICE, "AquaTransport iCloud %s rejected (HTTP %ld, code 21)",
+            code ? "verification code" : "verification prompt", (long)[r statusCode]);
         *error = aq_error(21, @"Apple rejected the verification request."); return NO;
     }
     return YES;
@@ -654,24 +666,42 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
             *error = aq_error(25, @"Invalid encrypted GrandSlam session data."); return nil;
         }
         NSDictionary *status = aq_dict([reply objectForKey:@"Status"]);
-        NSString *secondary = aq_string([status objectForKey:@"au"]);
-        if ([secondary isEqual:@"trustedDeviceSecondaryAuth"]) {
+        /* The verification hint normally rides in Status. It has also been seen in the
+         * encrypted session, so look there first and fall back. */
+        NSString *secondary = aq_string([spd objectForKey:@"au"]);
+        if (!secondary) secondary = aq_string([status objectForKey:@"au"]);
+        NSInteger hsc = [[status objectForKey:@"hsc"] integerValue];
+        /* hsc 409 is itself the authenticated indication that verification is wanted, and the
+         * hint is only a hint: Apple has answered 409 with no au at all, and the method's
+         * name is theirs to change. So a 409 goes to the trusted-device flow unless the hint
+         * names a method this adapter knows it cannot do -- SMS, which needs a delivery
+         * channel there is no adapter for. */
+        if ((hsc == 409 || [secondary isEqual:@"trustedDeviceSecondaryAuth"]) && ![secondary isEqual:@"secondaryAuth"]) {
             NSString *dsid = aq_string([spd objectForKey:@"adsid"]), *token = aq_string([spd objectForKey:@"GsIdmsToken"]);
             if (!dsid || !token) {
                 syslog(LOG_NOTICE, "AquaTransport iCloud verification requested without a session (code 26)");
                 *error = aq_error(26, @"Missing verification session."); return nil;
             }
             NSString *identity = aq_base64([[NSString stringWithFormat:@"%@:%@", dsid, token] dataUsingEncoding:NSUTF8StringEncoding]);
-            if (!aq_second_factor(owner, identity, nil, error)) return nil;
+            /* Ask for the prompt on the trusted devices, but do not make it a condition: the
+             * code can be read off one of them by hand, and a notification that could not be
+             * delivered is no reason to refuse the attempt. */
+            NSError *notificationError = nil;
+            if (!aq_second_factor(owner, identity, nil, &notificationError))
+                syslog(LOG_NOTICE, "AquaTransport iCloud verification prompt could not be requested (code %ld); a code read from another device still completes sign-in",
+                       (long)[notificationError code]);
+            if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
-            syslog(LOG_NOTICE, "AquaTransport iCloud verification code requested (trusted device, code 401)");
+            syslog(LOG_NOTICE, "AquaTransport iCloud verification required (method %s, hsc %ld, hint %s, code 401)",
+                [secondary isEqual:@"trustedDeviceSecondaryAuth"] ? "trusted-device" : secondary ? [secondary UTF8String] : "unlabelled",
+                (long)hsc, aq_string([spd objectForKey:@"au"]) ? "session" : secondary ? "status" : "absent");
             *error = aq_error(401, @"Approve sign-in on your trusted device, then enter your password followed by the six-digit code."); return nil;
         }
-        if (secondary || [[status objectForKey:@"hsc"] integerValue] != 200) {
+        if (secondary || hsc != 200) {
             syslog(LOG_NOTICE, "AquaTransport iCloud proof rejected (verification %s, hsc %ld, code 27)",
-                [secondary UTF8String] ?: "none", (long)[[status objectForKey:@"hsc"] integerValue]);
+                [secondary UTF8String] ?: "none", (long)hsc);
             *error = aq_error(27, @"This account requires an unsupported verification method (such as SMS)."); return nil;
         }
         syslog(LOG_NOTICE, "AquaTransport iCloud proof accepted (adapter 5)");

@@ -108,13 +108,13 @@ for a in x86_64 i386; do
     AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-service-test
     AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-ipc-test
     AQUATRANSPORT_DIR="$CONF/local" arch -"$a" build/anisette-local-test
-    for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa aos aos-basic aos-mixed settings settings-missing settings-redirect aos-settings ids-success ids-gzip ids-2fa ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
+    for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa 2fa-unlabelled 2fa-session-hint 2fa-renamed 2fa-top-level 2fa-refused 2fa-sms aos aos-basic aos-mixed settings settings-missing settings-redirect aos-settings ids-success ids-gzip ids-2fa ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
         AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe "$mode"
     done
 done
 "$GSA_CC" -arch x86_64 -mmacosx-version-min=10.7 $GSA_SDK -fobjc-gc -Wno-deprecated-declarations \
     -Ibuild/openssl/include tools/gsaprobe.m build/openssl/lib/libcrypto.a -lz -framework Foundation -o build/gsaprobe-gc
-for mode in success 2fa aos aos-basic aos-mixed settings aos-settings ids-gzip ids-2fa ids-rejected ids-bad-gzip; do
+for mode in success 2fa 2fa-unlabelled 2fa-session-hint 2fa-renamed 2fa-top-level 2fa-refused 2fa-sms aos aos-basic aos-mixed settings aos-settings ids-gzip ids-2fa ids-rejected ids-bad-gzip; do
     AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" build/gsaprobe-gc "$mode"
 done
 printf 'disable-icloud-gsa\n' > "$CONF/flags.txt"
