@@ -33,7 +33,7 @@ SEC="${AQ_SECURITY_PATH:-/System/Library/Frameworks/Security.framework/Versions/
 BACKUP="$SEC.original"
 INSERT="${AQ_INSERT_DYLIB:-/usr/local/bin/insert_dylib}"
 
-case "${1:-}" in install) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;; esac
+case "${1:-}" in install|uninstall) ;; *) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;; esac
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 
 case "$1" in
