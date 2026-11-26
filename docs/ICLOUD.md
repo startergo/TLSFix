@@ -279,6 +279,22 @@ identity. Verified end-to-end on 10.9.5 on 2026-09-14: GrandSlam proof
 accepted, account refresh HTTP 200, keyvalueservice HTTP 200, through a
 free-tier VM and the box's own identity.
 
+**When Apple stops accepting an identity.** A sign-in that fails at its first
+step, with `AquaTransport GrandSlam init failed (HTTP 200, hsc 200, ec -22410)`
+in the system log and the account helper reporting `account refresh completed
+(HTTP 401)`, means Apple no longer accepts the identity's provisioning. That is
+what the 10.9.5 machine's identity of 2026-09-14 was answered on 2026-11-26,
+with nothing about it changed: `init` refused with `-22410`, the saved-token
+refresh with 401, and another user agent made no difference. The remedy is a
+fresh identity -- provision one again as in step 2 above, install it in place
+of `gsa-anisette-v3.json`, and sign in once more. Others hit the same code in
+November 2026 and report the same remedy. One request finds it without a
+password:
+
+```sh
+AQUATRANSPORT_DIR=/usr/share/aquatransport/config build/gsa-pairing-probe '<apple id>'
+```
+
 **The identity fields must pair with the one-time password.** AOSKit's OTP is
 minted under the current machine's AuthKit provisioning, so the accompanying
 fields must come from the same context — exactly the pairing SideStore's
@@ -336,10 +352,20 @@ What to expect when switching to it:
   `/Users/Shared/adi` is created or completed, a persistent change to the machine
   that an uninstall leaves alone. Switching identity invalidates tokens issued
   under the old one, so the iCloud pane asks for the password once more.
-- **Tested on 10.9.5 only, and not yet by this fork.** Upstream's user confirmed a
-  pane sign-in with it on 2026-09-28; it has not been tried on 10.7 or 10.8. Until
-  it has been tried on the machine concerned, keep the `v3:` line that is known to
-  work and treat `local:` as the experiment it is. The two are one line apart.
+- **Tried live on 10.9.5 on 2026-11-26, and refused by Apple.** The generator did
+  its part: it provisioned the Mac with one exchange against `gsa.apple.com`, and
+  then minted headers on demand. Apple's edge answered the first step of the
+  sign-in exchange with a bare HTTP 503 -- no GrandSlam status at all -- in every
+  form tried: as the machine itself (`<MacPro5,1> <Mac OS X;10.9.5;13F1911>`,
+  akd's token), with a Mojave-era and with a current user agent, and with this
+  adapter's other client identity. The `v3:` identity's same step, minutes later,
+  was answered with a GrandSlam status. So it is the device identity this Mac's
+  AOSKit mints that Apple refuses, not the way it is dressed. Upstream's own notes
+  mark their November login work "live acceptance remains to be tested", and
+  AltStore's reports of October and November 2026 describe Apple's edge dropping
+  GrandSlam requests by client profile. Until that changes, keep the `v3:` line.
+  The two are one line apart, and the pairing probe (under Validation) says in one
+  request whether Apple is answering the local identity.
 - **A missing helper is an error, not a fallback.** With `local:` configured and
   the service absent, sign-in stops with "The local Anisette service is
   unavailable". No other source is consulted.
@@ -682,5 +708,9 @@ closed on the service's error and makes no request. `tools/gsa-diagnose.m` runs 
 configured provider for real, without reading credentials or starting Apple sign-in. Run
 it by hand on the machine concerned: with `local:` it makes the provisioning exchange if
 the machine is not provisioned yet, and with a server it sends the device identifier as
-described above. Live provider availability and Apple sign-in remain separate validation
-requirements.
+described above. `tools/gsa-pairing-probe.m` goes one step further and still without a
+password: it sends the first step of the sign-in exchange -- the account name and the
+device headers -- through the adapter's own exchange code, and prints whether Apple
+answered with a challenge, refused it with a status, or dropped it at the edge with a
+bare 503; the HTTP status, hsc and ec are in the system log. Build it like `gsa-diagnose`.
+Whether Apple then completes a sign-in remains a separate, live validation.
