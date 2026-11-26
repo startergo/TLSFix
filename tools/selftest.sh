@@ -178,12 +178,21 @@ check "debug flag in flags.txt enables logging" "handshake" "$(grep 'httpsprobe\
 : > "$T/flags.txt"; rm -f "$LOG"
 
 echo "== loading with no gate =="
-# The property the loader design rests on: loaded into a process with no CoreFoundation and no
-# Security, the library must pull in neither, and must still work if Secure Transport turns up
+# The property the loader design rests on: loaded into a process that has neither CoreFoundation
+# nor Security, the library must sit inert, and must still work once Secure Transport turns up
 # later. Without it, injection would have to wait for Security.framework before it was safe.
+#
+# Loading it does bring both frameworks in. The loader maps the engine at once, and the engine
+# names Security and CoreFoundation in ordinary load commands: c3777af found that the lazy
+# alternative cannot be linked against the 10.6 SDK, and bought nothing observed. So what is
+# asserted first is that the process really started without them. That is what makes the
+# request below a test of a framework that arrived after the library, rather than of one that
+# had been there all along. It replaces a check that demanded "CF=0 Security=0" of the second
+# phase, which no build since that commit could satisfy -- confirmed on 10.9.5 against the
+# 2026-09-22 build and against the build of 2026-11-26 alike, on both architectures.
 for a in x86_64 i386; do
   out=$(arch -$a "$LATECHECK" "$D" 2>&1)
-  check "$a: loading pulls in no frameworks" "injected=|loaded\): CF=0 Security=0" "$(echo "$out" | sed -n 2p)"
+  check "$a: loaded into a process with neither framework" "before our dylib\): CF=0 Security=0" "$(echo "$out" | sed -n 1p)"
   check "$a: works when Security arrives later" "HTTP 404" "$(echo "$out" | tail -1)"
 done
 
