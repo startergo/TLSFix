@@ -22,8 +22,11 @@ done
 # SDK by Xcode build shells and that one carries no crt files at all. The overlay gives
 # every build a sysroot with both: everything of the 10.9 SDK by symlink, plus the crt
 # files copied in.
+# The developer directory's own copy is the fallback, as in build-macos.sh.
 CRT_SRC=""
-for cand in "${AQUATRANSPORT_SDK:-${SDKROOT:-}}" "$HOME/Downloads/MacOSX10.6.sdk"; do
+DEV_SDKS="$(unset DEVELOPER_DIR; xcode-select -p 2>/dev/null || true)"
+for cand in "${AQUATRANSPORT_SDK:-${SDKROOT:-}}" \
+            "$DEV_SDKS/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.6.sdk" "$DEV_SDKS/SDKs/MacOSX10.6.sdk"; do
   [ -n "$cand" ] && [ -f "$cand/usr/lib/crt1.10.6.o" ] && CRT_SRC="$cand" && break
 done
 [ -n "$CRT_SRC" ] || { echo "no SDK with crt1.10.6.o found: set AQUATRANSPORT_SDK to the 10.6 SDK"; exit 1; }

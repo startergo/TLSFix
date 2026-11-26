@@ -51,15 +51,15 @@ TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 # and the link dies on plain libc ("symbol(s) not found for architecture i386" -- _time,
 # _vfprintf, _vm_protect). A 10.6-era SDK supplies every slice the deployment target names,
 # so the dylib links name one explicitly; compilation keeps the default SDK's headers, which
-# sit above the deployment floor. AQUATRANSPORT_SDK overrides, then SDKROOT, then the usual
-# place the SDK is kept on the machines that build this.
+# sit above the deployment floor. AQUATRANSPORT_SDK overrides, then SDKROOT, then the
+# developer directory's own copy.
 #
 # The choice is validated, not trusted: SDKROOT is often set by Xcode build environments to
 # the current SDK, which does not carry i386, and a nonexistent directory would otherwise
-# surface later as an opaque clang error. An unusable setting falls back to the known-good
-# location, and only when that is unusable too does the build stop. The probe requires both
-# of the architectures the build links -- an i386-only SDK would pass an i386-only check and
-# then fail the x86_64 link -- and it scrubs the environment because lipo itself honours
+# surface later as an opaque clang error. An unusable setting falls back to the developer
+# directory's copy, and only when that is unusable too does the build stop. The probe requires
+# both of the architectures the build links -- an i386-only SDK would pass an i386-only check
+# and then fail the x86_64 link -- and it scrubs the environment because lipo itself honours
 # SDKROOT: a stale exported value makes lipo error out looking for tooling inside it, which
 # would fail the check on a perfectly good SDK. For the same reason SDKROOT is dropped once
 # the choice is made: the build's later lipo/clang calls must not be steered by it either.
@@ -72,12 +72,25 @@ sdk_usable() {
   archs="$( (unset SDKROOT DEVELOPER_DIR; /usr/bin/lipo -info "$1/usr/lib/libSystem.dylib") 2>/dev/null)" || return 1
   grep -qw x86_64 <<<"$archs" && grep -qw i386 <<<"$archs"
 }
+# Where Xcode keeps its SDKs, found through xcode-select so that it holds wherever Xcode is:
+# on a 10.6 machine building with nothing but its own SDK, this is that SDK. Both layouts it
+# has used, one per line.
+dev_sdks() {
+  local dev
+  dev="$(unset DEVELOPER_DIR; xcode-select -p 2>/dev/null)" || return 0
+  echo "$dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.6.sdk"
+  echo "$dev/SDKs/MacOSX10.6.sdk"
+}
 
 SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-}}"
-[ -z "$SDK" ] && [ -d "$HOME/Downloads/MacOSX10.6.sdk" ] && SDK="$HOME/Downloads/MacOSX10.6.sdk"
 if ! sdk_usable "$SDK"; then
   [ -n "$SDK" ] && echo "SDK libSystem lacks i386 or x86_64, not using it: $SDK" >&2
-  SDK="$HOME/Downloads/MacOSX10.6.sdk"
+  SDK=""
+  while IFS= read -r cand; do
+    if sdk_usable "$cand"; then SDK="$cand"; break; fi
+  done <<EOF
+$(dev_sdks)
+EOF
 fi
 sdk_usable "$SDK" || { echo "no 10.6-era SDK with an i386+x86_64 libSystem found: set AQUATRANSPORT_SDK to one"; exit 1; }
 unset SDKROOT DEVELOPER_DIR
