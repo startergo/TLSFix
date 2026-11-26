@@ -398,6 +398,30 @@ static NSString *aq_device_field(id value) {
  * -isStopped. The broker, the worker and the provisioning exchange live in
  * aquatransport_anisette_service.m, built as the aquatransport-anisette executable. */
 #include "aquatransport_anisette_client.inc"
+/* How the generator, and so this Mac, describes itself to Apple. */
+#include "aquatransport_client_info.inc"
+
+/* The mark the local generator's header set carries. Not a header: nothing that applies the
+ * set to a request, or copies it into GrandSlam's client data, lets it through. */
+#define AQGenerated @"AQ-Generated"
+/* What reaches Apple from a provider's header set: everything but the mark, and -- in the
+ * client data, which never carried one -- the user agent. */
+static BOOL aq_copied(NSString *key, BOOL clientData) {
+    if ([key hasPrefix:@"AQ-"]) return NO;
+    return !(clientData && [key isEqualToString:@"User-Agent"]);
+}
+/* The client identity the verification step presents for a header set. Another source's is
+ * whatever that source's request carries. The local generator's is an Xcode request, as
+ * ever, but with the machine the real one -- the identity the one-time password was issued to
+ * -- and Xcode's application token where the generator's request had akd's. */
+static NSString *aq_verification_identity(NSDictionary *headers) {
+    NSString *client = [headers objectForKey:@"X-Mme-Client-Info"];
+    if (![headers objectForKey:AQGenerated]) return client;
+    NSRange application = [client rangeOfString:@" <" options:NSBackwardsSearch];
+    if (!client || application.location == NSNotFound) return AQClient;
+    return [[client substringToIndex:application.location] stringByAppendingString:
+        @" <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"];
+}
 
 /* The generator's reply under the names GrandSlam's request carries. The generator owns
  * provisioning and identity alike, so a reply missing either is an error rather than
@@ -420,9 +444,21 @@ static NSDictionary *aq_local_anisette(AQGSAProtocol *owner, NSError **error) {
      * this process: the provisioning that made the headers belongs to the hardware UUID
      * the helper reports. */
     if (!device) { *error = aq_error(13, @"Local Anisette returned no device identity. Update the helper and restart."); return nil; }
+    /* The one-time password is issued to the machine the generator described to Apple when it
+     * provisioned it: real model, installed system, akd's application token and user agent. A
+     * request carrying it has to say the same thing. Presented with this adapter's other client
+     * identity, Apple's edge refuses the pairing with a bare HTTP 503, no GrandSlam status at
+     * all (10.9.5, 2026-11-26). Both travel in the set like a remote provider's client
+     * identity, which the request builders prefer to their own. */
+    NSString *clientInfo = aq_client_info(), *userAgent = aq_akd_user_agent();
+    if (!clientInfo || !userAgent) {
+        *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no usable model or system version.");
+        return nil;
+    }
     return [NSDictionary dictionaryWithObjectsAndKeys:
         machine, @"X-Apple-I-MD-M", oneTime, @"X-Apple-I-MD", routing, @"X-Apple-I-MD-RINFO",
-        device, @"X-Mme-Device-Id", aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]), @"X-Apple-I-MD-LU", nil];
+        device, @"X-Mme-Device-Id", aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]), @"X-Apple-I-MD-LU",
+        clientInfo, @"X-Mme-Client-Info", userAgent, @"User-Agent", @"local", AQGenerated, nil];
 }
 
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
@@ -513,11 +549,12 @@ static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *header
     [r setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
     [r setValue:@"akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" forHTTPHeaderField:@"User-Agent"];
     [r setValue:AQClient forHTTPHeaderField:@"X-Mme-Client-Info"];
-    for (NSString *k in headers) [r setValue:[headers objectForKey:k] forHTTPHeaderField:k];
+    for (NSString *k in headers) if (aq_copied(k, NO)) [r setValue:[headers objectForKey:k] forHTTPHeaderField:k];
     return r;
 }
 static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payload, NSDictionary *headers, NSError **error) {
-    NSMutableDictionary *cpd = [[headers mutableCopy] autorelease];
+    NSMutableDictionary *cpd = [NSMutableDictionary dictionary];
+    for (NSString *k in headers) if (aq_copied(k, YES)) [cpd setObject:[headers objectForKey:k] forKey:k];
     [cpd setObject:[NSNumber numberWithBool:YES] forKey:@"bootstrap"];
     [cpd setObject:[NSNumber numberWithBool:YES] forKey:@"icscrec"];
     [cpd setObject:[NSNumber numberWithBool:NO] forKey:@"pbe"];
@@ -586,6 +623,9 @@ static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString 
     if (!headers) return NO;
     NSMutableURLRequest *req = aq_apple_request(code ? @"https://gsa.apple.com/grandslam/GsService2/validate" :
                                                         @"https://gsa.apple.com/auth/verify/trusteddevice", headers);
+    /* Only for the local generator: another source's verification request carries what it
+     * always carried. */
+    if ([headers objectForKey:AQGenerated]) [req setValue:aq_verification_identity(headers) forHTTPHeaderField:@"X-Mme-Client-Info"];
     [req setValue:identity forHTTPHeaderField:@"X-Apple-Identity-Token"];
     [req setValue:@"com.apple.gs.xcode.auth" forHTTPHeaderField:@"X-Apple-App-Info"];
     [req setValue:@"11.2 (11B41)" forHTTPHeaderField:@"X-Xcode-Version"];
@@ -723,7 +763,7 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
         NSDictionary *headers = aq_anisette(owner, error);
         if (!headers) return nil;
         NSMutableURLRequest *req = [[original mutableCopy] autorelease];
-        for (NSString *k in headers) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
+        for (NSString *k in headers) if (aq_copied(k, NO)) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
         NSHTTPURLResponse *response = nil;
         NSData *data = aq_send(owner, req, &response, error);
         if (data) syslog(LOG_NOTICE, "AquaTransport iCloud account refresh completed (HTTP %ld, adapter 5)", (long)[response statusCode]);
@@ -793,7 +833,7 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
         [req setHTTPBody:aq_encode(body)]; [req setValue:nil forHTTPHeaderField:@"Content-Length"];
         [req setValue:nil forHTTPHeaderField:@"Content-Encoding"];
         [req setValue:nil forHTTPHeaderField:@"Authorization"];
-        for (NSString *k in headers) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
+        for (NSString *k in headers) if (aq_copied(k, NO)) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
         NSData *data = aq_send(owner, req, &response, error);
         return data ? aq_result(response, data) : nil;
     }
