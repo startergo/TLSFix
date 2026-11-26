@@ -26,7 +26,11 @@ NEW=""                                 # the beside-the-pkg staging copy, once t
 # never run. Verified on 10.6's /bin/sh: a failing command mid-trap skips the rest of it.
 trap 'rm -rf "$W" 2>/dev/null || sudo rm -rf "$W" || :; [ -n "$NEW" ] && rm -f "$NEW" || :; :' EXIT
 
-if [ -t 0 ]; then sudo -v; else sudo -S -v; fi
+# Ask without a prompt first: an account allowed to run everything without a password never
+# needed one, and 10.9's sudo -S -v would read a line from stdin regardless and count an empty
+# one as a wrong password. Only when a password is required is it asked for -- on the terminal,
+# or on stdin when there is none.
+sudo -n -v 2>/dev/null || { if [ -t 0 ]; then sudo -v; else sudo -S -v; fi; }
 run_root() { sudo "$@"; }              # failures print their reason and stop the build
 
 STAGE="$REPO/build/stage/usr/share/aquatransport"
