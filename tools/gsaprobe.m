@@ -64,9 +64,12 @@ static void server_start(NSData *clientA) {
         hash(cat([NSArray arrayWithObjects:bnbytes(A, YES), m, serverKey, nil])), nil]) retain];
     BN_free(A); BN_free(b); BN_free(v); BN_free(B); BN_free(tmp); BN_free(S); BN_free(x); BN_free(k); BN_free(u); BN_CTX_free(ctx);
 }
-static NSData *encrypted_session(void) {
-    NSMutableDictionary *session = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken",
-        [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"], @"t", nil];
+/* A completed login's session carries the password-equivalent token; the session Apple
+ * returns while it is still asking for a code carries none. */
+static NSData *encrypted_session(BOOL challenge) {
+    NSMutableDictionary *session = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken", nil];
+    if (!challenge) [session setObject:[NSDictionary dictionaryWithObject:
+        [NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"] forKey:@"t"];
     /* Apple has put the verification hint in the encrypted session instead of Status. As
      * with the Status-side hint, it is gone once a code has been accepted. */
     if ([mode isEqual:@"2fa-session-hint"] && !verified) [session setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
@@ -95,7 +98,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
 - (void)stopLoading {}
 - (void)startLoading {
     NSURLRequest *req = [self request]; NSString *host = [[req URL] host], *path = [[req URL] path];
-    NSData *data = nil; NSDictionary *result = nil; int status = 200;
+    NSData *data = nil; NSDictionary *result = nil, *responseHeaders = nil; int status = 200;
     if (fixture(@"disabled")) {
         assert(![NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
         assert([[[parse([req HTTPBody]) objectForKey:@"password"] description] isEqual:@"Synthetic:PassWord"]);
@@ -146,7 +149,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
             NSMutableData *m2 = [[[serverProof subdataWithRange:NSMakeRange(32,32)] mutableCopy] autorelease];
             if (fixture(@"bad-proof")) ((unsigned char *)[m2 mutableBytes])[0] ^= 1;
             if ([mode isEqual:@"short-proof"]) [m2 setLength:1];
-            result = [NSDictionary dictionaryWithObjectsAndKeys:m2, @"M2", encrypted_session(), @"spd", nil];
+            result = [NSDictionary dictionaryWithObjectsAndKeys:m2, @"M2", encrypted_session(is2fa() && !verified), @"spd", nil];
         }
         NSMutableDictionary *r = [[result mutableCopy] autorelease];
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithObjectsAndKeys:@0, @"ec", @200, @"hsc", nil];
@@ -168,17 +171,24 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
         /* /validate has answered with its ec at the top level, and a refusal there is one the
          * adapter once read straight past. */
         if ([mode isEqual:@"2fa-refused"]) result = [NSDictionary dictionaryWithObject:@-22421 forKey:@"ec"];
-        else if ([mode isEqual:@"2fa-top-level"]) { result = [NSDictionary dictionaryWithObject:@0 forKey:@"ec"]; verified = YES; }
-        else { result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"]; verified = YES; }
+        else {
+            /* Apple names its token in a header whose case CFNetwork does not preserve. The
+             * rerun mode is the reply that carries none. */
+            if (![mode isEqual:@"2fa-rerun"])
+                responseHeaders = [NSDictionary dictionaryWithObject:@"Y29tLmFwcGxlLmdzLmlkbXMucGV0OnZhbGlkYXRlZC1wZXQ=" forKey:@"x-apple-pe-token"];
+            if ([mode isEqual:@"2fa-top-level"]) { result = [NSDictionary dictionaryWithObject:@0 forKey:@"ec"]; verified = YES; }
+            else { result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"]; verified = YES; }
+        }
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         accountCalls++;
         NSDictionary *body = parse([req HTTPBody]);
         assert([[body objectForKey:@"apple-id"] isEqual:@"test@example.invalid"]);
-        assert([[body objectForKey:@"password"] isEqual:@"fake-pet"]);
+        assert([[body objectForKey:@"password"] isEqual:is2fa() ? @"validated-pet" : @"fake-pet"]);
         assert([[body objectForKey:@"client-id"] isEqual:@"fake-device"]);
         NSDictionary *delegates = [body objectForKey:@"delegates"];
         assert([delegates count] == 1 && [[delegates objectForKey:@"com.apple.madrid"] isKindOfClass:[NSDictionary class]]);
-        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
+        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:is2fa() ?
+            @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6dmFsaWRhdGVkLXBldA==" : @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-ADSID"] isEqual:@"12345"]);
@@ -193,7 +203,10 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
             [NSDictionary dictionaryWithObject:delegate forKey:@"com.apple.madrid"], @"delegates", nil];
     } else if ([host isEqual:@"setup.icloud.com"] && [path hasPrefix:@"/setup/authenticate/"]) {
         accountCalls++;
-        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
+        /* The password-equivalent token the sign-in presents: the one Apple returned with the
+         * code, where there was one, and otherwise the one a repeated exchange produced. */
+        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:is2fa() && ![mode isEqual:@"2fa-rerun"] ?
+            @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6dmFsaWRhdGVkLXBldA==" : @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
         result = [NSDictionary dictionaryWithObjectsAndKeys:[NSDictionary dictionaryWithObject:@"12345" forKey:@"dsid"], @"appleAccountInfo",
             [NSDictionary dictionaryWithObject:@"fake-mme" forKey:@"mmeAuthToken"], @"tokens", nil];
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/get_account_settings"]) {
@@ -215,7 +228,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
         [[self client] URLProtocol:self wasRedirectedToRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.invalid/collect"]] redirectResponse:r];
         return;
     }
-    NSHTTPURLResponse *r = [[[NSHTTPURLResponse alloc] initWithURL:[req URL] statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:nil] autorelease];
+    NSHTTPURLResponse *r = [[[NSHTTPURLResponse alloc] initWithURL:[req URL] statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:responseHeaders] autorelease];
     [[self client] URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [[self client] URLProtocol:self didLoadData:data]; [[self client] URLProtocolDidFinishLoading:self];
 }
@@ -367,7 +380,8 @@ int main(int argc, char **argv) {
          * variant but SMS asks for the code the same way, whatever the hint looked like. */
         assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
         error = nil; response = nil;
-        data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
+        data = [NSURLConnection sendSynchronousRequest:login([mode isEqual:@"2fa-code-only"] ? @"123456" : @"Synthetic:PassWord123456")
+                                        returningResponse:&response error:&error];
         if ([mode isEqual:@"2fa-refused"]) assert(error && !verified && codeCalls == 2 && accountCalls == 0);
         else assert(verified && codeCalls == 2);
     }
@@ -379,6 +393,9 @@ int main(int argc, char **argv) {
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);
         assert([[parse(data) objectForKey:@"fixture"] isEqual:@"ok"] && accountCalls == 2);
+        /* An accepted code completes the sign-in on the exchange that asked for it. Only a
+         * reply without Apple's token repeats the exchange, as every code once did. */
+        if (is2fa()) assert(initCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1) && completeCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1));
         Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
         for (NSString *url in [NSArray arrayWithObjects:@"http://setup.icloud.com/setup/login_or_create_account",
             @"https://setup.icloud.com.example.invalid/setup/login_or_create_account", @"https://setup.icloud.com:444/setup/login_or_create_account",

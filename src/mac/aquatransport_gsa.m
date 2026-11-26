@@ -627,14 +627,66 @@ static NSDictionary *aq_decrypt(NSData *encrypted, unsigned char key[32]) {
     return result;
 }
 
-static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString *code, NSError **error) {
+/* A base64 value as bytes: empty, misaligned or oversized input, and anything that is not
+ * base64 at all, give nil. */
+static NSData *aq_unbase64(id value) {
+    NSData *ascii = [aq_string(value) dataUsingEncoding:NSASCIIStringEncoding];
+    NSUInteger n = [ascii length];
+    if (!n || n > 1024*1024 || n % 4) return nil;
+    const unsigned char *in = [ascii bytes];
+    NSMutableData *out = [NSMutableData dataWithLength:n];
+    int len = EVP_DecodeBlock([out mutableBytes], in, (int)n);
+    if (len <= 0) return nil;
+    if (in[n-1] == '=') len--;
+    if (n > 1 && in[n-2] == '=') len--;
+    [out setLength:len];
+    return len ? out : nil;
+}
+/* A response header by name, whatever case the server spelled it in. */
+static NSString *aq_response_header(NSHTTPURLResponse *response, NSString *wanted) {
+    for (id key in [response allHeaderFields])
+        if ([key isKindOfClass:[NSString class]] && [[(NSString *)key lowercaseString] isEqual:[wanted lowercaseString]])
+            return aq_string([[response allHeaderFields] objectForKey:key]);
+    return nil;
+}
+/* The token Apple returns with an accepted code: base64 of the service's name, a colon, and
+ * the token. Anything else is not one. */
+static NSString *aq_pet_from_header(id value) {
+    NSData *decoded = aq_unbase64(value);
+    NSString *envelope = decoded ? [[[NSString alloc] initWithData:decoded encoding:NSUTF8StringEncoding] autorelease] : nil;
+    NSString *prefix = @"com.apple.gs.idms.pet:";
+    if (![envelope hasPrefix:prefix]) return nil;
+    return aq_device_field([envelope substringFromIndex:[prefix length]]);
+}
+
+/* The two requests of the second factor: the prompt on the trusted devices, and the code's
+ * validation. Where `pet` is given, an accepted code's password-equivalent token is put
+ * there -- nil if Apple's reply carries none. */
+static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString *code, NSString **pet, NSError **error) {
+    if (pet) *pet = nil;
     NSDictionary *headers = aq_anisette(owner, error);
     if (!headers) return NO;
-    NSMutableURLRequest *req = aq_apple_request(code ? @"https://gsa.apple.com/grandslam/GsService2/validate" :
-                                                        @"https://gsa.apple.com/auth/verify/trusteddevice", headers);
-    /* Only for the local generator: another source's verification request carries what it
-     * always carried. */
-    if ([headers objectForKey:AQGenerated]) [req setValue:aq_verification_identity(headers) forHTTPHeaderField:@"X-Mme-Client-Info"];
+    NSMutableURLRequest *req;
+    if (!code) {
+        /* The prompt, as AltSign asks for it: Xcode's own profile, the device described as
+         * the one-time password's issuer describes it. With this adapter's usual profile
+         * Apple answered this request with HTTP 403 (10.9.5, 2026-11-26), and no code was
+         * pushed; a code read off a trusted device by hand still completes the sign-in. */
+        req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://gsa.apple.com/auth/verify/trusteddevice"]];
+        [req setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Content-Type"];
+        [req setValue:@"text/x-xml-plist" forHTTPHeaderField:@"Accept"];
+        [req setValue:@"Xcode" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:@"en-us" forHTTPHeaderField:@"Accept-Language"];
+        for (NSString *k in [NSArray arrayWithObjects:@"X-Apple-I-MD", @"X-Apple-I-MD-M", @"X-Apple-I-MD-LU",
+                                 @"X-Apple-I-MD-RINFO", @"X-Mme-Device-Id", @"X-MMe-Client-Info", @"X-Apple-I-Client-Time",
+                                 @"X-Apple-Locale", @"X-Apple-I-TimeZone", nil])
+            if ([headers objectForKey:k]) [req setValue:[headers objectForKey:k] forHTTPHeaderField:k];
+    } else {
+        req = aq_apple_request(@"https://gsa.apple.com/grandslam/GsService2/validate", headers);
+        /* Only for the local generator: another source's verification request carries what it
+         * always carried. */
+        if ([headers objectForKey:AQGenerated]) [req setValue:aq_verification_identity(headers) forHTTPHeaderField:@"X-Mme-Client-Info"];
+    }
     [req setValue:identity forHTTPHeaderField:@"X-Apple-Identity-Token"];
     [req setValue:@"com.apple.gs.xcode.auth" forHTTPHeaderField:@"X-Apple-App-Info"];
     [req setValue:@"11.2 (11B41)" forHTTPHeaderField:@"X-Xcode-Version"];
@@ -659,6 +711,10 @@ static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString 
             code ? "verification code" : "verification prompt", (long)[r statusCode]);
         *error = aq_error(21, @"Apple rejected the verification request."); return NO;
     }
+    if (code && pet) {
+        *pet = aq_pet_from_header(aq_response_header(r, @"X-Apple-PE-Token"));
+        syslog(LOG_NOTICE, "AquaTransport verification token %s", *pet ? "issued" : "absent");
+    }
     return YES;
 }
 
@@ -670,13 +726,35 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
     NSString *account = [user lowercaseString];
     NSDictionary *pending = [AQPending objectForKey:account];
     if (pending) {
-        NSString *code = [password length] > 6 ? [password substringFromIndex:[password length]-6] : nil;
+        NSUInteger length = [password length];
+        NSNumber *submitted = [pending objectForKey:@"passwordLength"];
+        /* On the retry the code follows the password; where the pane asks for the code alone,
+         * it is the password. */
+        BOOL appended = submitted && length > 6 && length - 6 == [submitted unsignedIntegerValue];
+        BOOL alone = submitted && length == 6 && [submitted unsignedIntegerValue] != 6;
+        NSString *code = appended ? [password substringFromIndex:length-6] : alone ? password : nil;
         if (!code || [code rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location != NSNotFound) {
             *error = aq_error(401, @"Enter your password followed by the six-digit verification code."); return nil;
         }
-        if (!aq_second_factor(owner, [pending objectForKey:@"identity"], code, error)) return nil;
-        password = [password substringToIndex:[password length]-6];
+        NSString *pet = nil;
+        if (!aq_second_factor(owner, [pending objectForKey:@"identity"], code, &pet, error)) return nil;
+        /* An accepted code is what Apple was waiting for. The token it returns with the code
+         * completes the sign-in, and the exchange that asked is not run again: run again on
+         * 2026-11-26, it was answered 409 a second time and the attempt went on to spend the
+         * code twice. Only a reply that carries no token falls back to repeating it.
+         * The pending entry owns the challenge's session, so the copy is taken before the
+         * entry is let go of. */
+        NSMutableDictionary *verified = pet ? [[aq_dict([pending objectForKey:@"session"]) mutableCopy] autorelease] : nil;
         [AQPending removeObjectForKey:account];
+        if (verified) {
+            [verified setObject:[NSDictionary dictionaryWithObject:
+                [NSDictionary dictionaryWithObject:pet forKey:@"token"] forKey:@"com.apple.gs.idms.pet"] forKey:@"t"];
+            syslog(LOG_NOTICE, "AquaTransport iCloud verification accepted; signing in with Apple's password-equivalent token (adapter 5)");
+            return verified;
+        }
+        syslog(LOG_NOTICE, "AquaTransport iCloud verification accepted without a password-equivalent token; repeating the exchange (adapter 5)");
+        if (alone) { *error = aq_error(41, @"Enter your password followed by the six-digit verification code."); return nil; }
+        password = [password substringToIndex:length-6];
     }
     NSDictionary *headers = aq_anisette(owner, error);
     if (!headers) return nil;
@@ -736,12 +814,14 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
              * code can be read off one of them by hand, and a notification that could not be
              * delivered is no reason to refuse the attempt. */
             NSError *notificationError = nil;
-            if (!aq_second_factor(owner, identity, nil, &notificationError))
+            if (!aq_second_factor(owner, identity, nil, NULL, &notificationError))
                 syslog(LOG_NOTICE, "AquaTransport iCloud verification prompt could not be requested (code %ld); a code read from another device still completes sign-in",
                        (long)[notificationError code]);
             if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
+            /* The challenge's own session is kept: with the code's token, it is the login. */
             [AQPending setObject:[NSDictionary dictionaryWithObjectsAndKeys:identity, @"identity",
+                spd, @"session", [NSNumber numberWithUnsignedInteger:[password length]], @"passwordLength",
                 [NSDate dateWithTimeIntervalSinceNow:300], @"expires", nil] forKey:account];
             syslog(LOG_NOTICE, "AquaTransport iCloud verification required (method %s, hsc %ld, hint %s, code 401)",
                 [secondary isEqual:@"trustedDeviceSecondaryAuth"] ? "trusted-device" : secondary ? [secondary UTF8String] : "unlabelled",
