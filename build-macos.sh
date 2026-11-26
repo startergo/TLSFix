@@ -52,12 +52,12 @@ TARBALL="$DIR/deps/openssl-$OPENSSL_VERSION.tar.gz"
 # _vfprintf, _vm_protect). A 10.6-era SDK supplies every slice the deployment target names,
 # so the dylib links name one explicitly; compilation keeps the default SDK's headers, which
 # sit above the deployment floor. AQUATRANSPORT_SDK overrides, then SDKROOT, then the
-# developer directory's own copy.
+# developer directory's own copy, then ~/Downloads.
 #
 # The choice is validated, not trusted: SDKROOT is often set by Xcode build environments to
 # the current SDK, which does not carry i386, and a nonexistent directory would otherwise
-# surface later as an opaque clang error. An unusable setting falls back to the developer
-# directory's copy, and only when that is unusable too does the build stop. The probe requires
+# surface later as an opaque clang error. An unusable setting falls back to those copies in
+# that order, and only when each is unusable too does the build stop. The probe requires
 # both of the architectures the build links -- an i386-only SDK would pass an i386-only check
 # and then fail the x86_64 link -- and it scrubs the environment because lipo itself honours
 # SDKROOT: a stale exported value makes lipo error out looking for tooling inside it, which
@@ -74,12 +74,14 @@ sdk_usable() {
 }
 # Where Xcode keeps its SDKs, found through xcode-select so that it holds wherever Xcode is:
 # on a 10.6 machine building with nothing but its own SDK, this is that SDK. Both layouts it
-# has used, one per line.
+# has used, one per line, and then the copy some machines keep under Downloads: a 10.9
+# machine's Xcode ships no 10.6 SDK, and that copy is the one it has to link 10.6 with.
 dev_sdks() {
   local dev
-  dev="$(unset DEVELOPER_DIR; xcode-select -p 2>/dev/null)" || return 0
-  echo "$dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.6.sdk"
-  echo "$dev/SDKs/MacOSX10.6.sdk"
+  dev="$(unset DEVELOPER_DIR; xcode-select -p 2>/dev/null)" || true
+  echo "${dev:+$dev/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.6.sdk}"
+  echo "${dev:+$dev/SDKs/MacOSX10.6.sdk}"
+  echo "$HOME/Downloads/MacOSX10.6.sdk"
 }
 
 SDK="${AQUATRANSPORT_SDK:-${SDKROOT:-}}"
