@@ -279,17 +279,18 @@ identity. Verified end-to-end on 10.9.5 on 2026-09-14: GrandSlam proof
 accepted, account refresh HTTP 200, keyvalueservice HTTP 200, through a
 free-tier VM and the box's own identity.
 
-**When Apple stops accepting an identity.** A sign-in that fails at its first
-step, with `AquaTransport GrandSlam init failed (HTTP 200, hsc 200, ec -22410)`
-in the system log and the account helper reporting `account refresh completed
-(HTTP 401)`, means Apple no longer accepts the identity's provisioning. That is
-what the 10.9.5 machine's identity of 2026-09-14 was answered on 2026-11-26,
-with nothing about it changed: `init` refused with `-22410`, the saved-token
-refresh with 401, and another user agent made no difference. The remedy is a
-fresh identity -- provision one again as in step 2 above, install it in place
-of `gsa-anisette-v3.json`, and sign in once more. Others hit the same code in
-November 2026 and report the same remedy. One request finds it without a
-password:
+**When sign-in fails at its first step.** On the 10.9.5 machine, on
+2026-11-26, the account helper logged `account refresh completed (HTTP 401)` and
+the first step of the exchange `AquaTransport GrandSlam init failed (HTTP 200,
+hsc 200, ec -22410)` -- after the Apple ID's password had been changed
+elsewhere. The 401 is that: the saved credentials are stale, and the account
+has to be signed in again with the new password, by the two-attempt flow
+above. Whether a changed password also brings `-22410` at the first step is
+not established. What was established that day is that the `v3:` identity
+passed Apple's edge every time, and that another user agent changed nothing.
+If a sign-in with the new password is refused the same way, the identity itself
+is in question: others who saw `-22410` that month clear it by provisioning a
+fresh identity (step 2 above). One request shows which, without a password:
 
 ```sh
 AQUATRANSPORT_DIR=/usr/share/aquatransport/config build/gsa-pairing-probe '<apple id>'
