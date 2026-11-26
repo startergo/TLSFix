@@ -56,7 +56,7 @@
 #include "aquatransport_config.h"
 #include "aquatransport_gsa_mail.h"
 #include "aquatransport_maps.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -79,20 +79,20 @@ static int       g_resolved;
 static pthread_once_t g_resolve_once = PTHREAD_ONCE_INIT;
 
 static void resolve_once(void) {
-    p_GetURL      = (CFURLRef (*)(void *))dlsym(RTLD_DEFAULT, "CFURLRequestGetURL");
-    p_MutableCopy = (void *(*)(CFAllocatorRef, void *))dlsym(RTLD_DEFAULT, "CFURLRequestCreateMutableCopy");
-    p_SetURL      = (void (*)(void *, CFURLRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetURL");
-    p_SetHeader   = (void (*)(void *, CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "CFURLRequestSetHTTPHeaderFieldValue");
-    p_CreateConnection = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionCreate");
-    p_SendSync = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionSendSynchronousRequest");
-    p_CreateWithProps = (fn6)dlsym(RTLD_DEFAULT, "CFURLConnectionCreateWithProperties");
+    p_GetURL      = (CFURLRef (*)(void *))fishhook_resolve(tf_cfnetwork_providers, "CFURLRequestGetURL");
+    p_MutableCopy = (void *(*)(CFAllocatorRef, void *))fishhook_resolve(tf_cfnetwork_providers, "CFURLRequestCreateMutableCopy");
+    p_SetURL      = (void (*)(void *, CFURLRef))fishhook_resolve(tf_cfnetwork_providers, "CFURLRequestSetURL");
+    p_SetHeader   = (void (*)(void *, CFStringRef, CFStringRef))fishhook_resolve(tf_cfnetwork_providers, "CFURLRequestSetHTTPHeaderFieldValue");
+    p_CreateConnection = (fn6)fishhook_resolve(tf_cfnetwork_providers, "CFURLConnectionCreate");
+    p_SendSync = (fn6)fishhook_resolve(tf_cfnetwork_providers, "CFURLConnectionSendSynchronousRequest");
+    p_CreateWithProps = (fn6)fishhook_resolve(tf_cfnetwork_providers, "CFURLConnectionCreateWithProperties");
     g_resolved = (p_GetURL && p_MutableCopy && p_SetURL && p_SetHeader);
 }
 static int resolved(void) { pthread_once(&g_resolve_once, resolve_once); return g_resolved; }
 
 // The CFHTTPMessage side, resolved the same way and for the same reason: a direct call would
-// make CFNetwork a load-time dependency of this library. Nothing else interposes these, so the
-// first definition in load order is CFNetwork's own.
+// make CFNetwork a load-time dependency of this library. Lookup is restricted to
+// CFNetwork's exports, independent of other libraries' load order or symbol names.
 static void *(*p_MsgCreate)(CFAllocatorRef, CFStringRef, CFURLRef, CFStringRef);
 static void  (*p_MsgSetHeader)(void *, CFStringRef, CFStringRef);
 static CFURLRef (*p_MsgURL)(void *);
@@ -101,10 +101,10 @@ static pthread_once_t g_msg_once = PTHREAD_ONCE_INIT;
 
 static void resolve_msg_once(void) {
     p_MsgCreate    = (void *(*)(CFAllocatorRef, CFStringRef, CFURLRef, CFStringRef))
-                     dlsym(RTLD_DEFAULT, "CFHTTPMessageCreateRequest");
+                     fishhook_resolve(tf_cfnetwork_providers, "CFHTTPMessageCreateRequest");
     p_MsgSetHeader = (void (*)(void *, CFStringRef, CFStringRef))
-                     dlsym(RTLD_DEFAULT, "CFHTTPMessageSetHeaderFieldValue");
-    p_MsgURL       = (CFURLRef (*)(void *))dlsym(RTLD_DEFAULT, "CFHTTPMessageCopyRequestURL");
+                     fishhook_resolve(tf_cfnetwork_providers, "CFHTTPMessageSetHeaderFieldValue");
+    p_MsgURL       = (CFURLRef (*)(void *))fishhook_resolve(tf_cfnetwork_providers, "CFHTTPMessageCopyRequestURL");
     g_msg_resolved = (p_MsgCreate && p_MsgSetHeader && p_MsgURL);
 }
 static int msg_resolved(void) { pthread_once(&g_msg_once, resolve_msg_once); return g_msg_resolved; }
@@ -137,6 +137,9 @@ static void load_gsa_once(void) {
 
 static void prepare_gsa(void) {
     void *(*get_class)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
+    /* The local device generator uses Foundation for its own provisioning
+     * requests. It must not load an authentication client inside itself. */
+    if (get_class && get_class("AQNativeAnisetteGenerator")) return;
     // A C-only request must not consume the once token: Foundation may arrive later.
     if (get_class && get_class("NSURLConnection")) pthread_once(&g_gsa_once, load_gsa_once);
 }
@@ -956,20 +959,57 @@ static void *my_MutableCopy(void *a, void *b, void *c, void *d, void *e, void *f
     return m;
 }
 
+// The WebKit host hook -- the engine's one exported symbol. A patched WebKit resolves it by name
+// and calls it for each outgoing request in its network process, passing the request URL and a
+// mutable dictionary of its header fields (names compared case-insensitively). This carries the
+// same redirect and header rules the CFNetwork entry points above apply, to the loads a WebKit
+// port routes through its own transport instead of CFNetwork.
+//
+// The contract is WebKit's, read from its caller: url and headers belong to WebKit and are not
+// released here; header rules edit the dictionary in place, where a rule with an empty value
+// removes the field; a returned URL is created +1 and released by WebKit, and returning NULL
+// leaves the request's URL unchanged.
+static void dict_header_set(void *dict, CFStringRef name, CFStringRef value) {
+    if (value) CFDictionarySetValue((CFMutableDictionaryRef)dict, name, value);
+    else       CFDictionaryRemoveValue((CFMutableDictionaryRef)dict, name);
+}
+
+__attribute__((visibility("default")))
+CFURLRef WKExternalURLRewrite(CFURLRef url, CFMutableDictionaryRef headers) {
+    if (!url) return NULL;
+    char *before = cf_to_c(CFURLGetString(url));
+    if (!before) return NULL;
+
+    char *after = tf_apply_redirect(before);
+    const char *effective = after ? after : before;
+
+    if (headers) {
+        const tf_headerrule *hr = match_headers(effective);
+        if (hr) apply_header_rule(hr, headers, dict_header_set);
+    }
+
+    CFURLRef result = NULL;
+    if (after) {
+        CFStringRef s = CFStringCreateWithCString(NULL, after, kCFStringEncodingUTF8);
+        if (s) { result = CFURLCreateWithString(NULL, s, NULL); CFRelease(s); }
+        tf_log("wk rewrite %s -> %s", before, after);
+    }
+    free(before); free(after);
+    return result;
+}
+
 // Six pointer parameters are declared on purpose. The real arities are 4; on both x86_64
 // and i386 passing more arguments than the callee reads is harmless, whereas declaring
 // fewer than the real count would make the callee read uninitialised registers or stack.
 // This keeps the pass-through safe without depending on private headers being exact.
-void tf_rewrite_install(void) {
-    tf_maps_install();
-    struct rebinding r[] = {
-        { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy },
-        { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync },
-        { "CFURLConnectionCreateWithProperties",   (void *)my_CreateWithProps, (void **)&o_CreateWithProps },
-        { "CFURLConnectionCreate",                 (void *)my_Create,          (void **)&o_Create },
-        { "CFHTTPMessageCreateRequest",            (void *)my_MsgCreate,       (void **)&o_MsgCreate },
-        { "CFHTTPMessageSetHeaderFieldValue",      (void *)my_MsgSetHeader,    (void **)&o_MsgSetHeader },
+struct tf_hook_group tf_rewrite_hooks(void) {
+    static const struct rebinding r[] = {
+        { "CFURLRequestCreateMutableCopy",         (void *)my_MutableCopy,     (void **)&o_MutableCopy, tf_cfnetwork_providers },
+        { "CFURLConnectionSendSynchronousRequest", (void *)my_SendSync,        (void **)&o_SendSync, tf_cfnetwork_providers },
+        { "CFURLConnectionCreateWithProperties",   (void *)my_CreateWithProps, (void **)&o_CreateWithProps, tf_cfnetwork_providers },
+        { "CFURLConnectionCreate",                 (void *)my_Create,          (void **)&o_Create, tf_cfnetwork_providers },
+        { "CFHTTPMessageCreateRequest",            (void *)my_MsgCreate,       (void **)&o_MsgCreate, tf_cfnetwork_providers },
+        { "CFHTTPMessageSetHeaderFieldValue",      (void *)my_MsgSetHeader,    (void **)&o_MsgSetHeader, tf_cfnetwork_providers },
     };
-    // Also arms a dyld add-image callback, so CFNetwork loaded later still gets rebound.
-    rebind_symbols(r, sizeof r / sizeof r[0]);
+    return (struct tf_hook_group){ r, sizeof r / sizeof r[0] };
 }

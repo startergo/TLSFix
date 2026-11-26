@@ -46,10 +46,10 @@ install)
       { echo "Security backup exists but the AquaTransport load command is missing"; exit 1; }
     updating=1
   fi
-  # Require the core payload before replacing any library; the GSA and Maps modules are
-  # optional, so a build made without its GC toolchain installs the loader and engine alone
-  # and a GSA-less build neither fails here nor over an absent third library below. Package
-  # installations can supply any of these in LIBDIR instead of the build stage.
+  # Require the core payload before replacing any library; the GSA, Maps and Anisette
+  # modules are optional, so a build made without its GC toolchain installs the loader and
+  # engine alone and a GSA-less build neither fails here nor over an absent third library
+  # below. Package installations can supply any of these in LIBDIR instead of the build stage.
   for lib in aquatransport_engine.dylib aquatransport.dylib; do
     [ -f "$SRC/$lib" ] || [ -f "$LIBDIR/$lib" ] ||
       { echo "missing $lib -- run ./build-macos.sh first"; exit 1; }
@@ -73,6 +73,16 @@ install)
       staged="$staged $lib"
     fi
   done
+  # The local Anisette generator and its job definition ride with the GSA module -- only that
+  # module's `local:` provider talks to it -- and are staged and published the same way. The
+  # job definition is installed beside the executable, where the bootstrap finds it.
+  if [ -f "$SRC/aquatransport-anisette" ]; then
+    cp "$SRC/aquatransport-anisette" "$LIBDIR/aquatransport-anisette.new"
+    chown root:wheel "$LIBDIR/aquatransport-anisette.new"; chmod 0755 "$LIBDIR/aquatransport-anisette.new"
+    cp "$SRC/org.aquatransport.anisette.plist" "$LIBDIR/org.aquatransport.anisette.plist.new"
+    chown root:wheel "$LIBDIR/org.aquatransport.anisette.plist.new"; chmod 0644 "$LIBDIR/org.aquatransport.anisette.plist.new"
+    staged="$staged aquatransport-anisette org.aquatransport.anisette.plist"
+  fi
   # A complete build without the GSA or Maps module supersedes an install that had one:
   # the rewriter dlopens whatever file it finds beside the engine, so an image left behind
   # would run stale module code against a newer engine. The prune runs after staging
@@ -83,6 +93,8 @@ install)
   if [ -f "$SRC/aquatransport.dylib" ] && [ -f "$SRC/aquatransport_engine.dylib" ]; then
     [ -f "$SRC/aquatransport_gsa.dylib" ] || rm -f "$LIBDIR/aquatransport_gsa.dylib"
     [ -f "$SRC/aquatransport_maps.dylib" ] || rm -f "$LIBDIR/aquatransport_maps.dylib"
+    [ -f "$SRC/aquatransport-anisette" ] ||
+      rm -f "$LIBDIR/aquatransport-anisette" "$LIBDIR/org.aquatransport.anisette.plist"
   fi
   for lib in $staged; do
     mv -f "$LIBDIR/$lib.new" "$LIBDIR/$lib"
@@ -93,6 +105,17 @@ install)
     install -d -o root -g wheel -m 755 "$LIBDIR/airdrop"
     install -o root -g wheel -m 755 "$SRC/airdrop/ad_ble_wake" "$SRC/airdrop/org.aquatransport.airdrop" "$SRC/airdrop/owl" "$LIBDIR/airdrop/"
     install -o root -g wheel -m 644 "$SRC/airdrop/org.aquatransport.airdrop.plist" "$LIBDIR/airdrop/"
+    # The UI the adapter loads into Finder and the share sheet: a bundle, so it carries
+    # its localizations. Only a stage that has it -- an older build-airdrop.sh staged none.
+    if [ -d "$SRC/airdrop/AirDropUI.bundle" ]; then
+      install -d -o root -g wheel -m 755 "$LIBDIR/airdrop/AirDropUI.bundle/Contents/Resources"
+      install -o root -g wheel -m 644 "$SRC/airdrop/AirDropUI.bundle/Contents/Info.plist" "$LIBDIR/airdrop/AirDropUI.bundle/Contents/"
+      for locale in "$SRC/airdrop/AirDropUI.bundle/Contents/Resources/"*.lproj; do
+        locale_dest="$LIBDIR/airdrop/AirDropUI.bundle/Contents/Resources/$(basename "$locale")"
+        install -d -o root -g wheel -m 755 "$locale_dest"
+        install -o root -g wheel -m 644 "$locale/Localizable.strings" "$locale_dest/"
+      done
+    fi
     install -o root -g wheel -m 755 "$SRC/aquatransport_airdrop.dylib" "$LIBDIR/"
   fi
   if [ -f "$SRC/aquatransport-bootstrap" ]; then
@@ -165,11 +188,17 @@ uninstall)
   # above it only when they are empty.
   rm -f "$DYLIB" "$ENGINE" "$LIBDIR/aquatransport_gsa.dylib" "$LIBDIR/aquatransport_maps.dylib" \
         "$LIBDIR/aquatransport_airdrop.dylib" "$LIBDIR/aquatransport-bootstrap" \
+        "$LIBDIR/aquatransport-anisette" "$LIBDIR/org.aquatransport.anisette.plist" \
         "$LIBDIR/insert_dylib" "$LIBDIR/aquatransport.sh" "$LIBDIR/uninstall.sh"
   launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist 2>/dev/null || true
+  launchctl unload /usr/share/aquatransport/org.aquatransport.anisette.plist 2>/dev/null || true
   launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist 2>/dev/null || true
   rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
   rm -rf "$LIBDIR/airdrop"
+  # The generator's machine-wide record -- hardware UUID, routing, last provisioning attempt --
+  # is runtime state rather than payload, so no receipt lists it. Apple's own provisioning
+  # under /Users/Shared/adi is Apple's and is left alone.
+  rm -rf "$LIBDIR/state"
   rmdir "$CONFDIR" 2>/dev/null || true
   rmdir "$LIBDIR" 2>/dev/null || true
   echo "Uninstalled. Restart your computer."

@@ -43,6 +43,7 @@ extern SSLContextRef SSLCreateContext(CFAllocatorRef alloc, SSLProtocolSide prot
 // flow. errSSLServerAuthCompleted (-9841, ST_PeerAuth above) is the other break.
 #define ST_CertReq        -9842
 #define ST_Internal       -9838
+#define ST_Handshake       1
 #define ST_Connected       2
 #define ST_TLS12           8
 
@@ -61,6 +62,21 @@ extern OSStatus SecKeyDecrypt(SecKeyRef key, SecPadding padding,
                               const uint8_t *cipherText, size_t cipherTextLen,
                               uint8_t *plainText, size_t *plainTextLen);
 
+// Shadow session states, separate from Secure Transport's public SSLSessionState.
+// NEW is zero because sh_create allocates the shadow with calloc.
+typedef enum {
+    SH_STATE_FAILED = -1,        // subsequent calls fall back to the native context
+    SH_STATE_NEW = 0,
+    SH_STATE_HANDSHAKING = 1,
+    SH_STATE_CONNECTED = 2,
+    SH_STATE_PEER_AUTH = 3,      // waiting for the application's trust decision
+    // Paused at the client-certificate break, kSSLSessionOptionBreakOnCertRequested: the
+    // server has asked for a certificate and the caller supplies one only now. The peer's
+    // chain has arrived by this point, as it has at PEER_AUTH -- the server's Certificate
+    // message precedes its CertificateRequest.
+    SH_STATE_CERT_REQUEST = 4
+} ShadowState;
+
 typedef struct {
     SSLContextRef    ctx;
     SSLReadFunc      rf;
@@ -74,9 +90,14 @@ typedef struct {
     unsigned char    peerID[256];
     size_t           peerIDLen;
     int              inited;
-    // Handshake states the hooks branch on: 0 fresh, 1 handshaking, 2 connected,
-    // 3 paused at the server-auth break, 4 paused at the cert-request break.
-    int              state;
+    // Which point of the handshake the shadow is at; see ShadowState above.
+    ShadowState      state;
+    // Native-context compatibility answers, frozen at handshake start. These never
+    // configure OpenSSL; its wire protocol/ciphers remain independent.
+    SSLProtocol      reportedProtocol;
+    SSLCipherSuite   reportedCipher;
+    OSStatus         reportedProtocolStatus;
+    OSStatus         reportedCipherStatus;
     int              breakAuth;
     // kSSLSessionOptionBreakOnCertRequested: the caller wants errSSLClientCertRequested
     // when the server asks for a client certificate, whatever identity is installed, and
@@ -121,11 +142,10 @@ typedef struct {
     size_t           wpendLen;
 } Shadow;
 
-// Re-entrancy guard. Our verify path calls into Security, which may itself open a
-// connection (revocation checks); without this, that nested connection would come back
-// through our hooks and call Security again. Set around our own Security calls; hooks
-// fall through to the system stack while it is set. pthread_specific rather than __thread
-// because native TLS needs a 10.7+ deployment target.
+// Nestable, thread-local guard for our own trust operations. Trust-policy hooks
+// leave these evaluations alone; TLS transport remains available to connections
+// opened during evaluation. pthread_specific rather than __thread because native
+// thread-local storage needs a 10.7+ deployment target.
 void       tf_guard_enter(void);
 void       tf_guard_leave(void);
 int        tf_reentrant(void);

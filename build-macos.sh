@@ -9,8 +9,9 @@
 # install-macos.sh adds a load command naming that dylib to Security.framework, so it is loaded
 # into every process that loads Security. Two requirements the build verifies before finishing:
 #   * both architectures present -- so it loads in i386 and x86_64 processes alike
-#   * no symbols exported -- OpenSSL defines the whole SSL_*/EVP_* namespace, which must
-#     not be visible to any process it is loaded into
+#   * no symbols exported, except the engine's one: the URL-rewrite hook a patched WebKit
+#     resolves by name. OpenSSL defines the whole SSL_*/EVP_* namespace, which must not be
+#     visible to any process it is loaded into
 
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -157,14 +158,18 @@ fi
 # ---- 2. the dylib ----------------------------------------------------------
 echo "==> building aquatransport.dylib (min $MIN)"
 SRCS=("$DIR/src/aquatransport_engine.c" "$DIR/src/mac/aquatransport_hooks_mac.c" "$DIR/src/mac/aquatransport_config.c"
-      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/deps/fishhook/fishhook.c")
+      "$DIR/src/mac/aquatransport_airdrop.c" "$DIR/src/mac/aquatransport_maps.c" "$DIR/src/mac/aquatransport_rewrite.c" "$DIR/src/mac/aquatransport_trust_mac.c" "$DIR/src/mac/aquatransport_cfhook.c" "$DIR/deps/fishhook/fishhook.c")
 OBJDIR="$BUILD/obj"; rm -rf "$OBJDIR"; mkdir -p "$OBJDIR"
 : > "$BUILD/nothing.exp"
+# The engine exports exactly one symbol: the URL-rewrite hook a patched WebKit resolves by name.
+# Nothing else -- the OpenSSL namespace stays hidden, checked below.
+printf '_WKExternalURLRewrite\n' > "$BUILD/engine.exp"
 
 slices=()
 loader_slices=()
 gsa_slices=()
 maps_slices=()
+anisette_slices=()
 for a in "${ARCHS[@]}"; do
   objs=()
   for src in "${SRCS[@]}"; do
@@ -193,7 +198,7 @@ for a in "${ARCHS[@]}"; do
     -install_name /usr/share/aquatransport/aquatransport_engine.dylib \
     "${objs[@]}" "$LS_OUT/lib/libssl.a" "$LS_OUT/lib/libcrypto.a" \
     -Wl,-framework,Security -Wl,-framework,CoreFoundation \
-    -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
+    -Wl,-exported_symbols_list,"$BUILD/engine.exp"
   slices+=("$out")
 
   # The loader is what Security.framework's load command names, so it is mapped into every
@@ -227,6 +232,21 @@ for a in "${ARCHS[@]}"; do
       "$gobj" "$cobj" "$OBJDIR/aquatransport_config-$a.o" "$LS_OUT/lib/libcrypto.a" \
       -framework Foundation -framework IOKit -lz -Wl,-exported_symbols_list,"$BUILD/nothing.exp"
     gsa_slices+=("$gout")
+    # The local Anisette generator rides along with the GSA module: only that module's
+    # `local:` provider talks to it. Retain/release rather than GC, so the system clang
+    # builds it. It is an executable, though, which the GSA dylib's SDK cannot link: that
+    # one is trimmed and carries no C startup object (crt1). So it takes the engine's
+    # split -- compiled against the 10.7-era SDK's headers, as the GSA module is, and
+    # linked against $SDK, the only one whose Foundation stub links for i386.
+    aobj="$OBJDIR/aquatransport_anisette_service-$a.o"
+    clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$GSA_SDK" -O2 -fvisibility=hidden \
+      -Wall -Wno-deprecated-declarations -I"$LS_OUT/include" \
+      -c "$DIR/src/mac/aquatransport_anisette_service.m" -o "$aobj"
+    aout="$OBJDIR/aquatransport-anisette-$a"
+    clang -arch "$a" -mmacosx-version-min=10.7 -isysroot "$SDK" "$aobj" \
+      "$LS_OUT/lib/libcrypto.a" -framework Foundation -framework IOKit \
+      -Wl,-exported_symbols_list,"$BUILD/nothing.exp" -o "$aout"
+    anisette_slices+=("$aout")
     # The Maps module rides the same GC toolchain and 10.7-era SDK Foundation as GSA.
     mout="$OBJDIR/aquatransport_maps-$a.dylib"
     "$GSA_CC" -arch "$a" -mmacosx-version-min=10.9 -isysroot "$GSA_SDK" -O2 -fPIC -fvisibility=hidden \
@@ -257,31 +277,38 @@ fi
 
 mkdir -p "$ST"
 
+# Restore the Objective-C GC bit the linker drops. The compile emits __objc_imageinfo
+# flags 0x2 (OBJC_IMAGE_SUPPORTS_GC -- loadable by GC and non-GC processes alike), but
+# modern ld64 writes the section back as zero, and ld-classic rewrites it to 0x40. A GC
+# process such as Mavericks' System Preferences refuses a library without the bit, so it
+# is written straight into the x86_64 slice at the section's file offset: the fat header
+# gives the slice's base, the section header the offset within it, and byte 4 of the
+# 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
+# use retain/release, and the verifier below only demands the bit of x86_64.
+
 lipo -create "${slices[@]}" -output "$ST/aquatransport_engine.dylib"
 lipo -create "${loader_slices[@]}" -output "$ST/aquatransport.dylib"
 if [ ${#gsa_slices[@]} -gt 0 ]; then
   lipo -create "${gsa_slices[@]}" -output "$ST/aquatransport_gsa.dylib"
 
-  # Restore the Objective-C GC bit the linker drops. The compile emits __objc_imageinfo
-  # flags 0x2 (OBJC_IMAGE_SUPPORTS_GC -- loadable by GC and non-GC processes alike), but
-  # modern ld64 writes the section back as zero, and ld-classic rewrites it to 0x40. A GC
-  # process such as Mavericks' System Preferences refuses a library without the bit, so it
-  # is written straight into the x86_64 slice at the section's file offset: the fat header
-  # gives the slice's base, the section header the offset within it, and byte 4 of the
-  # 8-byte section is the low flag byte. The i386 slice is left alone -- 32-bit processes
-  # use retain/release, and the verifier below only demands the bit of x86_64.
   GSADY="$ST/aquatransport_gsa.dylib"
   gsa_base=$(lipo -detailed_info "$GSADY" | awk '/^architecture x86_64$/{f=1;next} f && /offset /{print $2; exit}')
   gsa_off=$(otool -arch x86_64 -l "$GSADY" | awk '/sectname __objc_imageinfo/{f=1} f && /^ *offset /{print $2; exit}')
   [ -n "$gsa_base" ] && [ -n "$gsa_off" ] || { echo "FATAL: cannot locate __objc_imageinfo in $GSADY"; exit 1; }
-  # stderr discarded rather than dd's status=none: 10.9's dd lacks the flag, and its
-  # transfer statistics are the only thing this wants silenced.
   printf '\x02' | dd of="$GSADY" bs=1 seek=$((gsa_base + gsa_off + 4)) conv=notrunc 2>/dev/null
 else
   echo "==> GSA module skipped: no GC toolchain or no 10.7-era SDK (docs/ICLOUD.md)"
 fi
 if [ ${#maps_slices[@]} -gt 0 ]; then
   lipo -create "${maps_slices[@]}" -output "$ST/aquatransport_maps.dylib"
+fi
+if [ ${#anisette_slices[@]} -gt 0 ]; then
+  # The generator is an executable and its job definition a data file. The bootstrap
+  # registers the job from where it is installed, so no LaunchDaemon or LaunchAgent is
+  # installed for it.
+  lipo -create "${anisette_slices[@]}" -output "$ST/aquatransport-anisette"
+  chmod 0755 "$ST/aquatransport-anisette"
+  cp "$DIR/src/mac/org.aquatransport.anisette.plist" "$ST/"
 fi
 
 # AirDrop is a separate Mavericks-only image, loaded after the C eligibility gate.
@@ -292,38 +319,42 @@ bash "$DIR/tools/build-airdrop.sh"
 # and has no Objective-C dependency. The GSA image is loaded at request time.
 
 # ---- 3. verify the invariants ----------------------------------------------
-# Per slice: the architecture is present; nothing is exported (OpenSSL's whole SSL_*/EVP_*
-# namespace must not leak into host processes); and
+# Per slice: the architecture is present; nothing is exported beyond the engine's WebKit
+# hook (OpenSSL's whole SSL_*/EVP_* namespace must not leak into host processes); and
 # nothing is imported that postdates the deployment target. Post-10.6 imports bind lazily, so
 # the dylib would load and then crash the process on first use -- checked per slice because
 # i386 legitimately imports $UNIX2003 variants x86_64 never has.
 #   Added in 10.7:  strndup strnlen getline getdelim memmem arc4random_buf
 #   Added in 10.12: getentropy clock_gettime clock_gettime_nsec_np
 echo "==> verifying"
-for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib; do
-# A build without the GC toolchain stages no GSA or Maps image at all; verify what exists.
+for img in aquatransport.dylib aquatransport_engine.dylib aquatransport_gsa.dylib aquatransport_maps.dylib aquatransport-anisette; do
+# A build without the GC toolchain stages no GSA, Maps or Anisette image at all; verify what exists.
 [ -f "$ST/$img" ] || continue
 have=$(lipo -info "$ST/$img" | sed 's/.*://')
 echo "    $img architectures:$have"
 POST106='^_(strndup|strnlen|getline|getdelim|memmem|getentropy|clock_gettime|clock_gettime_nsec_np|arc4random_buf|dispatch_activate|os_unfair_lock_lock)$'
-# The engine and loader floor at $MIN; the GSA module floors at 10.7 -- its loader gates
-# on Darwin 11+, so what Lion added (strndup, strnlen, getline, getdelim, memmem,
+# The engine and loader floor at $MIN; the GSA module and the Anisette generator floor at
+# 10.7 -- the module's loader gates on Darwin 11+ and the bootstrap registers the generator's
+# job on Lion and later -- so what Lion added (strndup, strnlen, getline, getdelim, memmem,
 # arc4random_buf) is legal there, and only the newer set is banned.
 floor="$MIN"; banned="$POST106"
-[ "$img" = aquatransport_gsa.dylib ] && {
+[ "$img" = aquatransport_gsa.dylib ] || [ "$img" = aquatransport-anisette ] && {
   floor=10.7
   banned='^_(getentropy|clock_gettime|clock_gettime_nsec_np|dispatch_activate|os_unfair_lock_lock)$'
 }
 for a in "${ARCHS[@]}"; do
   echo "$have" | grep -qw "$a" || { echo "FATAL: $img missing $a slice; $a processes would go unpatched"; exit 1; }
-  n=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -cE " (T|D|B|S) _" || true)
-  [ "$n" = "0" ] || { echo "FATAL: $img $a exports $n symbols (OpenSSL namespace would leak)"; exit 1; }
+  exports=$(nm -arch "$a" -g "$ST/$img" 2>/dev/null | grep -E " (T|D|B|S) _" | awk '{print $NF}')
+  # The one permitted export in any image is the engine's WebKit hook; see engine.exp.
+  [ "$img" = aquatransport_engine.dylib ] && exports=$(printf '%s\n' "$exports" | grep -vxF '_WKExternalURLRewrite' || true)
+  [ -z "$exports" ] || { echo "FATAL: $img $a exports symbols beyond the WebKit hook (OpenSSL namespace would leak):"
+                        echo "$exports" | sed 's/^/      /'; exit 1; }
   bad=$(nm -arch "$a" -u "$ST/$img" 2>/dev/null | tr -d ' ' | grep -E "$banned" || true)
   [ -z "$bad" ] || { echo "FATAL: $img $a imports symbols absent on $floor (would crash on first use):"
                      echo "$bad" | sed 's/^/      /'; exit 1; }
 done
 done
-echo "    per slice: present, 0 exports, no post-floor imports"
+echo "    per slice: present, no exports beyond the WebKit hook, no post-floor imports"
 if [ -f "$ST/aquatransport_gsa.dylib" ]; then
   # OS X's Objective-C collector is x86_64 only; i386 uses retain/release.
   otool -arch x86_64 -ov "$ST/aquatransport_gsa.dylib" | grep -q 'OBJC_IMAGE_SUPPORTS_GC' ||

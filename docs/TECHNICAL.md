@@ -224,9 +224,9 @@ nothing else on the Mac is affected. The shipped default lists
 does its network I/O in `com.apple.WebKit.Networking` — a separate process that still gets the
 engine.
 
-This is a different mechanism from the `kDeny[]` list in `aquatransport_hooks_mac.c`, which
-names the trust daemons whose own traffic would otherwise route through our verify path and
-make trust evaluation depend on trust evaluation. That list is structural and not user-editable.
+The `kTrustServices[]` list in `aquatransport_hooks_mac.c` selects TLS-only installation
+for trust daemons. It does not exclude them from modern TLS; `disabled.txt` is the
+explicit exclusion mechanism.
 
 ### Flags
 
@@ -280,7 +280,31 @@ progress never sees a partially written file.
 
 ## How the hooks are installed
 
-Both subsystems rebind symbol pointers by name with fishhook (`deps/fishhook/`).
+Both subsystems rebind symbol pointers with the vendored fishhook (`deps/fishhook/`).
+The engine collects its TLS, URL-rewrite, trust and eligible Maps/AirDrop hooks into
+one registration, so existing images are scanned once. Trust services collect only
+the TLS group, and excluded processes register nothing. The separately loaded
+AirDrop adapter also registers its hooks in one batch. Fishhook retains each batch
+for images loaded later; provider matching and original-function lookup are unchanged.
+
+Every registration requires a symbol name **and an explicit list of import providers**.
+For example, `SSLRead` is hooked only when its import names Security.framework; an
+application's import of `SSLRead` from its own library is left untouched.
+
+The matcher uses the library ordinal in the imported symbol's `n_desc` to select the
+dependency load command. It counts normal, weak, reexport, upward and lazy dylib loads
+in order, excluding `LC_ID_DYLIB`, then compares the full install name. Provider lists
+in `src/mac/aquatransport_symbols.h` include CFNetwork's older nested install name and
+the CoreServices umbrella, plus the relevant libSystem reexports. Basenames and path
+substrings are never accepted. Additional reexport umbrellas need an explicit entry;
+unknown providers are skipped. A missing provider list rejects the entire registration.
+
+Flat-namespace images, forced-flat processes, dynamic-lookup/executable/self ordinals,
+weak-coalesced references and absent weak imports are skipped because they do not
+establish a usable two-level provider. This intentionally limits coverage in those
+cases. It is an import-identity check, not protection against a process deliberately
+substituting a library under a system install name. `rebind_symbols_image` additionally
+limits the importing image; it enforces the same provider checks.
 
 Rebinding rewrites call sites rather than function bodies, so the "function too small,
 clobbers adjacent memory" failure that makes `SSLClose` unsafe under body-patching schemes
@@ -294,19 +318,86 @@ used. Both frameworks live in the dyld shared cache, and the cache does not prev
 
 Two consequences for anyone editing `src/mac/aquatransport_hooks_mac.c`:
 
-- **Never call a hooked function by name from that file.** fishhook rebinds the symbol in
-  every loaded image including our own, so `SSLHandshake(c)` lands back in the replacement
-  and recurses until the process dies. Call through the `o_SSLHandshake` pointer. For the
-  same reason, `dlsym(RTLD_NEXT, ...)` resolves back to the replacement and must not be used.
-- **The `o_*` originals come from `dlsym(RTLD_DEFAULT)`, not from fishhook's `replaced`
+- **Never call a hooked function by name from that file.** fishhook rebinds Security
+  imports in every eligible image including our own, so `SSLHandshake(c)` lands back in
+  the replacement and recurses until the process dies. Call through the `o_SSLHandshake`
+  pointer, filled by the provider-scoped resolver below.
+- **The `o_*` originals come from `fishhook_resolve(providers, name)`, not fishhook's `replaced`
   output.** fishhook reports whatever value was in the symbol slot, and for a lazy symbol
   that has never been called that value is dyld's stub helper rather than the function.
-  `dlsym` resolves through the symbol table and is correct whether or not the symbol has
-  ever been bound.
+  `fishhook_resolve` uses `dlopen(RTLD_NOLOAD | RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY)` and
+  `dlsym` on that handle, balancing the temporary reference with `dlclose`. It searches
+  only that provider's exports (including actual reexports), never ordinary dependencies
+  or the global namespace, and does not load an absent framework. Resolve outside dyld
+  callbacks, and keep the provider loaded while using its function pointers. Both
+  `RTLD_DEFAULT` and `RTLD_NEXT` are inappropriate here: another image can export the
+  same name. Hiding AquaTransport's own exports does not prevent that collision.
 
-`install_ssl_hooks()` decides per process whether to install anything, so a process on the
-trust-daemon deny list carries no hooks at all. The per-hook `tf_on()` gate still runs on
-every call: `tf_reentrant()` is dynamic and cannot be decided at install time.
+`bash tools/test-fishhook.sh [path/to/aquatransport_engine.dylib]` tests duplicate symbol
+names in two different providers on i386 and x86_64, including providers with identical
+basenames. It covers bound and unbound lazy slots, non-lazy slots, weak imports, approved
+and unapproved reexport umbrellas, image-specific and late-load rebinding, flat/dynamic
+lookup exclusions, and provider-scoped original lookup. With an engine path, it also
+checks that unrelated `SSLRead` and CFNetwork imports survive, and that real system
+calls still work when the executable exports conflicting original-function names.
+
+The constructor honors `disabled.txt` before installing hooks. Trust services receive
+the TLS hooks but no application URL rewriting or optional features. The per-hook
+`tf_on()` gate resolves original entry points and checks process eligibility; being
+inside a trust evaluation does not select the native TLS transport.
+
+### Destructors: what fishhook cannot reach
+
+fishhook replaces a function where one image calls another's by name. A CoreFoundation
+object's destructor is called no such way. On the last release, CF calls the `finalize`
+function the object's class registered, through the class record handed to
+`_CFRuntimeRegisterClass`. That function is usually static in its framework. Secure
+Transport's, `sslContextDestroy`, is a local symbol that no image imports, so `dlsym` cannot
+find it and fishhook has no call site to rebind. Rebinding `CFRelease` would miss
+CoreFoundation's own releases, which are calls inside its own image.
+
+So `src/mac/aquatransport_cfhook.c` replaces the pointer in the class record, which is what CF
+calls through. That is what `method_setImplementation` does for an Objective-C method. The
+interface is shaped like fishhook's, so the hooks read like the rest:
+
+- Rows go in `kFinalizers`, beside `kHooks` in `aquatransport_hooks_mac.c`. Each row names the
+  class's type-ID function and its providers, the name the class must have, a `my_*`
+  replacement and an `o_*` original slot.
+- `rebind_cf_finalizers()` belongs in `resolve_origs`, not in the constructor. A class
+  exists only once its framework is loaded, and installing calls the type-ID function,
+  which a constructor or a dyld add-image callback must not do.
+- A row whose type-ID function does not resolve is inert, as an `absent` row of `kHooks` is.
+  That is how a row reads for a class that arrived after 10.6: `SSLContextGetTypeID` is 10.8.
+- A class whose name is not the row's, or whose record is not writable, is logged and left
+  alone.
+- The replacement calls the `o_*` original before returning, like every other hook.
+
+## Protocol and cipher compatibility reporting
+
+OpenSSL's wire negotiation is independent of the application's Secure Transport
+protocol and cipher settings. A caller restricted to TLS 1.0 can still reach a
+TLS-1.3-only server. The negotiated-version and negotiated-cipher getters present
+a synthetic native-compatible pair instead of exposing that upgrade to the caller.
+
+At handshake start, the hook reads the native context's effective configuration:
+the highest enabled protocol and the first enabled cipher suitable for that
+protocol, in native list order. Native setters remain untouched, so both explicit
+settings and OS defaults are reflected, including rejected setter calls leaving
+the old settings intact. The 10.8/10.9 min/max getters are resolved by name; the
+10.6/10.7 path uses per-version enable flags without importing newer APIs.
+
+The pair is frozen for the handshake and available at the server-authentication
+pause as well as after completion. No configured protocol/cipher pair means the
+reporting getters return an error; it does not restrict OpenSSL's negotiation.
+Debug logs label these values `compatibility`, while `handshake ok` continues to
+record the actual wire protocol and cipher. These are compatibility answers, not
+a claim to reproduce which cipher a particular server would have chosen natively.
+
+`bash tools/test-reporting.sh` runs x86_64 and i386 clients against an in-process
+TLS-1.3-only peer over socket pairs, checking defaults, exact and minimum versions,
+legacy setters, cipher restrictions, authentication-pause reporting and payload
+I/O. It also exercises simulated legacy enable flags without the newer getters.
+It installs nothing and works with AquaTransport already installed.
 
 ## Rules
 
@@ -437,16 +528,38 @@ pointer parameters against real arities of four: passing more arguments than the
 reads is harmless on both x86_64 and i386, while declaring fewer would make it read
 uninitialised registers.
 
-### The one list that remains, and why
+### TLS for trust-service downloads
 
-`ocspd`, `securityd`, `securityd_service`, `trustd` are excluded from the engine. That is
-not "things that happen to break" — it is a circular dependency: our verify path calls
-`SecTrustEvaluate`, which those processes *implement*. A re-entrancy guard
-(`tf_guard_enter`/`tf_reentrant`, pthread-specific rather than `__thread` for 10.6)
-handles the same-thread case; these four are where the cycle crosses a process boundary.
+`ocspd`, `securityd`, `securityd_service`, and `trustd` receive TLS hooks, while
+application URL rewriting and optional features stay disabled in those processes.
+This allows HTTPS certificate and revocation downloads to negotiate modern TLS.
+`disabled.txt` still excludes any named process from all hooks.
 
-Anything else misbehaving with the library loaded is a bug in the engine to fix, not a name to
-add.
+The former native-TLS bypass did not remove the dependency on trust evaluation:
+Apple's own `sslVerifyCertChain` also invokes `SecTrustEvaluate`. AquaTransport
+retains native trust policy, including AIA chasing and revocation behavior, while
+replacing the TLS transport. It does not accept an untrusted HTTPS endpoint to
+make a download succeed.
+
+The thread-local trust guard is a nesting counter. It prevents the optional
+anchor-policy hook from changing AquaTransport's own trust evaluations, but does
+not prevent a nested HTTPS connection from using OpenSSL. Errors from nested
+OpenSSL operations are discarded when returning from native trust evaluation so
+they do not contaminate the outer handshake's error reporting.
+
+`bash tools/test-trust-transport.sh` checks TLS-1.3-only socketpair peers on i386
+and x86_64, using each trust-service process name and an ordinary application
+name. It covers a connection started inside another connection's trust evaluation,
+native and application-directed verification, rejection of wrong-host and untrusted
+certificates, and the `disabled.txt` exclusion. Anchors are attached only to test
+trust objects; no certificate is installed. The test requires access to the local
+Security services and has been run on 10.9.5; it does not launch or replace the
+real daemons, or establish compatibility on 10.6–10.8.
+
+Modern TLS does not validate a downloaded certificate file as ASN.1. AIA response
+bodies, including HTTP responses and CMS certificate bundles, need their own
+validation before native parsing. This transport change does not fix
+CVE-2021-30737 or claim to provide that response validation.
 
 ## Client certificates the security level would refuse
 
@@ -582,6 +695,100 @@ and collected by the next call, which the caller makes either way.
 An end of stream or an error reached *after* some bytes is not allowed to swallow them: the
 data is handed over with `noErr` and the condition surfaces on the next call, once there is
 nothing left to deliver first.
+
+### Session state
+
+| point in the handshake | `SSLGetSessionState` |
+|---|---|
+| before the first `SSLHandshake` | `kSSLIdle` |
+| handshake in flight (`errSSLWouldBlock`) | `kSSLHandshake` |
+| paused for server authentication (`errSSLPeerAuthCompleted`) | **`kSSLHandshake`** |
+| connected | `kSSLConnected` |
+| after `SSLClose` | `kSSLClosed` |
+
+The row that matters is the pause. Rust's security-framework, which native-tls uses, asks for
+the state there before it fetches the peer trust. On `kSSLIdle` it returns `errSecBadReq` (-909)
+itself, so every native-tls client needs `kSSLHandshake` at that point.
+
+The native context cannot give that answer. The engine's handshake never reaches it, so it says
+`kSSLIdle` until the connection is up. The hook answers `kSSLHandshake` itself instead, while
+the engine is handshaking.
+
+CFNetwork asks only before the first `SSLHandshake`, where the native answer is already right.
+
+`tools/statecontract.c` measures these answers on the stock stack, and `selftest.sh` requires the
+engine's to match them exactly.
+
+### A context released without `SSLClose`
+
+The hooks keep a shadow entry per context, keyed by the context's address. `SSLClose` and
+`SSLDisposeContext` drop it. A caller need not call either: a release is all Secure Transport
+needs. Rust's security-framework, under native-tls, releases with `CFRelease` alone whenever a
+stream is dropped without a shutdown, and a failed handshake always is. CFNetwork does the same
+on some failure paths.
+
+The entry then outlived its context, which cost twice:
+
+1. The allocator gave the address to a later context. That context must behave as a new one,
+   as it does on the stock stack. But it inherited the dead connection's entry. After a failed
+   handshake the entry says state -1, and the hooks hand every handshake in that state to the
+   native stack. So the next connection at that address ran on stock 10.9, which cannot reach
+   api.openai.com or chatgpt.com (-9824).
+2. Entries for dead contexts filled the table, 256 of them, until LRU eviction took the entry
+   of a live one. A context set up and about to handshake then lost its I/O callbacks and its
+   connection, and its handshake went to the native stack too.
+
+So the hook is on the context's destructor. From 10.8 an `SSLContext` is a CF object, and its
+last release calls the destructor its class registered, however that release comes. See
+"Destructors: what fishhook cannot reach" above for how it is hooked. Measured on 10.9.5:
+`CFRelease` alone, `SSLDisposeContext`, and the last release after `SSLClose` each arrive at
+`my_SSLContextFinalize`. It drops the entry, then calls the original, in that order: once the
+context's memory is freed, the address can belong to a new context on another thread.
+
+Before 10.8 there is no `SSLContextGetTypeID`, and no CF type to release. `SSLDisposeContext`
+is the only end a context has, and it drops the entry itself.
+
+`tools/releasecontract.c` fails a handshake, ends the context one way or another, and sends a
+ClientHello from the next context at the same address. It then releases 1000 contexts with
+`CFRelease` alone while another is set up and waiting, and sends that one's ClientHello.
+`selftest.sh` requires each hello to be a fresh context's, as it is on the stock stack.
+
+### Handshake failures
+
+| the client handshake fails because | `SSLHandshake` returns |
+|---|---|
+| the server sent alert 10 to 100 | that alert's `errSSLPeer*` code, -9819 to -9840 |
+| the server sent an alert with no such code | `errSSLFatalAlert` (-9802) |
+| the certificate failed trust evaluation | `errSSLXCertChainInvalid` (-9807) |
+| the server does not speak TLS | `errSSLProtocol` (-9800) |
+| anything else, a hang-up included | `errSSLClosedAbort` (-9806) |
+
+A caller should get from the engine what the stock stack would tell it, and callers act on these
+codes. The engine used to answer -9806 for every failure, "connection closed via error". Two
+callers broke:
+
+1. System `/usr/bin/curl`, given an expired, self-signed, wrong-host or untrusted-root
+   certificate, said `(35) Server aborted the SSL handshake`. Stock says `(60) SSL certificate
+   problem: Invalid certificate chain`.
+2. Codex's HTTP client falls back to rustls on `errSSLPeerProtocolVersion` (-9836, alert 70),
+   by its message, "bad protocol version". It never fell back.
+
+CFNetwork saw no difference for certificates. It breaks on server authentication and evaluates
+trust itself, so the handshake does not fail in the engine, and NSURLConnection and NSURLSession
+report -1202 with the peer trust attached either way.
+
+The trust row is one code for every reason. Stock 10.9 says -9807 for an expired, a wrong-host,
+a not-yet-valid and an untrusted certificate alike, on local listeners and on badssl.com. It
+does not say `errSSLCertExpired` (-9814) or `errSSLBadCert` (-9808) for any of them.
+
+Two alerts are not in the first row. 41, SSL 3's no_certificate, gives -9806. 0, close_notify,
+is a hang-up.
+
+The hook maps the OpenSSL reason through a table in `aquatransport_hooks_mac.c`. A server-side
+failure keeps -9806, since nothing here measures the stock server.
+
+`tools/errorcontract.c` measures every row on the stock stack, from local listeners that answer
+the ClientHello with fixed bytes. `selftest.sh` requires the engine's answers to match exactly.
 
 ### The one thing that does not match, and why it cannot
 
@@ -995,6 +1202,14 @@ tools/readcontract.c    # starving an IO callback of its own; run against the st
                         # print the reference answers, and against the engine they must match.
                         # Nothing else here reaches those states: a request small enough to fit
                         # in the socket send buffer never blocks
+tools/statecontract.c   # what SSLGetSessionState says at each step of a handshake that pauses
+                        # for server authentication; compared with the stock stack the same way
+tools/releasecontract.c # what a context released without SSLClose leaves for the next context
+                        # at its address, and for a live one when many are released; compared
+                        # with the stock stack the same way
+tools/errorcontract.c   # what SSLHandshake returns for each way a handshake can be refused:
+                        # every alert, a bad certificate, a server that is not TLS, a hang-up.
+                        # Local listeners only; compared with the stock stack the same way
 tools/uploadprobe.c     # a POST big enough to fill that buffer, in-memory body or streamed from
                         # a file, blocking reads or run-loop scheduled -- CFNetwork drives writes
                         # differently in each, and reports peak RSS so a write path that grew

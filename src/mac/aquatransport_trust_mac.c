@@ -12,12 +12,12 @@
 //
 // CALLING THE ORIGINAL -- as in the SSL hooks, never call SecTrustSetAnchorCertificates by
 // name from here: fishhook has rebound it in every image, including this one, so the name now
-// resolves to the replacement. o_SecTrustSetAnchorCertificates comes from dlsym(RTLD_DEFAULT),
-// which resolves through the symbol table to the real implementation.
+// resolves to the replacement. o_SecTrustSetAnchorCertificates is resolved only
+// through Security's exports, so another library cannot supply the original.
 
 #include "../aquatransport.h"
 #include "aquatransport_config.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <pthread.h>
 #include <dlfcn.h>
 
@@ -29,10 +29,13 @@ static int g_trust_ok = 0;
 
 static void resolve_trust_origs(void) {
     o_SecTrustSetAnchorCertificates =
-        (OSStatus (*)(SecTrustRef, CFArrayRef))dlsym(RTLD_DEFAULT, "SecTrustSetAnchorCertificates");
+        (OSStatus (*)(SecTrustRef, CFArrayRef))fishhook_resolve(tf_security_providers, "SecTrustSetAnchorCertificates");
     o_SecTrustSetAnchorCertificatesOnly =
-        (OSStatus (*)(SecTrustRef, Boolean))dlsym(RTLD_DEFAULT, "SecTrustSetAnchorCertificatesOnly");
+        (OSStatus (*)(SecTrustRef, Boolean))fishhook_resolve(tf_security_providers, "SecTrustSetAnchorCertificatesOnly");
     g_trust_ok = (o_SecTrustSetAnchorCertificates != NULL);
+    if (!g_trust_ok) tf_log("could not resolve SecTrustSetAnchorCertificates");
+    else if (!o_SecTrustSetAnchorCertificatesOnly)
+        tf_log("SecTrustSetAnchorCertificatesOnly absent; disable-certificate-pinning cannot apply");
 }
 
 // True once the original entry point is resolved. The hook only runs when Security is loaded
@@ -59,14 +62,14 @@ static OSStatus my_SecTrustSetAnchorCertificates(SecTrustRef trust, CFArrayRef a
     return r;
 }
 
-// Rebinds SecTrustSetAnchorCertificates. Called from the constructor after the process is
+// Collects SecTrustSetAnchorCertificates. Called from the constructor after the process is
 // found eligible, so denied processes never carry this hook. Rebinding needs nothing loaded:
 // a process that never reaches Security has no call site to rewrite, and fishhook's add-image
 // callback rebinds Security whenever it arrives.
-void tf_trust_install(void) {
-    struct rebinding r[1];
-    r[0].name        = "SecTrustSetAnchorCertificates";
-    r[0].replacement = (void *)my_SecTrustSetAnchorCertificates;
-    r[0].replaced    = NULL;
-    rebind_symbols(r, 1);
+struct tf_hook_group tf_trust_hooks(void) {
+    static const struct rebinding r[] = {
+        { "SecTrustSetAnchorCertificates", (void *)my_SecTrustSetAnchorCertificates,
+          NULL, tf_security_providers }
+    };
+    return (struct tf_hook_group){ r, sizeof r / sizeof r[0] };
 }

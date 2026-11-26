@@ -54,11 +54,13 @@ static void guard_init(void) { pthread_key_create(&gGuardKey, NULL); }
 
 void tf_guard_enter(void) {
     pthread_once(&gGuardOnce, guard_init);
-    pthread_setspecific(gGuardKey, (void *)1);
+    uintptr_t depth = (uintptr_t)pthread_getspecific(gGuardKey);
+    pthread_setspecific(gGuardKey, (void *)(depth + 1));
 }
 void tf_guard_leave(void) {
     pthread_once(&gGuardOnce, guard_init);
-    pthread_setspecific(gGuardKey, (void *)0);
+    uintptr_t depth = (uintptr_t)pthread_getspecific(gGuardKey);
+    if (depth) pthread_setspecific(gGuardKey, (void *)(depth - 1));
 }
 int tf_reentrant(void) {
     pthread_once(&gGuardOnce, guard_init);
@@ -255,7 +257,7 @@ Shadow *sh_get(SSLContextRef c) {
 }
 Shadow *sh_create(SSLContextRef c) {
     Shadow *evicted = NULL; int freeEvicted = 0;
-    const char *evictedHost = NULL; int evictedState = 0;
+    const char *evictedHost = NULL; ShadowState evictedState = SH_STATE_NEW;
     pthread_mutex_lock(&gLock);
     Shadow *s = NULL;
     for (int i = 0; i < MAXSH; i++) if (gTab[i] && gTab[i]->ctx == c) { s = gTab[i]; s->lastUse = ++gClock; s->refcount++; break; }
@@ -695,7 +697,10 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
         if (der) OPENSSL_free(der);
     }
     CFStringRef host = (s && s->host[0]) ? CFStringCreateWithCString(NULL, s->host, kCFStringEncodingUTF8) : NULL;
-    tf_guard_enter();                       // anything Security opens from here is not ours to hook
+    // Nested HTTPS issuer/revocation fetches may use OpenSSL on this same thread.
+    // Keep their error queues from changing the outcome of the outer handshake.
+    int error_mark = ERR_set_mark();
+    tf_guard_enter();
     SecPolicyRef pol = SecPolicyCreateSSL(!(s && s->serverSide), host);
     SecTrustRef t = NULL; int ok = 0;
     if (SecTrustCreateWithCertificates(arr, pol, &t) == errSecSuccess && t) {
@@ -706,6 +711,8 @@ static int verify_chain(X509_STORE_CTX *sctx, void *arg) {
     }
     if (pol) CFRelease(pol);
     tf_guard_leave();
+    if (error_mark) ERR_pop_to_mark();
+    else ERR_clear_error();
     if (ok && haveDg) chain_ok_put(dg);
     if (tf_debug()) tf_log("verify_chain host=%s took %.0f ms certs=%ld ok=%d",
                            s && s->host[0] ? s->host : "?", tf_now_ms() - vt0,

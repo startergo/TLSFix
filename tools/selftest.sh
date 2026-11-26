@@ -21,6 +21,9 @@ UPLOADPROBE="$DIR/build/uploadprobe"
 BIGBUFPROBE="$DIR/build/bigbufprobe"
 WRITECONTRACT="$DIR/build/writecontract"
 READCONTRACT="$DIR/build/readcontract"
+STATECONTRACT="$DIR/build/statecontract"
+RELEASECONTRACT="$DIR/build/releasecontract"
+ERRORCONTRACT="$DIR/build/errorcontract"
 LATECHECK="$DIR/build/latecheck"
 POOLPROBE="$DIR/build/poolprobe"
 pass=0; fail=0
@@ -66,6 +69,12 @@ fi
     -framework CoreFoundation -framework Security -o "$WRITECONTRACT" "$DIR/tools/writecontract.c"
 [ -x "$READCONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework Security -o "$READCONTRACT" "$DIR/tools/readcontract.c"
+[ -x "$STATECONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$STATECONTRACT" "$DIR/tools/statecontract.c"
+[ -x "$RELEASECONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$RELEASECONTRACT" "$DIR/tools/releasecontract.c"
+[ -x "$ERRORCONTRACT" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
+    -framework CoreFoundation -framework Security -o "$ERRORCONTRACT" "$DIR/tools/errorcontract.c"
 
 # Rules used only by the rewrite tests. example.invalid deliberately does not resolve:
 # if the redirect works, DNS is never consulted for it.
@@ -288,6 +297,34 @@ check "short-read contract matches stock" "^identical$" \
   "$([ -n "$cr_stock" ] && [ "$cr_stock" = "$cr_eng" ] && echo identical || echo differs)"
 [ "$cr_stock" = "$cr_eng" ] || diff <(echo "$cr_stock") <(echo "$cr_eng") | sed 's/^/        /'
 
+# The same for SSLGetSessionState, through a handshake that pauses for server authentication.
+# native-tls needs kSSLHandshake at that pause, or it will not fetch the peer trust. Nothing in
+# the output depends on the network, so it is compared whole.
+cs_stock=$("$STATECONTRACT" postman-echo.com 2>&1 | grep -E '^  ')
+cs_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$STATECONTRACT" postman-echo.com 2>&1 | grep -E '^  ')
+check "session-state contract matches stock" "^identical$" \
+  "$([ -n "$cs_stock" ] && [ "$cs_stock" = "$cs_eng" ] && echo identical || echo differs)"
+[ "$cs_stock" = "$cs_eng" ] || diff <(echo "$cs_stock") <(echo "$cs_eng") | sed 's/^/        /'
+
+# The same for a context ended with CFRelease alone, as security-framework ends every context:
+# the next context the allocator puts at its address must send a fresh context's ClientHello,
+# as it does on the stock stack, and so must a live context while many others are released that
+# way. Nothing here uses the network.
+cx_stock=$("$RELEASECONTRACT" 2>&1 | grep -E '^  ')
+cx_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$RELEASECONTRACT" 2>&1 | grep -E '^  ')
+check "released-context contract matches stock" "^identical$" \
+  "$([ -n "$cx_stock" ] && [ "$cx_stock" = "$cx_eng" ] && echo identical || echo differs)"
+[ "$cx_stock" = "$cx_eng" ] || diff <(echo "$cx_stock") <(echo "$cx_eng") | sed 's/^/        /'
+
+# The same for what SSLHandshake returns when the handshake fails: one local listener per
+# refusal, each a fixed answer to the ClientHello. Callers branch on the code, as Codex does
+# on -9836 to retry with its own TLS stack. Nothing here uses the network.
+ce_stock=$("$ERRORCONTRACT" 2>&1 | grep -E '^  ')
+ce_eng=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" "$ERRORCONTRACT" 2>&1 | grep -E '^  ')
+check "handshake-failure contract matches stock" "^identical$" \
+  "$([ -n "$ce_stock" ] && [ "$ce_stock" = "$ce_eng" ] && echo identical || echo differs)"
+[ "$ce_stock" = "$ce_eng" ] || diff <(echo "$ce_stock") <(echo "$ce_eng") | sed 's/^/        /'
+
 echo "== client certificates =="
 # Whether the certificate the client was given actually reaches the server. A client that
 # sends an empty Certificate message still completes a TLS 1.3 handshake -- the client
@@ -348,11 +385,16 @@ else
   echo "  skip  no /usr/bin/openssl to build the test CA"
 fi
 
-echo "== deny list =="
-# The gate matches on process name, so a copy named ocspd must pass straight through.
-cp "$PROBE" "$DIR/build/ocspd"
-check "process named ocspd is skipped" "$STOCKFAIL" "$(run "$DIR/build/ocspd" https://api.twitter.com/)"
-rm -f "$DIR/build/ocspd"
+echo "== exclusion =="
+# Trust services (ocspd, securityd, trustd) are no longer excluded by name: they get the TLS
+# hooks on their own, so that an HTTPS issuer or revocation download can negotiate modern TLS.
+# tools/test-trust-transport.sh covers that against a TLS-1.3-only peer. What takes a process
+# out of everything is disabled.txt, matched on the executable's name, so a copy of the probe
+# named in it must pass straight through to the stock stack.
+cp "$PROBE" "$DIR/build/aq-excluded-probe"
+printf 'aq-excluded-probe\n' > "$T/disabled.txt"
+check "process named in disabled.txt is skipped" "$STOCKFAIL" "$(run "$DIR/build/aq-excluded-probe" https://api.twitter.com/)"
+rm -f "$T/disabled.txt" "$DIR/build/aq-excluded-probe"
 
 echo
 echo "$pass passed, $fail failed"

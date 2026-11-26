@@ -3,7 +3,7 @@
  * the separate module loads when that method or a map URL is actually used. */
 #include "aquatransport_maps.h"
 #include "aquatransport_config.h"
-#include "../../deps/fishhook/fishhook.h"
+#include "aquatransport_symbols.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
@@ -79,6 +79,7 @@ static void install_eta(void) {
     if (!dladdr(original, &owner) || !owner.dli_fname || !strstr(owner.dli_fname, "/GeoServices.framework/")) return;
     native_write = original;
     set_implementation(method, (void *)&maps_write);
+    tf_log("Maps ETA hook installed");
 }
 static void try_eta(void) {
     pthread_mutex_lock(&hook_lock);
@@ -100,14 +101,19 @@ static void *maps_dlopen(const char *path, int flags) {
     if (image && __sync_fetch_and_add(&geo_seen,0)) try_eta();
     return image;
 }
-void tf_maps_install(void) {
+struct tf_hook_group tf_maps_hooks(void) {
     if (maps_supported() && !tf_flag("disable-maps-fixes")) {
-        native_dlopen=dlsym(RTLD_DEFAULT,"dlopen");
-        if (!native_dlopen) return;
-        struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL};
-        rebind_symbols(&hook,1);
-        _dyld_register_func_for_add_image(maps_image);
+        native_dlopen=fishhook_resolve(tf_dlopen_providers,"dlopen");
+        if (native_dlopen) {
+            static const struct rebinding hook={"dlopen", (void *)&maps_dlopen, NULL, tf_dlopen_providers};
+            return (struct tf_hook_group){ &hook, 1 };
+        }
     }
+    return (struct tf_hook_group){ NULL, 0 };
+}
+void tf_maps_install(void) {
+    // Called after the engine's batch has installed the dlopen hook.
+    if (native_dlopen) _dyld_register_func_for_add_image(maps_image);
 }
 char *tf_maps_rewrite_url(const char *url) {
     /* A narrow C prefilter keeps Objective-C out of unrelated URL requests. */

@@ -45,6 +45,12 @@ mkdir -p "$R/config"
 cp "$STAGE/aquatransport.dylib" "$STAGE/aquatransport_engine.dylib" "$R/"
 [ -f "$STAGE/aquatransport_gsa.dylib" ] && cp "$STAGE/aquatransport_gsa.dylib" "$R/"
 [ -f "$STAGE/aquatransport_maps.dylib" ] && cp "$STAGE/aquatransport_maps.dylib" "$R/"
+# The local Anisette generator rides with the GSA module, which is what talks to it: the
+# executable 0755 and its job definition 0644, as the Packages-app project lays them down.
+# Its launchd job is registered by the bootstrap from where the plist is installed, so
+# nothing goes under /Library/LaunchDaemons for it.
+[ -f "$STAGE/aquatransport-anisette" ] && cp "$STAGE/aquatransport-anisette" "$R/"
+[ -f "$STAGE/org.aquatransport.anisette.plist" ] && cp "$STAGE/org.aquatransport.anisette.plist" "$R/"
 cp "$REPO/packaging/Default Configuration/disabled.txt" \
    "$REPO/packaging/Default Configuration/headers.txt" \
    "$REPO/packaging/Default Configuration/redirects.txt" "$R/config/"
@@ -52,6 +58,8 @@ chmod 0755 "$W/root" "$R"
 chmod 0775 "$W/root/usr" "$W/root/usr/share" "$R/config"
 chmod 0644 "$R/"*.dylib
 chmod 0664 "$R/config/"*.txt
+[ -f "$R/aquatransport-anisette" ] && chmod 0755 "$R/aquatransport-anisette"
+[ -f "$R/org.aquatransport.anisette.plist" ] && chmod 0644 "$R/org.aquatransport.anisette.plist"
 # The AirDrop runtime, present only when tools/build-airdrop.sh ran (it is invoked by
 # build-macos.sh): the adapter dylib, the socket-activated radio helpers it spawns, and
 # the bootstrap LaunchDaemon that starts the whole thing. Modes mirror the Packages-app
@@ -63,6 +71,14 @@ if [ -f "$STAGE/aquatransport_airdrop.dylib" ]; then
     mkdir -p "$R/airdrop"
     cp "$STAGE/airdrop/ad_ble_wake" "$STAGE/airdrop/org.aquatransport.airdrop" \
        "$STAGE/airdrop/owl" "$STAGE/airdrop/org.aquatransport.airdrop.plist" "$R/airdrop/"
+    # The UI the adapter loads into Finder and the share sheet: a bundle, with its
+    # localizations. Directories 0755 and files 0644, set explicitly rather than left to
+    # whatever cp -R made of the stage's modes. Only a stage that has it.
+    if [ -d "$STAGE/airdrop/AirDropUI.bundle" ]; then
+        cp -R "$STAGE/airdrop/AirDropUI.bundle" "$R/airdrop/"
+        find "$R/airdrop/AirDropUI.bundle" -type d -exec chmod 0755 {} \;
+        find "$R/airdrop/AirDropUI.bundle" -type f -exec chmod 0644 {} \;
+    fi
     mkdir -p "$W/root/Library/LaunchDaemons"
     cp "$REPO/build/stage/Library/LaunchDaemons/org.aquatransport.bootstrap.plist" \
        "$W/root/Library/LaunchDaemons/"

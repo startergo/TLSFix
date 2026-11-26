@@ -6,5 +6,18 @@
 <string>/usr/share/aquatransport/aquatransport-bootstrap</string>
 </array>
 <key>RunAtLoad</key><true/>
+<!-- launchd delivers matching services that exist when the job loads as well
+     as ones that register later. -->
+<key>LaunchEvents</key><dict>
+<key>com.apple.iokit.matching</key><dict>
+<key>WiFiAvailable</key><dict>
+<key>IOProviderClass</key><string>IO80211Interface</string>
+<key>IOMatchLaunchStream</key><true/>
+</dict>
+<key>BluetoothAvailable</key><dict>
+<key>IOProviderClass</key><string>IOBluetoothHCIController</string>
+<key>IOMatchLaunchStream</key><true/>
+</dict>
+</dict></dict>
 <key>ProcessType</key><string>Background</string>
 </dict></plist>

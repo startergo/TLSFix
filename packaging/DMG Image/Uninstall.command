@@ -13,6 +13,9 @@ echo "Please type in your password and press return. No characters will appear a
 sudo true || exit 1
 
 sudo launchctl unload /usr/share/aquatransport/airdrop/org.aquatransport.airdrop.plist
+# The local Anisette generator's job is socket-activated and exits when idle; unloading
+# it here only spares a reboot from carrying a job whose files are about to go.
+sudo launchctl unload /usr/share/aquatransport/org.aquatransport.anisette.plist 2>/dev/null || true
 sudo launchctl unload /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 sudo rm -f /Library/LaunchDaemons/org.aquatransport.bootstrap.plist
 
@@ -54,6 +57,10 @@ done
 # only where a file is missing, so deleting them here would quietly revert that
 # tuning. Remove the directories only when they are empty.
 sudo rmdir /usr/share/aquatransport/config 2>/dev/null || true
+# The local Anisette generator's record -- hardware UUID, routing, last provisioning
+# attempt -- is written at run time, so no receipt lists it. Apple's own provisioning
+# under /Users/Shared/adi is Apple's and is left alone.
+sudo rm -rf /usr/share/aquatransport/state
 sudo rmdir /usr/share/aquatransport 2>/dev/null || true
 if [ -d /usr/share/aquatransport/config ]
 then

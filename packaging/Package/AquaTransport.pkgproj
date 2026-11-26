@@ -499,6 +499,38 @@
 													<key>GID</key>
 													<integer>0</integer>
 													<key>PATH</key>
+													<string>../../build/stage/usr/share/aquatransport/aquatransport-anisette</string>
+													<key>PATH_TYPE</key>
+													<integer>1</integer>
+													<key>PERMISSIONS</key>
+													<integer>493</integer>
+													<key>TYPE</key>
+													<integer>3</integer>
+													<key>UID</key>
+													<integer>0</integer>
+												</dict>
+												<dict>
+													<key>CHILDREN</key>
+													<array/>
+													<key>GID</key>
+													<integer>0</integer>
+													<key>PATH</key>
+													<string>../../build/stage/usr/share/aquatransport/org.aquatransport.anisette.plist</string>
+													<key>PATH_TYPE</key>
+													<integer>1</integer>
+													<key>PERMISSIONS</key>
+													<integer>420</integer>
+													<key>TYPE</key>
+													<integer>3</integer>
+													<key>UID</key>
+													<integer>0</integer>
+												</dict>
+												<dict>
+													<key>CHILDREN</key>
+													<array/>
+													<key>GID</key>
+													<integer>0</integer>
+													<key>PATH</key>
 													<string>../../build/stage/usr/share/aquatransport/aquatransport_maps.dylib</string>
 													<key>PATH_TYPE</key>
 													<integer>1</integer>
@@ -589,6 +621,337 @@
 															<integer>493</integer>
 															<key>TYPE</key>
 															<integer>3</integer>
+															<key>UID</key>
+															<integer>0</integer>
+														</dict>
+														<dict>
+															<key>CHILDREN</key>
+															<array>
+																<dict>
+																	<key>CHILDREN</key>
+																	<array>
+																		<dict>
+																			<key>CHILDREN</key>
+																			<array/>
+																			<key>GID</key>
+																			<integer>0</integer>
+																			<key>PATH</key>
+																			<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Info.plist</string>
+																			<key>PATH_TYPE</key>
+																			<integer>1</integer>
+																			<key>PERMISSIONS</key>
+																			<integer>420</integer>
+																			<key>TYPE</key>
+																			<integer>3</integer>
+																			<key>UID</key>
+																			<integer>0</integer>
+																		</dict>
+																		<dict>
+																			<key>CHILDREN</key>
+																			<array>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/de.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>de.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/en.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>en.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/es.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>es.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/fr.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>fr.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/ja.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>ja.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/ko.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>ko.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/pt.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>pt.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																				<dict>
+																					<key>CHILDREN</key>
+																					<array>
+																						<dict>
+																							<key>CHILDREN</key>
+																							<array/>
+																							<key>GID</key>
+																							<integer>0</integer>
+																							<key>PATH</key>
+																							<string>../../build/stage/usr/share/aquatransport/airdrop/AirDropUI.bundle/Contents/Resources/zh-Hans.lproj/Localizable.strings</string>
+																							<key>PATH_TYPE</key>
+																							<integer>1</integer>
+																							<key>PERMISSIONS</key>
+																							<integer>420</integer>
+																							<key>TYPE</key>
+																							<integer>3</integer>
+																							<key>UID</key>
+																							<integer>0</integer>
+																						</dict>
+																					</array>
+																					<key>GID</key>
+																					<integer>0</integer>
+																					<key>PATH</key>
+																					<string>zh-Hans.lproj</string>
+																					<key>PATH_TYPE</key>
+																					<integer>2</integer>
+																					<key>PERMISSIONS</key>
+																					<integer>493</integer>
+																					<key>TYPE</key>
+																					<integer>2</integer>
+																					<key>UID</key>
+																					<integer>0</integer>
+																				</dict>
+																			</array>
+																			<key>GID</key>
+																			<integer>0</integer>
+																			<key>PATH</key>
+																			<string>Resources</string>
+																			<key>PATH_TYPE</key>
+																			<integer>2</integer>
+																			<key>PERMISSIONS</key>
+																			<integer>493</integer>
+																			<key>TYPE</key>
+																			<integer>2</integer>
+																			<key>UID</key>
+																			<integer>0</integer>
+																		</dict>
+																	</array>
+																	<key>GID</key>
+																	<integer>0</integer>
+																	<key>PATH</key>
+																	<string>Contents</string>
+																	<key>PATH_TYPE</key>
+																	<integer>2</integer>
+																	<key>PERMISSIONS</key>
+																	<integer>493</integer>
+																	<key>TYPE</key>
+																	<integer>2</integer>
+																	<key>UID</key>
+																	<integer>0</integer>
+																</dict>
+															</array>
+															<key>GID</key>
+															<integer>0</integer>
+															<key>PATH</key>
+															<string>AirDropUI.bundle</string>
+															<key>PATH_TYPE</key>
+															<integer>2</integer>
+															<key>PERMISSIONS</key>
+															<integer>493</integer>
+															<key>TYPE</key>
+															<integer>2</integer>
 															<key>UID</key>
 															<integer>0</integer>
 														</dict>
@@ -801,7 +1164,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.09.21</string>
+				<string>2026.11.24</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1309,7 +1672,7 @@
 				<key>USE_HFS+_COMPRESSION</key>
 				<false/>
 				<key>VERSION</key>
-				<string>2026.09.03</string>
+				<string>2026.11.03</string>
 			</dict>
 			<key>TYPE</key>
 			<integer>0</integer>
@@ -1421,13 +1784,14 @@
 										<key>LANGUAGE</key>
 										<string>English</string>
 										<key>VALUE</key>
-										<string>Adds a set of contemporary root certificates to the system keychain which are frequently needed to access the modern web. Also distrusts a set of old certificates which are widely considered unsafe. If unsure, leave this enabled.
+										<string>Adds contemporary root certificates to the system keychain which are frequently needed to access modern websites. Also distrusts old certificates that are considered unsafe. A list of certificates is below. If unsure, leave this enabled.
 
 New Certificates:
 • Amazon Root CA 1
 • Amazon Root CA 3
 • DigiCert Global Root G2
 • DigiCert Global Root G3
+• GlobalSign R6
 • GlobalSign Root R46
 • GTS Root R1
 • GTS Root R4
@@ -1440,6 +1804,12 @@ New Certificates:
 • USERTrust RSA Certification Authority
 
 Distrusted Certificates:
+• EM DV TLS CA - G3B (AAA cross-signed)
+• EM DV TLS CA - G3C (AAA cross-signed)
+• EM EV TLS CA - G3B (AAA cross-signed)
+• EM EV TLS CA - G3C (AAA cross-signed)
+• EM OV TLS CA - G3B (AAA cross-signed)
+• EM OV TLS CA - G3C (AAA cross-signed)
 • Chambers of Commerce Root
 • Chambers of Commerce Root - 2008
 • Global Chambersign Root
