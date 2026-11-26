@@ -2,6 +2,9 @@
 build/
 *.dylib
 *.o
+# Python bytecode, from running the tools/*.py helpers
+__pycache__/
+*.pyc
 
 # ...except the vendored PowerPC no-op slice. It needs gcc-4.2 from Xcode 3.2.6 (clang has
 # no ppc backend), so it is committed prebuilt. Without it a system-wide install on 10.6
