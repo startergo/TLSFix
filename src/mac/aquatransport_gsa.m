@@ -415,7 +415,7 @@ static BOOL aq_copied(NSString *key, BOOL clientData) {
  * ever, but with the machine the real one -- the identity the one-time password was issued to
  * -- and Xcode's application token where the generator's request had akd's. */
 static NSString *aq_verification_identity(NSDictionary *headers) {
-    NSString *client = [headers objectForKey:@"X-Mme-Client-Info"];
+    NSString *client = [headers objectForKey:@"X-MMe-Client-Info"];
     if (![headers objectForKey:AQGenerated]) return client;
     NSRange application = [client rangeOfString:@" <" options:NSBackwardsSearch];
     if (!client || application.location == NSNotFound) return AQClient;
@@ -446,10 +446,12 @@ static NSDictionary *aq_local_anisette(AQGSAProtocol *owner, NSError **error) {
     if (!device) { *error = aq_error(13, @"Local Anisette returned no device identity. Update the helper and restart."); return nil; }
     /* The one-time password is issued to the machine the generator described to Apple when it
      * provisioned it: real model, installed system, akd's application token and user agent. A
-     * request carrying it has to say the same thing. Presented with this adapter's other client
-     * identity, Apple's edge refuses the pairing with a bare HTTP 503, no GrandSlam status at
-     * all (10.9.5, 2026-11-26). Both travel in the set like a remote provider's client
-     * identity, which the request builders prefer to their own. */
+     * request carrying it has to say the same thing. Both travel in the set like a remote
+     * provider's client identity, which the request builders prefer to their own -- under the
+     * key every one of them reads, X-MMe-Client-Info. Stored under any other spelling, the
+     * GrandSlam envelope, the DAV headers and the Mail adapter keep the default identity, and
+     * on 2026-11-26 Apple's edge answered the mismatch with a bare HTTP 503, no GrandSlam
+     * status at all. */
     NSString *clientInfo = aq_client_info(), *userAgent = aq_akd_user_agent();
     if (!clientInfo || !userAgent) {
         *error = aq_error(13, @"Local Anisette is unavailable: this Mac has no usable model or system version.");
@@ -458,7 +460,7 @@ static NSDictionary *aq_local_anisette(AQGSAProtocol *owner, NSError **error) {
     return [NSDictionary dictionaryWithObjectsAndKeys:
         machine, @"X-Apple-I-MD-M", oneTime, @"X-Apple-I-MD", routing, @"X-Apple-I-MD-RINFO",
         device, @"X-Mme-Device-Id", aq_base64([device dataUsingEncoding:NSUTF8StringEncoding]), @"X-Apple-I-MD-LU",
-        clientInfo, @"X-Mme-Client-Info", userAgent, @"User-Agent", @"local", AQGenerated, nil];
+        clientInfo, @"X-MMe-Client-Info", userAgent, @"User-Agent", @"local", AQGenerated, nil];
 }
 
 static NSDictionary *aq_anisette(AQGSAProtocol *owner, NSError **error) {
@@ -552,6 +554,18 @@ static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *header
     for (NSString *k in headers) if (aq_copied(k, NO)) [r setValue:[headers objectForKey:k] forHTTPHeaderField:k];
     return r;
 }
+/* What a GrandSlam request carries beside its body. GSAPort sends the one-time password
+ * inside cpd, so the envelope holds the machine and device identity and not the password a
+ * second time. It also carries the client identity, and the user agent where the set names
+ * one: a request that describes one device on the outside and presents another's one-time
+ * password inside is dropped at Apple's edge with a bare 503 (10.9.5, 2026-11-26). Every
+ * provider stores the client identity under the same key, the one read here. */
+static NSDictionary *aq_grandslam_envelope(NSDictionary *headers) {
+    NSMutableDictionary *envelope = [NSMutableDictionary dictionary];
+    for (NSString *k in [NSArray arrayWithObjects:@"X-Apple-I-MD-M", @"X-Mme-Device-Id", @"X-MMe-Client-Info", @"User-Agent", nil])
+        if ([headers objectForKey:k]) [envelope setObject:[headers objectForKey:k] forKey:k];
+    return envelope;
+}
 static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payload, NSDictionary *headers, NSError **error) {
     NSMutableDictionary *cpd = [NSMutableDictionary dictionary];
     for (NSString *k in headers) if (aq_copied(k, YES)) [cpd setObject:[headers objectForKey:k] forKey:k];
@@ -566,12 +580,7 @@ static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payl
     [payload setObject:cpd forKey:@"cpd"];
     NSDictionary *outer = [NSDictionary dictionaryWithObjectsAndKeys:
         [NSDictionary dictionaryWithObject:@"1.0.1" forKey:@"Version"], @"Header", payload, @"Request", nil];
-    /* GSAPort sends the OTP inside cpd. Its HTTP headers carry only the
-     * machine/device identity; don't submit the OTP a second time as a header. */
-    NSMutableDictionary *httpHeaders = [NSMutableDictionary dictionary];
-    for (NSString *k in [NSArray arrayWithObjects:@"X-Apple-I-MD-M", @"X-Mme-Device-Id", @"X-MMe-Client-Info", nil])
-        if ([headers objectForKey:k]) [httpHeaders setObject:[headers objectForKey:k] forKey:k];
-    NSMutableURLRequest *req = aq_apple_request(@"https://gsa.apple.com/grandslam/GsService2", httpHeaders);
+    NSMutableURLRequest *req = aq_apple_request(@"https://gsa.apple.com/grandslam/GsService2", aq_grandslam_envelope(headers));
     [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
     [req setHTTPMethod:@"POST"]; [req setHTTPBody:aq_encode(outer)];
     NSHTTPURLResponse *r = nil;

@@ -10,6 +10,7 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include "local-anisette-fixture.h"
 
 static NSString *mode;
 static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls;
@@ -79,6 +80,14 @@ static NSData *encrypted_session(void) {
     [out setLength:a+b]; EVP_CIPHER_CTX_free(ctx); return out;
 }
 
+/* The generator, replaced: the remote fixture's synthetic values, so that every assertion
+ * about them holds for the local provider as well. Only the identity differs -- this
+ * machine's, as the generator reports it. */
+static id localOTP(id self, SEL selector, id owner, NSError **error) {
+    anisetteCalls++;
+    return [NSDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-MD", @"fake-machine", @"X-Apple-MD-M",
+        @"84215040", @"X-Apple-I-MD-RINFO", @"fake-device", @"device", nil];
+}
 @interface AQMock : NSURLProtocol @end
 @implementation AQMock
 + (BOOL)canInitWithRequest:(NSURLRequest *)r { return YES; }
@@ -115,8 +124,17 @@ static NSData *encrypted_session(void) {
         assert(![[payload objectForKey:@"cpd"] objectForKey:@"Authorization"]);
         NSDictionary *cpd = [payload objectForKey:@"cpd"];
         assert([[cpd objectForKey:@"svct"] isEqual:@"iCloud"] && [[cpd objectForKey:@"prkgen"] boolValue]);
-        assert([[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:@"<fixture-device> <fixture-os> <fixture-client>"]);
-        assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:[cpd objectForKey:@"X-MMe-Client-Info"]]);
+        /* The body names the client identity once, and the envelope carries that same one, for
+         * a server's set and for the generator's alike. On 2026-11-26 the generator's set
+         * spelled the key otherwise: the envelope kept the adapter's default identity beside
+         * the generator's one-time password, and Apple's edge dropped the request. */
+        NSString *clientInfo = [mode isEqual:@"local"] ? AQTestClient : @"<fixture-device> <fixture-os> <fixture-client>";
+        NSUInteger spellings = 0;
+        for (NSString *k in cpd) if ([[k lowercaseString] isEqual:@"x-mme-client-info"]) spellings++;
+        assert(spellings == 1 && [[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:clientInfo]);
+        assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:clientInfo]);
+        /* The generator's set names its user agent. A server's names none, and none is invented. */
+        if ([mode isEqual:@"local"]) assert([[req valueForHTTPHeaderField:@"User-Agent"] isEqual:AQTestUserAgent]);
         if ([[payload objectForKey:@"o"] isEqual:@"init"]) {
             initCalls++; server_start([payload objectForKey:@"A2k"]);
             result = [NSDictionary dictionaryWithObjectsAndKeys:@"s2k", @"sp", @5, @"i", bytes(@"ordinarysalt1234"), @"s",
@@ -248,6 +266,9 @@ int main(int argc, char **argv) {
     assert([NSGarbageCollector defaultCollector] != nil);
 #endif
     [NSURLProtocol registerClass:[AQMock class]];
+    /* The generator's own set, through the module: the whole sign-in exchange, with its
+     * headers on the envelope and in the body alike. */
+    if ([mode isEqual:@"local"]) aq_test_install_otp((IMP)localOTP);
     if ([mode hasPrefix:@"ids-"]) {
         NSURLResponse *response = nil; NSError *error = nil;
         NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord") returningResponse:&response error:&error];
@@ -352,7 +373,8 @@ int main(int argc, char **argv) {
     }
     /* SMS: refused at once as unsupported, with no prompt requested and no code asked for. */
     if ([mode isEqual:@"2fa-sms"]) assert(error && codeCalls == 0 && accountCalls == 0);
-    BOOL success = [mode isEqual:@"success"] || (is2fa() && ![mode isEqual:@"2fa-refused"] && ![mode isEqual:@"2fa-sms"]);
+    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"local"] ||
+        (is2fa() && ![mode isEqual:@"2fa-refused"] && ![mode isEqual:@"2fa-sms"]);
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);

@@ -53,9 +53,12 @@ printf 'http://127.0.0.1:9/anisette\n' > "$CONF/gsa-anisette-url.txt"
 mkdir -p "$CONF/local"
 : > "$CONF/local/flags.txt"
 printf 'local:\n' > "$CONF/local/gsa-anisette-url.txt"
-# These would break the exchange if authentication were subject to generic rules.
+# These would break the exchange if authentication were subject to generic rules. The `local:`
+# configuration carries the same two, so that its provider is tried under them too.
 printf '*\nhttps://gsa.apple.com/\nhttps://example.invalid/\n' > "$CONF/redirects.txt"
 printf '*\nhttps://setup.icloud.com/\nAuthorization: must-not-replace-token\n\n*\nhttps://profile.ess.apple.com/\nAuthorization: must-not-replace-token\n' > "$CONF/headers.txt"
+printf '*\nhttps://gsa.apple.com/\nhttps://example.invalid/\n' > "$CONF/local/redirects.txt"
+printf '*\nhttps://setup.icloud.com/\nAuthorization: must-not-replace-token\n\n*\nhttps://profile.ess.apple.com/\nAuthorization: must-not-replace-token\n' > "$CONF/local/headers.txt"
 # gsa-vectors.py runs under both pythons; prefer python3, which is what a modern host
 # has -- several still ship no unversioned `python` at all.
 PY="$(command -v python3 || command -v python)" || { echo "no python found for gsa-vectors"; exit 1; }
@@ -112,6 +115,7 @@ for a in x86_64 i386; do
     AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-service-test
     AQUATRANSPORT_DIR="$CONF" arch -"$a" build/anisette-ipc-test
     AQUATRANSPORT_DIR="$CONF/local" arch -"$a" build/anisette-local-test
+    AQUATRANSPORT_DIR="$CONF/local" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe local
     for mode in success bad-proof short-proof malformed redirect missing-anisette 2fa 2fa-unlabelled 2fa-session-hint 2fa-renamed 2fa-top-level 2fa-refused 2fa-sms aos aos-basic aos-mixed settings settings-missing settings-redirect aos-settings ids-success ids-gzip ids-2fa ids-rejected ids-bad-gzip ids-gzip-limit ids-gzip-trailing ids-bad-proof ids-missing-anisette ids-redirect ids-bad-delegate ids-missing-token ids-missing-profile ids-bad-status-type; do
         AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" arch -"$a" build/gsaprobe "$mode"
     done
@@ -121,6 +125,7 @@ done
 for mode in success 2fa 2fa-unlabelled 2fa-session-hint 2fa-renamed 2fa-top-level 2fa-refused 2fa-sms aos aos-basic aos-mixed settings aos-settings ids-gzip ids-2fa ids-rejected ids-bad-gzip; do
     AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" build/gsaprobe-gc "$mode"
 done
+AQUATRANSPORT_DIR="$CONF/local" DYLD_INSERT_LIBRARIES="$LIB" build/gsaprobe-gc local
 printf 'disable-icloud-gsa\n' > "$CONF/flags.txt"
 [ "${AQUATRANSPORT_SKIP_MAIL:-0}" = 1 ] || \
     AQUATRANSPORT_DIR="$CONF" DYLD_INSERT_LIBRARIES="$LIB" build/mailprobe disabled
