@@ -144,13 +144,6 @@ install)
     fi
   done
 
-# The rule files sit in their own group-writable directory so an admin can edit them in a GUI
-# editor -- whose save replaces the file, needing write on the directory -- without write to the
-# directory that holds the dylibs. root:admin 0775 on the directory and 0664 on the files, still
-# world-readable for the sandbox; the subpath grant reaches this depth under /usr/share.
-chown root:admin "$CONFDIR"; chmod 0775 "$CONFDIR"
-chown root:admin "$CONFDIR"/*; chmod 0664 "$CONFDIR"/*
-
   # The rule files sit in their own group-writable directory so an admin can edit them in a GUI
   # editor -- whose save replaces the file, needing write on the directory -- without write to the
   # directory that holds the dylibs. root:admin 0775 on the directory and 0664 on the files, still
