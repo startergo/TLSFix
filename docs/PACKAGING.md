@@ -1,15 +1,16 @@
 # Building the installer
 
-How the shipped `AquaTransport.pkg` and the DMG around it are produced. The pkg is
-**not** committed: generated installers are kept out of version control, and the
-build reproduces it from source. (`packaging/DMG Image/AquaTransport.pkg` may exist
-locally as a build output; `.gitignore` covers it.)
+How the shipped `AquaTransport.pkg` and the DMG around it are produced. `tools/make-pkg.sh`
+rebuilds the pkg from source, and it needs a pkg to start from: the file under
+`packaging/DMG Image/` is that template, and it is committed for that reason (861a882), so
+a fresh clone can rebuild without the Packages app. Upstream keeps generated installers out
+of version control; this fork keeps this one because the script cannot work without it.
 
 ## What the artifacts are
 
 ```
 packaging/DMG Image/          the DMG's source folder
-├── AquaTransport.pkg         the installer (build output; see below)
+├── AquaTransport.pkg         the installer, and the template the script re-archives
 ├── Readme.rtf                end-user notes shown in the DMG
 └── Uninstall.command         receipt-driven uninstaller
 
@@ -38,11 +39,14 @@ Everything the pkg can carry is staged under `build/stage/`:
 | --- | --- |
 | `aquatransport.dylib`, `aquatransport_engine.dylib`, config defaults | always |
 | `aquatransport_gsa.dylib`, `aquatransport_maps.dylib` | a GC-capable compiler is available (see [ICLOUD.md](ICLOUD.md)) |
-| `aquatransport_airdrop.dylib`, `aquatransport-bootstrap`, `airdrop/` helpers, the bootstrap LaunchDaemon | `tools/build-airdrop.sh` ran (invoked automatically by `build-macos.sh`) |
+| `aquatransport-anisette`, `org.aquatransport.anisette.plist` | the same, since only the GSA module's `local:` provider talks to it ([ICLOUD.md](ICLOUD.md)) |
+| `aquatransport_airdrop.dylib`, `aquatransport-bootstrap`, `airdrop/` helpers, `airdrop/AirDropUI.bundle`, the bootstrap LaunchDaemon | `tools/build-airdrop.sh` ran (invoked automatically by `build-macos.sh`) |
 
 Each optional image rides along only when present, the same way
 `install-macos.sh` stages whatever exists — a build without the GC toolchain
-ships an installer without those modules, cleanly.
+ships an installer without those modules, cleanly. The script is meant to give each path
+the mode the Packages project gives it (executables 0755, the rest 0644); after changing
+either, change the other.
 
 ## Building the pkg
 
@@ -57,10 +61,13 @@ re-archives — replicating the original Packages-app output byte-format: odc-cp
 double-compressed Payload with `BOMCopierFatalError`). The shipped pkg is
 replaced atomically, so a reported success is never a half-written file.
 
-Because it needs a template, the first build on a fresh clone has to come from
-the Packages app (below), or from a previously built pkg — the file is not in
-git. If the template is missing after a fresh clone, recover it from any
-machine that built one, or rebuild via the Packages project once.
+The committed template is a build, not a live artifact: it carries the payload of the
+day it was made, and goes on carrying it until the script is run again. Rebuilding after
+a change to the payload is therefore part of the change. The one in git is the
+2026-09-22 build: the loader, the engine, the GSA module and the rule files, and nothing
+else. An installer assembled from it as-is lacks the Maps module, the local Anisette
+generator, and the AirDrop payload with its UI bundle. The listing below shows which you
+have.
 
 **Build from scratch: the Packages app.** Open
 `packaging/Package/AquaTransport.pkgproj` in [Packages](https://github.com/packagesdev/packages)
