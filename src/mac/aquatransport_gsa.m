@@ -560,6 +560,9 @@ static NSMutableURLRequest *aq_apple_request(NSString *url, NSDictionary *header
  * one: a request that describes one device on the outside and presents another's one-time
  * password inside is dropped at Apple's edge with a bare 503 (10.9.5, 2026-11-26). Every
  * provider stores the client identity under the same key, the one read here. */
+/* The status of the exchange's last refusal, for a caller that has to tell a wrong password
+ * from a challenge. Sign-in runs on one serial queue, so one pair serves. */
+static long aq_refusal_hsc, aq_refusal_ec;
 static NSDictionary *aq_grandslam_envelope(NSDictionary *headers) {
     NSMutableDictionary *envelope = [NSMutableDictionary dictionary];
     for (NSString *k in [NSArray arrayWithObjects:@"X-Apple-I-MD-M", @"X-Mme-Device-Id", @"X-MMe-Client-Info", @"User-Agent", nil])
@@ -591,10 +594,11 @@ static NSDictionary *aq_exchange(AQGSAProtocol *owner, NSMutableDictionary *payl
     id ec = [status objectForKey:@"ec"];
     if ([r statusCode] != 200 || !result || !status || ![ec isKindOfClass:[NSNumber class]] || [ec integerValue] != 0) {
         id hsc = [status objectForKey:@"hsc"];
+        aq_refusal_hsc = [hsc isKindOfClass:[NSNumber class]] ? [hsc integerValue] : -1L;
+        aq_refusal_ec = [ec isKindOfClass:[NSNumber class]] ? [ec integerValue] : -1L;
         syslog(LOG_NOTICE, "AquaTransport GrandSlam %s failed (HTTP %ld, hsc %ld, ec %ld)",
             [[payload objectForKey:@"o"] isEqual:@"init"] ? "init" : "complete", (long)[r statusCode],
-            [hsc isKindOfClass:[NSNumber class]] ? (long)[hsc integerValue] : -1L,
-            [ec isKindOfClass:[NSNumber class]] ? (long)[ec integerValue] : -1L);
+            (long)aq_refusal_hsc, (long)aq_refusal_ec);
         *error = aq_error(20, @"Apple rejected the GrandSlam exchange."); return nil;
     }
     return result;
@@ -718,6 +722,16 @@ static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString 
     return YES;
 }
 
+/* Whether a password field could be a password with the code on the end: more than six
+ * characters, the last six of them digits. */
+static BOOL aq_code_on_end(NSString *password) {
+    if ([password length] <= 6) return NO;
+    NSRange tail = NSMakeRange([password length]-6, 6);
+    NSCharacterSet *other = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+    return [password rangeOfCharacterFromSet:other options:0 range:tail].location == NSNotFound;
+}
+static NSDictionary *aq_password_login(AQGSAProtocol *owner, NSString *user, NSString *account, NSString *password, NSError **error);
+
 static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *password, NSError **error) {
     /* Runs on the serial worker queue. No passwords are retained between attempts. */
     for (NSString *k in [[[AQPending allKeys] copy] autorelease]) {
@@ -756,6 +770,33 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
         if (alone) { *error = aq_error(41, @"Enter your password followed by the six-digit verification code."); return nil; }
         password = [password substringToIndex:length-6];
     }
+    /* No challenge is pending here and the password ends in six digits. On this pane a
+     * two-factor account is signed in with the password and the code together, to whichever
+     * process sends the request, and that process need not be the one that asked for the
+     * code: on 2026-11-26 iMessage's agent held the challenge and spent the code while the
+     * pane's helper, sent the same string, gave Apple the whole of it as the password and
+     * was refused (-22406). So ask with the six digits off. A challenge that comes back is
+     * what they are then checked against, as on any retry. Only when the shorter string is
+     * refused as the password were they part of it, and the field goes as it was typed. */
+    if (aq_code_on_end(password)) {
+        aq_refusal_hsc = aq_refusal_ec = 0;
+        NSError *shorter = nil;
+        NSDictionary *session = aq_password_login(owner, user, account, [password substringToIndex:[password length]-6], &shorter);
+        if (session) return session;
+        if ([shorter code] == 401 && [AQPending objectForKey:account]) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud password and code given together; checking the code against the challenge (adapter 5)");
+            return aq_login(owner, user, password, error);
+        }
+        if (aq_refusal_hsc == 401 && aq_refusal_ec == -22406 && [shorter code] == 20) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud password ends in six digits; signing in with it as typed (adapter 5)");
+        } else { *error = shorter; return nil; }
+    }
+    return aq_password_login(owner, user, account, password, error);
+}
+
+/* One password exchange. The session once Apple accepts it; on a challenge, nil with error
+ * 401, the challenge left pending for the account so that the old client asks for the code. */
+static NSDictionary *aq_password_login(AQGSAProtocol *owner, NSString *user, NSString *account, NSString *password, NSError **error) {
     NSDictionary *headers = aq_anisette(owner, error);
     if (!headers) return nil;
     unsigned char A[256], M[32], key[32] = {0};
@@ -863,9 +904,9 @@ static NSDictionary *aq_bridge(AQGSAProtocol *owner, NSURLRequest *original, NSE
      * The password remains byte-for-byte as submitted. */
     NSString *submittedUser = [credentials objectAtIndex:0];
     NSString *user = [submittedUser lowercaseString];
-    syslog(LOG_NOTICE, "AquaTransport iCloud credentials decoded (source %s, account case normalized %s)",
+    syslog(LOG_NOTICE, "AquaTransport iCloud credentials decoded (source %s, account case normalized %s, password field %lu characters)",
         [[[original valueForHTTPHeaderField:@"Authorization"] lowercaseString] hasPrefix:@"basic "] ? "Basic" : "plist",
-        [submittedUser isEqual:user] ? "no" : "yes");
+        [submittedUser isEqual:user] ? "no" : "yes", (unsigned long)[[credentials objectAtIndex:1] length]);
     NSDictionary *session = aq_login(owner, user, [credentials objectAtIndex:1], error);
     if (!session) return nil;
     NSString *pet = aq_string([aq_dict([aq_dict([session objectForKey:@"t"]) objectForKey:@"com.apple.gs.idms.pet"]) objectForKey:@"token"]);

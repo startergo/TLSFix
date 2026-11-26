@@ -45,7 +45,7 @@ static void server_start(NSData *clientA) {
     const SRP_gN *gn = SRP_get_default_gN("2048"); BN_CTX *ctx = BN_CTX_new();
     BIGNUM *A = number(clientA), *b = BN_new(), *v = BN_new(), *B = BN_new(), *tmp = BN_new(), *S = BN_new();
     BN_set_word(b, 1234567);
-    unsigned char derived[32]; NSData *password = hash(bytes(@"Synthetic:PassWord"));
+    unsigned char derived[32]; NSData *password = hash(bytes([mode isEqual:@"password-tail-digits"] ? @"Synthetic:123456" : @"Synthetic:PassWord"));
     PKCS5_PBKDF2_HMAC([password bytes], 32, (unsigned char *)"ordinarysalt1234", 16, 5, EVP_sha256(), 32, derived);
     NSData *inner = hash(cat([NSArray arrayWithObjects:bytes(@":"), [NSData dataWithBytes:derived length:32], nil]));
     BIGNUM *x = number(hash(cat([NSArray arrayWithObjects:bytes(@"ordinarysalt1234"), inner, nil])));
@@ -99,6 +99,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
 - (void)startLoading {
     NSURLRequest *req = [self request]; NSString *host = [[req URL] host], *path = [[req URL] path];
     NSData *data = nil; NSDictionary *result = nil, *responseHeaders = nil; int status = 200;
+    BOOL wrongPassword = NO;   /* this proof was made for a string that is not the password */
     if (fixture(@"disabled")) {
         assert(![NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
         assert([[[parse([req HTTPBody]) objectForKey:@"password"] description] isEqual:@"Synthetic:PassWord"]);
@@ -145,7 +146,11 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
             if ([mode isEqual:@"malformed"]) result = [NSDictionary dictionaryWithObject:@"invalid" forKey:@"s"];
         } else {
             completeCalls++;
-            assert([[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]]);
+            /* The first proof of the mode whose password ends in six digits is made for the
+             * shorter string, which is not the password; the adapter must ask again. */
+            wrongPassword = [mode isEqual:@"password-tail-digits"] && completeCalls == 1;
+            if (!wrongPassword)
+                assert([[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]]);
             NSMutableData *m2 = [[[serverProof subdataWithRange:NSMakeRange(32,32)] mutableCopy] autorelease];
             if (fixture(@"bad-proof")) ((unsigned char *)[m2 mutableBytes])[0] ^= 1;
             if ([mode isEqual:@"short-proof"]) [m2 setLength:1];
@@ -161,6 +166,9 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
             else if ([mode isEqual:@"2fa-renamed"]) [s setObject:@"trustedDeviceSecondaryAuthV2" forKey:@"au"];
             else if ([mode isEqual:@"2fa-unlabelled"] || [mode isEqual:@"2fa-session-hint"]) ;
             else [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
+        } else if (wrongPassword) {
+            /* Apple's answer to a wrong password: not a challenge. */
+            [s setObject:@401 forKey:@"hsc"]; [s setObject:@-22406 forKey:@"ec"];
         }
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
@@ -368,14 +376,18 @@ int main(int argc, char **argv) {
         puts("PASS: offline sign-in via native AOSRequest / CFURLConnection"); [pool drain]; return 0;
     }
     NSURLResponse *response = nil; NSError *error = nil;
-    NSData *data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord") returningResponse:&response error:&error];
+    /* What the first request carries: the fixture password, unless the mode is about a
+     * password that ends in six digits, or the password and the code given together. */
+    NSString *typed = [mode isEqual:@"password-tail-digits"] ? @"Synthetic:123456" :
+        [mode isEqual:@"2fa-one-step"] ? @"Synthetic:PassWord123456" : @"Synthetic:PassWord";
+    NSData *data = [NSURLConnection sendSynchronousRequest:login(typed) returningResponse:&response error:&error];
     if ([mode isEqual:@"disabled"]) {
         assert(!error && [[parse(data) objectForKey:@"fixture"] isEqual:@"native"]);
         assert(anisetteCalls == 0 && initCalls == 0 && NSClassFromString(@"AQGSAProtocol") == Nil);
         puts("PASS: disable-icloud-gsa preserves native requests and leaves the module unloaded");
         [pool drain]; return 0;
     }
-    if (is2fa() && ![mode isEqual:@"2fa-sms"]) {
+    if (is2fa() && ![mode isEqual:@"2fa-sms"] && ![mode isEqual:@"2fa-one-step"]) {
         /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. Every
          * variant but SMS asks for the code the same way, whatever the hint looked like. */
         assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
@@ -387,7 +399,7 @@ int main(int argc, char **argv) {
     }
     /* SMS: refused at once as unsupported, with no prompt requested and no code asked for. */
     if ([mode isEqual:@"2fa-sms"]) assert(error && codeCalls == 0 && accountCalls == 0);
-    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"local"] ||
+    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"local"] || [mode isEqual:@"password-tail-digits"] ||
         (is2fa() && ![mode isEqual:@"2fa-refused"] && ![mode isEqual:@"2fa-sms"]);
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
@@ -396,6 +408,11 @@ int main(int argc, char **argv) {
         /* An accepted code completes the sign-in on the exchange that asked for it. Only a
          * reply without Apple's token repeats the exchange, as every code once did. */
         if (is2fa()) assert(initCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1) && completeCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1));
+        /* Password and code typed together, with no challenge pending: one exchange, which
+         * asks for the code, and the code checked against it. A password whose own last six
+         * characters are digits: the shorter string refused as the password, then the whole. */
+        if ([mode isEqual:@"2fa-one-step"]) assert(initCalls == 1 && completeCalls == 1 && codeCalls == 2);
+        if ([mode isEqual:@"password-tail-digits"]) assert(initCalls == 2 && completeCalls == 2 && codeCalls == 0);
         Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
         for (NSString *url in [NSArray arrayWithObjects:@"http://setup.icloud.com/setup/login_or_create_account",
             @"https://setup.icloud.com.example.invalid/setup/login_or_create_account", @"https://setup.icloud.com:444/setup/login_or_create_account",
