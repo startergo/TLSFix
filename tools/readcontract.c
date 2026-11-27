@@ -109,7 +109,8 @@ int main(int argc, char **argv) {
     struct timeval rcvto = { 10, 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof rcvto);
 
-    SSLContextRef ctx = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
+    SSLContextRef ctx = NULL;
+    SSLNewContext(false, &ctx);
     g_ctx = ctx;
     SSLSetIOFuncs(ctx, sock_read, sock_write);
     SSLSetConnection(ctx, &fd);
@@ -174,7 +175,7 @@ int main(int argc, char **argv) {
     report("zero length", st, n, 0);
 
     SSLClose(ctx);
-    CFRelease(ctx);
+    SSLDisposeContext(ctx);   // pairs with SSLNewContext, not CFRelease
     close(fd);
     free(buf);
     return 0;

@@ -23,6 +23,9 @@ skipped there), both `x86_64` and `i386`.
 ./tools/selftest.sh       # per-process tests, installs nothing
 ```
 
+Building the installer itself (pkg and DMG) is described in
+[PACKAGING.md](PACKAGING.md).
+
 OpenSSL is vendored: `deps/openssl-3.5.7.tar.gz` (checksum matches upstream).
 The iCloud authentication module also needs a GC-capable compiler;
 see [ICLOUD.md](ICLOUD.md) for toolchain setup, configuration, and its experimental
@@ -35,9 +38,12 @@ The build enforces three invariants, each guarding a failure that is silent at l
    processes of either architecture; the build refuses without both. A weak load command naming
    a library with no slice for the process is skipped in silence, so a build missing one would
    leave that architecture unpatched and say nothing.
-2. **Zero exported symbols.** Loaded into another process by any mechanism, the library must
-   export nothing: a naive link exports 9252 symbols, the whole `SSL_*`/`EVP_*` namespace
-   among them, which would interpose those names in the host.
+2. **Nothing exported but the one hook.** Loaded into another process by any mechanism, the
+   library must export nothing a host could bind to unawares: a naive link exports 9252
+   symbols, the whole `SSL_*`/`EVP_*` namespace among them, which would interpose those
+   names in the host. The single exception is the engine's `WKExternalURLRewrite`, which a
+   patched WebKit resolves by name on purpose (under *Rules*). Every other image exports
+   nothing, and the engine exports nothing else.
 3. **No post-10.6 libc imports.** `getentropy` is 10.12+; `strndup`, `strnlen`, `getline`,
    `getdelim` are 10.7+. They bind *lazily*, so the dylib loads fine and then kills the
    process on first use. OpenSSL is configured `--with-rand-seed=devrandom` to keep seeding
@@ -174,7 +180,7 @@ If a patched Security ever stops the machine from booting, the original is a har
 it. From another volume or single-user mode:
 
 ```
-ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.aquatransport-original \
+ln -f /System/Library/Frameworks/Security.framework/Versions/A/Security.original \
       /System/Library/Frameworks/Security.framework/Versions/A/Security
 ```
 
@@ -440,9 +446,12 @@ User-Agent: Something Else
 
 Scope matches the process that **issues** the request, which is not always the app you have
 in mind. WebKit1 apps load in-process, so `Dictionary`, `HelpViewer`, the iWork apps and
-`Twitter` all work. A **WebKit2 app hands its loads to the shared
-`com.apple.WebKit.Networking` service**, so a rule scoped to `Safari` will never match —
-use `*` for those, or scope nothing and accept system-wide application.
+`Twitter` all work. A **WebKit2 app hands its loads to a `com.apple.WebKit.Networking`
+service** of its own, which runs under that name rather than the app's. The rewriter
+attributes that service's requests to the app responsible for it as well, so a rule scoped
+to `Safari` — or to any WebKit2 app — matches the loads it makes there, as a `*` rule
+would. The lookup that finds the responsible process exists from 10.9; where it is missing,
+is refused, or answers with the process itself, no second identity is recorded.
 
 A block too short to hold a scope line is ignored.
 
@@ -451,6 +460,12 @@ rules change the destination host — and by the time `SSLWrite` runs, CFNetwork
 resolved DNS and handshaked with the *original* host. At the request layer CFNetwork does
 DNS, SNI and certificate validation against the rewritten host, and `http://` rules and
 `http`→`https` upgrades work too.
+
+The same rules reach a WebKit that does its networking without CFNetwork. The engine
+exports one symbol, `WKExternalURLRewrite`, and the loader maps the engine globally so that
+a patched WebKit can find it by name. WebKit calls it with each outgoing request's URL and
+header dictionary, and it applies the redirect and header rules to them. It is the one
+permitted export (see the invariants above), and without such a WebKit it has no caller.
 
 ### How the rewriter works, and why it is pure C
 
@@ -700,6 +715,7 @@ nothing left to deliver first.
 | before the first `SSLHandshake` | `kSSLIdle` |
 | handshake in flight (`errSSLWouldBlock`) | `kSSLHandshake` |
 | paused for server authentication (`errSSLPeerAuthCompleted`) | **`kSSLHandshake`** |
+| paused for a client certificate (`errSSLClientCertRequested`) | **`kSSLHandshake`** |
 | connected | `kSSLConnected` |
 | after `SSLClose` | `kSSLClosed` |
 
@@ -709,7 +725,8 @@ itself, so every native-tls client needs `kSSLHandshake` at that point.
 
 The native context cannot give that answer. The engine's handshake never reaches it, so it says
 `kSSLIdle` until the connection is up. The hook answers `kSSLHandshake` itself instead, while
-the engine is handshaking.
+the engine is handshaking. This fork honours a second pause, the cert-request break below, and
+it answers the same there: stock is mid-handshake at either.
 
 CFNetwork asks only before the first `SSLHandshake`, where the native answer is already right.
 
@@ -1092,6 +1109,29 @@ correctly once modern roots are installed, so no OpenSSL-side verifier is needed
 In practice CFNetwork sets `kSSLSessionOptionBreakOnServerAuth` on nearly every
 connection, so the app-verified path (`sh_build_trust` → CFNetwork evaluates) is the
 common one, not an edge case for pinning apps.
+
+**The cert-request break.** `kSSLSessionOptionBreakOnCertRequested` — the on-demand
+identity flow, where the caller supplies its certificate only after the server asks — is
+honoured too. `client_cert_cb` suspends there whatever identity is installed
+(`SSL_ERROR_WANT_X509_LOOKUP`, the same pause point the server-auth break uses), and
+`SSLSetCertificate` at the pause keeps the suspended handshake rather than
+re-initialising it: that call is exactly what the contract names, and restarting would
+send a fresh ClientHello down a socket that has already consumed the server's flight.
+With both breaks set, stock reports the server-auth pause before the cert-request one —
+the server's Certificate message precedes its CertificateRequest — and the engine reports
+them in that order too, each resume re-entering the other pause. The pause is a state of its
+own in the shadow, `SH_STATE_CERT_REQUEST`, beside `SH_STATE_PEER_AUTH`: it answers
+`kSSLHandshake` like the server-auth pause (see *Session state*), and the negotiated
+protocol and cipher and the peer's trust are available at it, since the server's Certificate
+message has arrived by then. Both are decided by switches over the state enum
+(`sh_session_state()` and `sh_peer_arrived()`), so a state added without a case fails the
+build under `-Wswitch` rather than being handled one way in one hook and another elsewhere.
+`SSLGetClientCertificateState` answers from whether the server actually asked — recorded the
+moment the client-certificate callback runs, since that callback fires exactly at the server's
+`CertificateRequest` — not from whether an identity happens to be installed:
+`kSSLClientCertRequested` while the request is unanswered, `kSSLClientCertSent` after a
+handshake that answered it with a certificate. `selftest.sh` runs the flow against `mtlssrv`
+with the identity supplied only at the pause.
 
 **mTLS.** `SecKeyRawSign` and `SecKeyDecrypt` exist on both 10.6 and 10.9 (exported but
 absent from the OS X headers, so declared in `aquatransport.h`), so the private key never

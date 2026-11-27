@@ -5,64 +5,7 @@ into GrandSlam authentication on **OS X 10.7–10.9**. AquaTransport's TLS engin
 still supports 10.6; this module does not add iCloud to Snow Leopard.
 The authentication adapter is enabled by default.
 
-**Current candidate (2026.11.24.3, adapter 18):** Device authentication uses
-only the Mac's native AOSKit backend and hardware identity. There is one minimal
-GrandSlam request profile, with a User-Agent built from the installed CFNetwork
-and Darwin versions. The private CoreADI backend, alternate profile flag and
-speculative second SRP exchange after verification have been removed.
-
-After successful code validation, the adapter requires a valid password-equivalent
-token in `X-Apple-PE-Token`. Missing or malformed tokens stop the attempt with a
-specific diagnostic; the adapter does not try a second authentication strategy.
-The initial password exchange, optional verification and token exchange form one
-state machine. Verification hints in either `Status.au` or the encrypted session
-are normalized before entering that same verification state. These supported
-field locations do not establish that Apple requires separate client profiles.
-
-The helper returns its device identity with every proof; clients no longer infer
-an identity when an older helper omits it. Installation must update both the
-client and helper, followed by a reboot. The identity is checked again during
-verification and resynchronization. Logs record fixed stage labels, numeric
-statuses, verification-hint location and token presence/validity, never token values.
-Live acceptance by Apple remains to be tested on affected accounts.
-
-**Missing-metadata recovery (2026.11.24.3):** AquaTransport uses one machine-wide
-`/usr/share/aquatransport/state/anisette.plist`. The root broker opens and locks it
-before handing an already-open descriptor to the worker running as the requesting
-user. The directory is root-owned mode 0700 and the file is mode 0600. No metadata
-is created in a user's Library, and no old routing record needs to be migrated.
-
-If native state is provisioned but the routing record is absent, malformed, or
-belongs to a different hardware UUID, the helper records a bounded repair attempt.
-It first obtains a valid provisioning challenge from Apple, then invokes AOSKit's
-native RP/reset operation for the production `-2` record only and runs the normal
-provisioning exchange. It does not delete the ADI directory or other native records.
-A failed attempt imposes a machine-wide 24-hour cooldown. Unknown native errors,
-missing reset support and failures before a valid start challenge do not reset
-native state. Successful provisioning clears the attempt marker. Ordinary account
-or password failures do not trigger this repair.
-
-The Mavericks routing-query probe returned error -45019, so this implementation
-does not depend on recovering a routing value directly from CoreADI or guessing
-one. Recovery is tested with synthetic native routines and mocked Apple responses;
-no live reprovisioning of the user's working Mac was performed for this change.
-
-Validation for 2026.11.24.3: the offline GSA suite passed 220 reported checks,
-including missing/corrupt/mismatched metadata, recovery cooldown, failures before
-native reset, reset errors, shared-record reuse, secure file opening and descriptor
-inheritance on both Intel architectures. All four Find My checks passed. The native
-RP/reset wrapper is present in both installed Mavericks AOSKit slices; its calling
-convention was checked against Apple's own provisioning-action handler.
-
-**Local-only change (2026-09-28):** Device authentication now uses only the Mac's
-AOSKit/CoreADI. Both the public provider and configurable HTTP providers have been
-removed. Native Apple provisioning succeeded on this Mavericks machine, and the
-user confirmed a successful iCloud sign-in in System Preferences with local
-headers. Native generation also passes in fresh i386, x86_64 and x86_64 GC
-processes. The final architecture uses one bundled local generator process so
-sandboxed Mail and Calendar can use the same state without filesystem exemptions.
-
-**Earlier validation: GrandSlam sign-in and trusted-device 2FA reached successful account
+**Status: GrandSlam sign-in and trusted-device 2FA reached successful account
 creation on 10.9.5 with a real account. After adding saved-token device headers,
 the native helper's account refresh returned HTTP 200. Read-only Calendar and Contacts
 discovery returned HTTP 401 with the saved modern token alone and HTTP 207 with
@@ -70,32 +13,38 @@ device headers. The user confirmed both Calendar and Contacts work with the nati
 Mail failed with the account-helper fixes alone; the user confirmed it works after
 installing the six-field ATOKEN adapter on 2026-09-09. All 63 offline checks passed
 for that build, including native MailCore tests with synthetic credentials.**
+
+**2026-09-13 update:** Apple's edge stopped accepting the shared GSAPort anisette
+identity, and its password-equivalent exchange began issuing `U`-prefixed
+(144-char) MME tokens in place of `E`-prefixed ones. Both required adapter
+changes (self-hosted anisette with AKDevice-paired identity; `E`/`U` token
+acceptance). With those, a real pane sign-in, saved-token refresh and the Mail
+adapter all work end-to-end on 10.9.5: `account refresh completed (HTTP 200)`
+repeatedly, no password re-prompt. The pane's setup spinner can outlast the
+account creation because Apple's modern responses carry no setup transaction
+ID; the account is nevertheless written and functional — close and reopen the
+pane. `p402-quota.icloud.com` quota lookups still fail natively (no adapter,
+no device authentication) and only affect the storage display.
+
+**2026-11-26 update:** Apple now refuses, at the first step of the exchange, the
+device data that `anisette-v3-server` derives (`ec -22410`, whatever the client
+identity). The Mac's own generator (*Local Anisette*) is accepted. For most of
+that day it looked refused too, with a bare 503 at Apple's edge; that was this
+adapter, not Apple. The generator's identity was stored under a key the
+GrandSlam envelope did not read, so the request described an Xcode MacBook on
+the outside and carried the Mac's own one-time password inside. Fixed the same
+day; the comparison is under *Anisette V3*. That evening the account was signed
+in again in the pane, on the Mac's own generator, from the password and a code
+typed together in one entry: `account refresh completed (HTTP 200)`, and the
+account store rewritten fifteen seconds later. Apple now sends the code with its
+answer instead of on request, and the code a trusted device can produce by hand
+is offered only while that device is offline (*Install and try a sign-in*).
+
 The mock tests pass through the installed AOSKit framework's actual
 `AOSRequest` / `CFURLConnection` path. They cannot establish that Apple's current
 servers accept this client identity, issue the required tokens, or return an account
 settings dictionary that the iCloud preference pane accepts. Offline tests do not
 change existing accounts.
-
-**Account-settings fix (adapter 11, 2026-09-21):** The adapter previously added
-device headers to saved-account refreshes only when the MME token began with `E`.
-A live failing request used a numeric DSID and a token without that prefix, so it
-bypassed the adapter and returned HTTP 401. Treating the token as opaque and
-adding device headers to the same narrowly scoped DSID/token request restored
-HTTP 200. Credentials, method and body are preserved; no password exchange or
-account reset is performed. The new non-`E` regression fails against the old
-implementation. All 108 offline checks pass, including ordinary and native AOSKit
-refreshes on i386, x86_64 and x86_64 GC. Preference-pane completion still requires
-user confirmation.
-
-**Device-resynchronization fix (adapter 12, 2026-11-03):** GrandSlam can return
-HTTP 200 with `hsc 434`, `ec -22421` and `X-Apple-I-MD-DATA` when a previously
-provisioned machine must refresh its device state. Earlier builds treated that
-response as a terminal authentication failure. The adapter now passes the server
-message to the Mac's own CoreADI `Synchronize` wrapper, posts the resulting MID/SRM
-pair to Apple's URL-bag `midSyncMachine` endpoint, obtains fresh device headers and
-retries the interrupted GrandSlam operation once. A repeated challenge, malformed
-server message, native failure, invalid URL, rejected sync or routing persistence
-failure stops without another retry. No account credential enters this repair path.
 
 ## Build
 
@@ -122,165 +71,426 @@ It is a development tool and is not included in the installer. After toolchain s
 builds and the GSA tests require no network. This particular compiler binary runs on
 Mavericks; building on earlier systems requires a compatible GC-capable compiler.
 
-The build produces loader, TLS engine and GSA dylibs under
-`build/stage/usr/share/aquatransport/`. All have i386 and x86_64 slices and zero
-exported symbols. The build checks GC compatibility for the GSA x86_64 slice;
-32-bit processes use retain/release. The package project and command-line installer
-include the module, native generator executable and feature job plist. Existing
-`.pkg`/DMG binaries are not regenerated by the build.
-To create an installer with the Packages command-line tool:
+The build produces the loader, the TLS engine, and — when the GC compiler and a
+10.7-era SDK are present — the GSA and Maps modules and the local Anisette
+generator, under `build/stage/usr/share/aquatransport/`. All are i386 and x86_64
+and export nothing, except the engine's one symbol, the hook a patched WebKit
+resolves by name. The build checks GC compatibility for the GSA and Maps x86_64
+slices; 32-bit processes use retain/release. The package project and command-line
+installer include them all. Existing `.pkg`/DMG binaries are not regenerated by
+the build.
+
+## Anisette prerequisite
+
+GrandSlam needs fresh device authentication data as well as SRP. Where it comes
+from is decided by the one line in
+`/usr/share/aquatransport/config/gsa-anisette-url.txt`:
+
+- `local:` — this Mac's own generator, over a local socket. No server anywhere;
+  see [Local Anisette](#local-anisette-the-macs-own-generator) below.
+- `exec:/path/to/helper` — a helper on this Mac that prints the JSON dictionary
+  below; see [Self-hosted anisette](#self-hosted-anisette-from-a-modern-mac).
+- `v3:http(s)://…` — a self-hosted Anisette V3 server; see
+  [Anisette V3](#anisette-v3-a-self-contained-client-identity).
+- a bare `http(s)://…` URL — a server that answers an unauthenticated GET with
+  the JSON dictionary below.
+
+Which of them Apple accepts changes, and costs one request to learn (the
+pairing probe, under *Validation*). On 2026-11-26 `local:` was accepted and a
+`v3:` identity served by `anisette-v3-server` was not; the bare URL was
+accepted as served by a modern Mac, and its `exec:` form was not tried. Each
+source has its status under its own heading.
+
+With no file, or an empty one, the adapter asks `+[AOSUtilities
+retrieveOTPHeadersForDSID:@"-2"]` from the system's AOSKit first — it returned
+**no headers on this machine**, inside and outside the development sandbox, and
+the adapter does not attempt to provision or modify it — and then the `local:`
+generator. Nothing else is tried: no third-party server is contacted unless an
+administrator names one. The shared public provider that once stood in here,
+`icloud.podpod123.com`, received the Mac's hardware UUID and saw its address; it
+stopped answering around 2026-09-13 and has been removed.
+
+A bare URL must name a server that answers an unauthenticated GET with a JSON
+dictionary containing these string values:
+
+```json
+{
+  "X-Apple-I-MD": "fresh one-time device value",
+  "X-Apple-I-MD-M": "machine value",
+  "X-Apple-I-MD-LU": "local user identity",
+  "X-Apple-I-MD-RINFO": "routing information",
+  "X-Mme-Device-Id": "device identity"
+}
+```
+
+The device identity must remain consistent across requests. The adapter adds the
+current time, timezone and locale. It accepts the optional `X-Apple-I-SRL-NO` string,
+and the optional `X-MMe-Client-Info` string, retaining the provider's client identity
+in both the HTTP headers and GrandSlam client data. Other fields are ignored.
+HTTPS is required except for HTTP on loopback. Redirects
+are rejected. A server requiring a V3 provisioning handshake needs a separate adapter
+that exposes this GET interface; a V3 URL alone is not sufficient.
+
+Passwords, Apple IDs, verification codes, Apple tokens and cookies are never
+included in any provider request. A server still sees the connecting IP and
+supplies the device identity material. The `local:` generator is the exception on
+both counts: the only host it ever talks to is `gsa.apple.com`, and only while
+provisioning. [SideStore documents why shared older anisette identities can cause
+account locks](https://docs.sidestore.io/docs/advanced/anisette).
+
+### Self-hosted anisette from a modern Mac
+
+A Mac that is itself signed into iCloud can mint properly paired anisette through
+its own AOSKit, and `tools/anisette-server.m` serves it over the GET-JSON contract
+above. `tools/anisette-host.sh` builds it and installs two launch agents on the
+modern Mac: the server, bound to `127.0.0.1:9724`, and a reverse SSH tunnel that
+binds the same port on the client's loopback. The client's
+`gsa-anisette-url.txt` then holds `http://127.0.0.1:9724/anisette`; plain HTTP on
+loopback is what the adapter's URL check permits, and the tunnel provides the
+encryption. `anisette-host.sh` also has `status`, `stop` and `uninstall`
+subcommands.
+
+**Quick start.** Prerequisites: the modern Mac is signed into iCloud (AOSKit
+mints nothing otherwise), and it can `ssh` into the client without a password —
+the tunnel dials *out to the client*, so the key lives on the modern Mac and the
+client runs sshd. Then:
 
 ```sh
-packagesbuild --build-folder "$PWD/build/local-anisette-package" packaging/Package/AquaTransport.pkgproj
+# on the modern Mac
+tools/anisette-host.sh install <client-ssh-host>
+tools/anisette-host.sh status        # expect: agents running, HTTP 200
+
+# on the client
+echo http://127.0.0.1:9724/anisette | sudo tee /usr/share/aquatransport/config/gsa-anisette-url.txt
 ```
 
-The resulting `build/local-anisette-package/AquaTransport.pkg` includes the helper
-and feature job. This command overrides the output for this build only; the
-project's default remains `../DMG Image`. The 2026-09-28 build and its payload
-manifest were verified for the planned Lion test; Lion runtime validation remains
-outstanding.
+**Tried on 2026-11-26: accepted.** Device data minted here was answered with a
+challenge every time: from a `Mac16,8` on macOS 26, as minted and with two other
+client identities substituted, and twice from the 10.9.5 machine over a reverse
+tunnel to it. It was accepted as minted, `macOS;` spelled that way, although
+Apple's edge had been dropping that spelling for others since 2026-11-20; so
+the pairing of the one-time password with the identity fields is what matters,
+and that month's client-identity rules are not worth reproducing here. The
+client's own generator is accepted as well (*Local Anisette*) and needs no
+second machine; this arrangement is for a client whose AOSKit cannot mint, as
+on 2026-09-13.
 
-## Local Anisette generation
+Sign-in, Mail, Calendar/Contacts, iMessage and iCloud Keychain then draw their
+device data from the modern Mac -- on every request, since a saved token is
+only accepted when the request carries device data. `anisette-host.sh stop`
+suspends both agents and `uninstall` removes them. While the Mac is asleep or
+away the adapter has nothing to send, so no request reaches Apple and the
+saved tokens are not spent. That dependence on the Mac is the one condition
+the client's own generator does not have, and the thing to weigh before
+choosing this source.
 
-GrandSlam needs fresh device authentication data as well as SRP. The generator uses Apple's installed AOSKit/CoreADI, called by the bundled
-`aquatransport-anisette` helper. Its job plist lives at
-`/usr/share/aquatransport/org.aquatransport.anisette.plist`. The existing
-`aquatransport-bootstrap` registers it on Lion and later, unless iCloud support
-is disabled, using the same lifecycle as the AirDrop feature job. No additional
-job is installed in `/Library/LaunchAgents` or `/Library/LaunchDaemons`.
+**Daemon-free variant.** `gsa-anisette-url.txt` also accepts an `exec:` line:
+the absolute path of a helper that prints the same JSON dictionary on stdout
+and exits. The adapter launches it directly — no shell, no arguments, at most a
+64 KiB response, killed at the HTTP path's 30-second bound — so the natural
+form is a one-line wrapper, e.g. an `ssh` forced command running
+`anisette-server --once` on the minting Mac. Nothing runs resident anywhere;
+each fetch costs one helper launch. The C-side keychain injection (below)
+understands the same `exec:` line, so DAV, Mail, keychain and sign-in paths all
+keep working when the loopback server is replaced by helpers.
 
-All clients use `/var/run/org.aquatransport.anisette.sock`. Clients verify the
-server's root identity. The broker obtains each client's user ID from the kernel
-and starts a fresh worker with that user's groups, UID and home directory;
-only the worker calls Apple's native generator. Workers verify the peer again.
-The broker supplies the locked machine-state file as descriptor 3; the worker
-validates its ownership and permissions and never opens a user-selected path.
-The socket accepts requests to generate device headers, transform an Apple-issued
-resynchronization message with CoreADI, and persist routing returned by that same
-exchange. Account names, passwords, verification codes and service tokens never
-pass through it. Resynchronization input and output are bounded. There is
-no TCP listener, remote provider, provider URL setting, downloaded runtime, or
-remote generation path. Failure stops authentication.
+### Anisette V3: a self-contained client identity
 
-The separate process is necessary on Mavericks: the running Mail, Calendar and
-CalendarAgent sandboxes deny access to Apple's `/Users/Shared/adi` state and to
-the adapter's metadata directory. Generation runs as the requesting user and
-requires no sandbox changes. Launchd starts the broker only when a client uses
-the socket. Each worker handles one request; the broker exits after 30 idle
-seconds. Registration and startup alone do not contact Apple. A missing helper
-produces a local-service error.
+V1 is closed to new identities: every freshly provisioned V1 pair — including
+the `GET /` output of omnisette-server, anisette-v3-server, and SideStore's
+own production servers — is refused by Apple's edge with the same bare 503 as
+a mismatched pair (verified 2026-09-14). What still works is **V3**: the
+client holds its own identity (a 16-byte identifier plus an `adi.pb`
+provisioning record), and the server only *derives* one-time passwords from
+it, statelessly, over `POST /v3/get_headers`. No other machine's anisette
+identity is borrowed, so nothing shared can be revoked underneath you.
 
-```mermaid
-flowchart LR
-    Bootstrap["Existing bootstrap"] -->|"Registers feature job"| Launchd["launchd"]
-    Launchd -->|"Socket activation"| Broker["Root broker"]
-    Client["iCloud clients"] -->|"Local Unix socket"| Broker
-    Broker -->|"Drops privileges, exec"| Helper["Worker as requesting user"]
-    Helper --> Native["Apple AOSKit / CoreADI"]
-    Helper -->|"First-time provisioning only"| Apple["Apple"]
-    Client -->|"Account authentication"| Apple
+**Status on 2026-11-26: refused by Apple.** The identity this section set up on
+2026-09-14 still derives headers, and Apple's edge still takes the request, but
+the first step of the sign-in exchange is answered `ec -22410` every time, with
+the identity as provisioned and with four other client identities, each on the
+envelope and in the body together (under *When sign-in fails at its first
+step*). The server's maintainer
+gives the reason in the project's
+[issue #61](https://github.com/Dadoum/anisette-v3-server/issues/61): since
+2026-10-12 Apple refuses at GrandSlam the one-time passwords that server
+derives. They come from Android's CoreADI libraries, and a request that presents
+a Mac may not carry them. Nothing points at the provisioning record: the same
+issue has the refusal for every instance of the server, and a user reports a
+fresh provisioning through a self-hosted instance failing at Apple's
+`finishMachineProvisioning` (`-29003`, "possible environment mismatch"), while
+servers running a Mac's own ADI pass. A new identity on the same server is
+therefore not worth provisioning until that changes. What Apple accepted that
+day, in the same minutes, was device data minted by a Mac's own AOSKit: the
+machine's own generator (*Local Anisette*) and the server under
+[Self-hosted anisette from a modern Mac](#self-hosted-anisette-from-a-modern-mac).
+The rest of this section stands as the record of how such an identity is built.
+
+Pieces:
+
+1. **Server.** [anisette-v3-server](https://github.com/Dadoum/anisette-v3-server)
+   built from source (the release Docker image predates the POST endpoint) and
+   bound to loopback on any always-on host — a free-tier VM is plenty.
+   Setup, as deployed and verified on 2026-09-14:
+
+   Any always-on Linux host works. Oracle Cloud's Always Free tier is one
+   option — an Ampere A1 instance, no expiry. Size it **within the current
+   allowance: 2 OCPU / 12 GB total across all A1 instances** (1,500 OCPU-hours
+   and 9,000 GB-hours per month). Oracle cut this from 4 / 24 in June 2026 by
+   editing only its Always Free page, so re-check it before sizing; an
+   over-limit instance is shut down or terminated, and this server needs a
+   fraction of even one OCPU. The rest of the instance recipe: pick the home
+   region deliberately (it is permanent, and A1 capacity varies by region),
+   aarch64 or x86_64 Ubuntu, public subnet with a public IPv4, your ssh key
+   pasted at creation, and a **budget alert at $1** as the early warning if
+   anything drifts off the free allowance. "Out of host capacity" at creation
+   is region-dependent: retry other availability domains, try a smaller shape
+   first and resize once running, retry off-peak, or loop the launch call via
+   the OCI CLI. Build and install:
+
+   ```sh
+   sudo apt install -y ldc dub libz-dev libssl-dev gcc ca-certificates git
+   git clone https://github.com/Dadoum/anisette-v3-server /opt/anisette-v3
+   cd /opt/anisette-v3
+   DC=ldc2 dub build -c static --build-mode allAtOnce -b release --compiler=ldc2
+   ```
+
+   On first start the server downloads the ADI libraries from Apple's own
+   Music APK; nothing to extract by hand. Ubuntu's trust store lacks Apple's
+   root, which the provisioning requests need — take it from the chain Apple
+   itself serves:
+
+   ```sh
+   echo | openssl s_client -connect gsa.apple.com:443 -servername gsa.apple.com -showcerts 2>/dev/null \
+     | sed -n "/BEGIN CERTIFICATE/,/END CERTIFICATE/p" | awk "/BEGIN/{n++} n==3" | sudo tee \
+     /usr/local/share/ca-certificates/apple-root-g1.crt >/dev/null
+   sudo update-ca-certificates
+   ```
+
+   The ADI library makes its own single-level `mkdir` under
+   `$XDG_RUNTIME_DIR/anisette-v3/provisioning`; the directory must already
+   exist or every provisioning ends in `-45054` (the project's issue #52). A
+   unit that arranges both:
+
+   ```ini
+   [Unit]
+   Description=anisette-v3-server
+   After=network-online.target
+
+   [Service]
+   User=youruser
+   WorkingDirectory=/opt/anisette-v3
+   Environment=XDG_RUNTIME_DIR=/tmp/xdg
+   ExecStartPre=/bin/mkdir -p /tmp/xdg/anisette-v3/provisioning
+   ExecStartPre=/bin/chmod 777 /tmp/xdg/anisette-v3
+   ExecStart=/opt/anisette-v3/anisette-v3-server --host 127.0.0.1 --port 6969
+   Restart=always
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   An idle-always-free Oracle instance can be reclaimed after days of ~zero
+   CPU; a five-minutely crontab that burns a few seconds of CPU prevents that.
+
+   A 10.9 client cannot negotiate with a current sshd, so the tunnel in piece 3
+   needs the legacy algorithms re-enabled additively on the server (modern
+   clients are unaffected):
+
+   ```sh
+   printf "KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha256,ecdh-sha2-nistp256\nHostKeyAlgorithms +ssh-rsa\nPubkeyAcceptedAlgorithms +ssh-rsa\nCiphers +aes128-ctr,aes192-ctr,aes256-ctr\n" \
+     | sudo tee /etc/ssh/sshd_config.d/10-legacy-mavericks.conf
+   sudo sshd -t && sudo systemctl reload ssh
+   ```
+
+   Verify before moving on — a POST with a dummy identity must reach the
+   endpoint (a JSON error reply, not an HTML 405 from a stale build):
+
+   ```sh
+   curl -sS -X POST -H "Content-Type: application/json" \
+     -d '{"identifier":"","adi_pb":""}' http://127.0.0.1:6969/v3/get_headers
+   ```
+2. **Identity.** `tools/anisette-v3-provision.py` runs the one-time
+   provisioning WebSocket and writes the adapter-ready identity file
+   (`adi_identifier`, `adi_pb`, `client-info` — copy it to
+   `/usr/share/aquatransport/config/gsa-anisette-v3.json`). The client info it
+   provisions under **must be akd-flavored** — an identity provisioned in the
+   Xcode AuthKit context is refused outright, while akd-context identities are
+   accepted in every service context (`svct` iMessage or iCloud, with or
+   without hardware headers; verified 2026-09-14 on 10.9.5). The tool talks to
+   the server over HTTPS or loopback HTTP only, the way the adapter does.
+3. **Client config.** `gsa-anisette-url.txt` holds
+   `v3:http://127.0.0.1:PORT/v3/get_headers`. The adapter posts the identity,
+   derives the local-user hash and device UUID from the identifier itself, and
+   presents the provisioning client info. The C-side keychain injection speaks
+   the same `v3:` form, so keychain traffic rides the same identity. The
+   server URL must be loopback on the client — an ssh tunnel from the client
+   (`ssh -N -L 9724:127.0.0.1:6969 user@server`) as a launch daemon is the
+   durable arrangement; a 10.9 client needs the server's sshd to permit its
+   legacy key exchange and RSA signatures.
+
+Sign-in under a new identity invalidates tokens issued under the old one:
+expect one password re-entry after switching, after which sign-in refresh,
+Mail, Calendar/Contacts, iMessage and Keychain all run on the client's own
+identity. Verified end-to-end on 10.9.5 on 2026-09-14: GrandSlam proof
+accepted, account refresh HTTP 200, keyvalueservice HTTP 200, through a
+free-tier VM and the box's own identity.
+
+**When sign-in fails at its first step.** Two failures that look like one
+appeared on the 10.9.5 machine in November 2026, and the log keeps them apart.
+
+`account refresh completed (HTTP 401)`, again and again from 2026-11-24 04:39,
+is the saved credentials being stale: the Apple ID's password had been changed
+elsewhere. The account has to be signed in again with the new password, by the
+two-attempt flow above.
+
+`GrandSlam init failed (HTTP 200, hsc 200, ec -22410)` is not that. The first
+step carries the account name and the device headers, and no password. It was
+in the log on 2026-11-23 at 22:49, before the account store was last written
+(2026-11-24 01:08) and hours before the first 401; and three sign-ins with the
+new password on 2026-11-26 were each refused there: the pane handed the
+password over (`credentials decoded (source Basic, …)`), the exchange stopped
+at `init`, and the pane reported `AOSErrorDomain error 1000`. The password is
+not sent at this step, so a wrong one cannot be what is refused.
+
+The `-22410` is about the device data and not about how the device describes
+itself. With the `v3:` identity on that machine, the pairing probe was answered
+`-22410` for each of five presentations, each with the client identity on the
+envelope and in the body together: the identity as provisioned
+(`<Mac16,8> <macOS;26.5;25F71>`, akd's token); the same with `Mac OS X;` in
+place of `macOS;`; the pair that restored sign-in for SideStore's users that
+week (`<MacBookPro13,3> <Mac OS X;26.6;25F84>` with `akd/1.0 CFNetwork/811.5.4
+Darwin/16.7.0`, [SideStore #1745](https://github.com/SideStore/SideStore/issues/1745));
+a current one (`<Mac14,15> <Mac OS X;27.0.1;26A434>` with `akd/1.0
+CFNetwork/3896.100.1.1.1 Darwin/27.0.0`); and the identity with the user agent
+it was provisioned under. The host `gsd.apple.com`, which the server's
+maintainer suggested in issue #61, answered with HTTP 403 and no GrandSlam
+status. So it is the identity's one-time passwords, as that server derives
+them, that Apple refuses (see the status note at the head of this section); no
+client identity tried changed the answer, and a fresh identity on that server
+is not worth provisioning.
+
+**A bare 503 at the same step is a third thing, and was read wrongly here for
+most of a day.** The `local:` generator's requests were dropped at Apple's
+edge while a `v3:` identity's were answered with a status, and that was taken
+for Apple refusing the generator's device data. It was not: it was this
+adapter. The generator's set stored the machine's client identity under
+`X-Mme-Client-Info`, with a lower-case `mme`, and the request builders read
+`X-MMe-Client-Info`, with a capital one. So the body of the request said
+`<MacPro5,1> <Mac OS X;10.9.5;13F1911>` as akd, and its envelope said
+`<MacBookPro13,2> <macOS;13.1;22C65>` under Xcode, with a Mojave-era user
+agent: one device outside, another's one-time password inside. Wowfunhappy's
+adapter, which stores the identity under the other spelling and so sends a
+consistent request, was accepted on the same machine in the same minutes; that
+is how the difference was found. With the key put right and the generator's
+user agent carried on the envelope, the probe's first step with `local:` was
+answered with a challenge three times in three. The tests hold it there now:
+`gsaprobe`'s `local` mode checks, on the wire, that the body names the identity
+once and the envelope carries that same one.
+
+What was accepted, in the same minutes and for the same account: that probe
+with `local:`, the machine's own generator; and with device data minted by
+another Mac, a `Mac16,8` on macOS 26 -- as minted and with either of the two
+substituted client identities above, from that Mac, and twice from the 10.9.5
+machine over a reverse tunnel. That server spells its key with the capital,
+which is why it passed while `local:` did not. The source is under
+[Self-hosted anisette from a modern Mac](#self-hosted-anisette-from-a-modern-mac).
+One request tells which of these a machine is seeing, without a password:
+
+```sh
+AQUATRANSPORT_DIR=/usr/share/aquatransport/config build/gsa-pairing-probe '<apple id>'
 ```
 
-On first use, if the native state check specifically returns `-45061` (not
-provisioned), the helper performs a single lookup/start/finish exchange directly
-with `gsa.apple.com`: at most three HTTPS requests, no redirects or automatic
-retries, 30 seconds per request. Apple's native routines create and finish the
-cryptographic challenge and retain the resulting ADI state. The machine-wide metadata
-file is locked across processes, and a failed attempt imposes a 24-hour cooldown.
-Unknown native errors do not trigger provisioning. Native state is reset only for
-the explicit missing-routing repair described above; it is never copied from
-another device.
+It reads `gsa-anisette-url.txt` from the directory it is given, so a candidate
+line can be tried from a scratch directory, with an empty `flags.txt` beside
+it, and the installed one left alone; that is how the five presentations and
+the sources above were compared.
 
-The obsolete `/usr/share/aquatransport/config/gsa-anisette-url.txt` file is no longer
-read. A file left by an older installation has no effect and can be removed. The
-library must be rebuilt and installed, and affected processes restarted, for this
-change to apply; a source checkout does not change an already loaded library.
+**The identity fields must pair with the one-time password.** AOSKit's OTP is
+minted under the current machine's AuthKit provisioning, so the accompanying
+fields must come from the same context — exactly the pairing SideStore's
+[MacAnisette](https://github.com/SideStore/MacAnisette) uses: client info from
+`AKDevice.currentDevice.serverFriendlyDescription`, device ID from
+`uniqueDeviceIdentifier`, local user from `localUserUUID`, routing info `0`, and
+`AOSUtilities machineSerialNumber` for the optional serial field. A mismatched
+pair — for example OTP from one machine paired with a different or hand-written
+client identity, as with the legacy local-AOSKit mapping — is rejected by
+Apple's edge as a **bare HTTP 503 with an nginx error page and no GrandSlam
+status at all**. That response is widely misread as an IP block or an Apple
+outage (see SideStore's 2026 sign-in issues); varying the client info, user
+agent, IP address or network does not change it. Only a correctly paired, fresh
+one-time password is accepted, and such a request is answered with a structured
+GrandSlam response even from datacenter IPs.
 
-The adapter reads `IOPlatformUUID` through IOKit for its stable device identity.
-Mavericks lacks `machineUDID`, and its 32-bit Objective-C OTP wrapper truncates
-the `-2` provisioning identifier. The generator calls the named native AOSKit
-wrappers with a full `uint64_t` on both architectures. Those wrappers are local
-Mach-O symbols: the resolver checks the installed framework's symbol and segment
-bounds and accepts only defined executable addresses. It neither patches Apple's
-framework nor uses hardcoded addresses. Unsupported or stripped frameworks fail
-closed; native compatibility has been tested on 10.9.5, not 10.7 or 10.8.
-Native `X-Apple-MD` and `X-Apple-MD-M` become
-`X-Apple-I-MD` and `X-Apple-I-MD-M`; missing, empty, malformed or oversized values
-are rejected. The local identity is the base64-encoded hardware UUID, routing
-information comes from Apple's successful provisioning response. Client information
-uses the Mac's real `hw.model`, installed OS version and build, followed by the
-GrandSlam-compatible `com.apple.AuthKit/1 (com.apple.akd/1.0)` application token.
-The adapter adds current time, timezone and locale and forwards no other native
-dictionary fields. Once provisioned, header generation and the native half of
-resynchronization make no HTTP requests. Account proofs, verification codes,
-service tokens and generated device headers go directly to Apple.
+### Local Anisette: the Mac's own generator
 
-### Device identity
+`local:` takes the server out of the picture. The routines that mint device
+authentication data are still inside Apple's AOSKit on Mavericks; what the system
+no longer does is call them, or hold provisioning for them to answer with. The
+`aquatransport-anisette` executable does both, so the Mac presents its own
+hardware identity and no other machine is involved. It is
+[Wowfunhappy's design](https://github.com/Wowfunhappy/TLSFix), taken from
+upstream's work of 2026-09-28 and offered here as one provider beside the two
+below.
 
-There is one native AOSKit backend, using Apple's `/Users/Shared/adi` and the
-matching machine-wide AquaTransport routing record under the installation folder.
-Both proofs and outgoing identity headers use the helper's hardware UUID. A helper
-that omits that identity is rejected explicitly.
+How it runs:
 
-Previous per-user `Library/Application Support/AquaTransport` metadata and private
-state are not read by this build. They can be removed after updating; their values
-are not needed for recovery. Missing current metadata is repaired on demand. No
-installation-time reset or account sign-out is performed. Existing account tokens
-are not cleared by native device reprovisioning; live service acceptance after a
-repair still requires testing.
+- The bootstrap registers `org.aquatransport.anisette.plist`, a socket-activated
+  job, on Lion and later, unless iCloud support is disabled. Nothing is installed
+  under `/Library/LaunchDaemons` or `/Library/LaunchAgents` for it.
+- Clients connect to `/var/run/org.aquatransport.anisette.sock`. The broker runs
+  as root, takes the caller's identity from the kernel, and execs a fresh worker
+  with that user's UID, groups and home directory; only the worker calls Apple's
+  code. That is what lets a sandboxed Mail or Calendar use it with no exemption,
+  and the broker exits after 30 idle seconds.
+- The worker reaches Apple's routines by name, in the loaded framework's own
+  symbol table: they are local symbols, which `dlsym` cannot see. A framework that
+  lacks them, or does not look as expected, fails closed.
+- On first use, when Apple's state says the machine is not provisioned, the worker
+  makes exactly one provisioning exchange with `gsa.apple.com`: a lookup, a start
+  and a finish, at most three HTTPS requests, no redirects, no retries. After that,
+  generating headers is local and makes no request.
+- One machine-wide record, `/usr/share/aquatransport/state/anisette.plist`
+  (root-owned, mode 0600), holds the hardware UUID, the routing value and the time
+  of the last provisioning attempt. A failed attempt waits 24 hours before another.
 
-### V3 and native generation
+Account names, passwords, verification codes and service tokens never cross that
+socket.
 
-Anisette V3 is SideStore's client/server protocol for separate client provisioning
-state. Its HTTP and WebSocket operations still ask an Anisette server to run
-CoreADI. It does not define a newer Apple OTP header format. See the
-[V3 server implementation](https://github.com/Dadoum/anisette-v3-server/blob/main/source/app.d)
-and [SideStore's explanation of shared-identity account locks](https://docs.sidestore.io/docs/advanced/anisette).
-Using the Mac's own CoreADI keeps device state local. The local helper uses the
-same Apple start/finish provisioning primitives, without V3's HTTP/WebSocket
-server protocol. Its Unix socket is an on-device transport, not a V3 endpoint.
+What to expect when switching to it:
 
-### Provisioning and routing state
-
-On 2026-09-28, the native failure was traced to missing provisioning. One
-three-request transaction returned HTTP 200 at every stage; native start/finish
-and OTP generation then returned success. Subsequent offline probes generated
-60-byte machine data and 24-byte OTPs on both architectures; values were withheld.
-The user subsequently confirmed successful iCloud login in System Preferences.
-The installed helper then returned native headers to fresh i386, x86_64 and
-x86_64 GC clients. A client sandbox denying IP networking and access to both
-native ADI files and adapter metadata also succeeded through the Unix socket.
-These checks did not perform additional Apple provisioning transactions. After
-moving registration to the existing bootstrap, the same client checks passed
-again. The root broker exited after its idle timeout, and the next request
-started a new broker and successfully generated native headers. The rebuilt
-installer contains the feature plist under `/usr/share/aquatransport` and no
-Anisette LaunchAgent.
-
-`/usr/share/aquatransport/state/anisette.plist` contains the hardware
-UUID, routing value and last attempt time, with directory mode 0700 and file mode
-0600. Routing is saved before committing newly provisioned native state. The
-Apple ADI blobs are not copied into this file. A missing or unusable record invokes
-the bounded native repair above. There is no manual routing-value recovery command.
-
-### Device resynchronization
-
-A `434/-22421` GrandSlam response is a repair request, not an HTTP transport
-failure. The adapter accepts its Server Intermediate Message only from the fixed
-GrandSlam response body or HTTP header. The local helper calls Mavericks AOSKit's
-named synchronization wrapper with the existing `-2` device state and returns only
-the generated MID and Server Response Message. The client then performs a fresh,
-unauthenticated URL-bag lookup and sends those values plus the existing routing
-number to the returned `midSyncMachine` URL. Both URLs must be HTTPS on exactly
-`gsa.apple.com`, port 443, below `/grandslam/`; redirects are refused.
-
-After an `ec 0` response, any returned routing value is validated and stored under
-the same machine-wide lock. The failed `init` or `complete` operation is retried once
-with a newly generated OTP. If the OTP has not advanced, the adapter waits until
-the next 30-second boundary and checks again, rather than immediately resending
-the same value. This bound prevents a repeated server challenge from
-creating a request loop. The original password, SRP proof, verification code and
-service tokens never cross the helper IPC or enter the synchronization request.
+- **It provisions this Mac as itself.** Apple's own state under
+  `/Users/Shared/adi` is created or completed, a persistent change to the machine
+  that an uninstall leaves alone. Switching identity invalidates tokens issued
+  under the old one, so the iCloud pane asks for the password once more.
+- **Tried live on 10.9.5 on 2026-11-26: accepted.** The generator did its part
+  from the first: it provisioned the Mac with one exchange against
+  `gsa.apple.com`, and then minted headers on demand. The first requests
+  carrying them were answered with a bare HTTP 503, which looked like Apple's
+  edge refusing the pairing, and was for most of a day written down as that.
+  It was this adapter: the set stored the machine's client identity under a key
+  the GrandSlam envelope did not read, so the envelope described another device
+  (*When sign-in fails at its first step*, under *Anisette V3*). With that put
+  right, the pairing probe's first step was answered with a challenge, three
+  times in three, in the same minutes as a `v3:` identity was refused. The same
+  afternoon the preference pane's own helper got through device data and password
+  to Apple's request for a code on this generator, and at 23:01 a sign-in in the pane
+  completed on it (*Install and try a sign-in*). Upstream's own notes mark their
+  November login work "live acceptance remains to be tested". The sources are one line apart, and the pairing probe (under
+  Validation) says in one request whether Apple is answering a source.
+- **The engine's own injection has no local source.** Where the Objective-C
+  module cannot arm in a process making keychain or escrow requests, the engine
+  adds the device headers itself, from the provider line -- and it understands
+  `exec:`, `v3:` and a URL, not `local:`. The keychain client on the 10.9.5
+  machine is `syncdefaultsd`, a Foundation process in which the module does
+  arm, so Keychain should ride the module as under upstream's `local:`-only
+  build; a process where it cannot would send without device headers. Read
+  from the code, not yet seen live.
+- **A missing helper is an error, not a fallback.** With `local:` configured and
+  the service absent, sign-in stops with "The local Anisette service is
+  unavailable". No other source is consulted.
+- Install or update, then reboot: the job is registered at boot, and the processes
+  that load the GSA module must be restarted to pick up the new build.
 
 ## Install and try a sign-in
 
@@ -292,47 +502,92 @@ sudo ./install-macos.sh install
 
 GrandSlam authentication is enabled automatically; no enable flag is needed. An
 update preserves the existing Security.framework patch, its original backup, and
-configuration files. It installs the local generator and refreshes the existing
-bootstrap to register the feature job immediately. Quit and reopen iCloud
-clients after updating, or log out and back in, to replace already loaded modules.
-A source build alone does not update installed libraries.
+configuration files. A source build alone does not update installed libraries.
 
 Quit and reopen System Preferences, then sign in normally. A reboot is not required
 for the preference pane's own requests. If an account helper owns the request, that
 process must also be restarted to load updated code.
 
-Existing provisioned machines are repaired automatically when Apple requests it.
-A `434/-22421` response uses the synchronization flow; no manual deletion is
-necessary. Missing AquaTransport metadata uses the separate bounded provisioning
-repair. Neither path clears account credentials or indiscriminately deletes
-Apple's shared ADI directory.
+For trusted-device two-factor authentication, the first attempt returns an
+authentication failure to the old client, and Apple sends the code: a sign-in request
+appears on the trusted devices, and Allow shows it. Read the code, then retry within
+five minutes using **your password immediately followed by the six-digit code** -- or
+the code by itself, where the pane asks for it that way. Entering the password on its
+own again asks Apple for the code again. The password and the code can be given
+together the first time as well: read the code off the device before you start and
+type the password with it on the end. That needs no second attempt, and it is how the
+sign-in of 2026-11-26 was made. Keep the same preference pane/helper process running
+between attempts. Pending state stores the
+verification session and the length of the password that was submitted, never the
+password, and is bounded to 32 accounts per process. Expired entries are removed on the
+next attempt. The log's credentials line records the length of the password field, and
+never any of it.
 
-For trusted-device two-factor authentication, approve the prompt, then retry within
-five minutes using **your password immediately followed by the six-digit code**.
-Keep the same preference-pane/helper process running between attempts. The first
-password exchange must verify the server proof before a pending verification
-session is retained. Code validation must return explicit success and a usable
-`X-Apple-PE-Token`; its decoded token completes sign-in without another password
-exchange. A code alone also works unless the original password was itself six
-digits long; in that ambiguous case always append the code to the password.
+An accepted code completes the sign-in. Apple returns a password-equivalent token
+with the code it accepts, in the `X-Apple-PE-Token` reply header, and the token the
+sign-in then presents to iCloud in place of the password is that one, put into the
+session of the exchange that asked for the code. Until 2026-11-26 the adapter instead
+ran the password exchange a second time and took the token from that reply's session,
+as AltSign does. On the 10.9.5 machine that day Apple accepted the code and answered
+the repeated exchange `409` again; the adapter went on to submit the same code a
+second time, which spent it (`-21669`), and the pane asked again. A reply that
+carries no token still falls back to repeating the exchange (`2fa-code-only` covers
+the first, `2fa-rerun` the fallback).
 
-Pending state contains the verified session, device identity, original password
-length and expiry. It contains no plaintext password or password fingerprint,
-is bounded to 32 accounts per process, and expires after five minutes. Expired
-entries are removed on the next attempt or process exit; memory erasure is not
-guaranteed. A changed identity requires restarting sign-in. SMS delivery, account
-recovery and terms acceptance are not implemented; an authenticated 409 can retain
-the session for a manually obtained verification code if notification fails.
+**Password and code together.** Nothing has to be asked for first. When a request
+carries six digits on the end of the password and the process making it has no
+challenge pending, the adapter asks with the digits off and checks them against the
+challenge that comes back, as on any retry. The case is not rare on this pane: the
+password typed into it is saved, and iMessage's and FaceTime's agent reads it too. On
+the 10.9.5 machine on 2026-11-26 that agent held the challenge and Apple accepted the
+code there -- it signed iMessage in -- and forty-one seconds later the pane's helper
+was sent the same string with no challenge to match it to, and Apple refused the whole
+of it as the password (`-22406`). Every such refusal counts at Apple as a wrong
+password. At 23:01 that day the pane's own helper was given the sixteen characters
+this way, and the sign-in completed. A password whose own last six characters are digits is still taken as typed,
+at the cost of one refused attempt with the shorter string (`2fa-one-step` covers the
+first, `password-tail-digits` the second).
+
+Three things about that exchange are worth knowing. Each comes from upstream's
+work of 2026-11, and each has an offline case of its own (`tools/gsaprobe.m`, the
+`2fa-*` modes):
+
+- Apple has answered `hsc 409` — verification wanted — with no `au` hint at all,
+  with the hint only inside the encrypted session, and under a new name. All three
+  now take this flow. A hint naming `secondaryAuth`, which is SMS, is still refused
+  as unsupported, since there is no adapter for delivering a code that way.
+- The code check, `/grandslam/GsService2/validate`, has answered with its `ec` at
+  the top level rather than in the usual envelope. It is read in either place, and
+  a code counts as accepted only on a numeric `ec` of 0. A refusal there used to
+  pass as approval, and the retry then ran a second password exchange on a code
+  that had never been accepted.
+- The code is not asked for. Apple sends it with an answer that names no method:
+  on 2026-11-26 codes were accepted ten and twenty-two seconds after such answers,
+  while a request for the prompt, `/auth/verify/trusteddevice`, was answered
+  `HTTP 403` every time, with this adapter's headers and with AltSign's. SideStore's
+  SideSign stopped asking too, on 2026-10-13. The prompt is requested only where
+  Apple names the trusted-device method, as it did in September. A code produced by
+  hand still completes the sign-in. On iOS 18 and 26 a trusted device offers **Get
+  Verification Code** only while it is offline -- Airplane Mode, and Wi-Fi off as
+  well: Settings, the account, *Sign-In & Security*, the pop-up *Account Details
+  Unavailable*.
 
 The old pane may show a generic authentication failure rather than instructions for
-entering the code. Earlier builds completed a two-attempt flow with a real account. SMS-only
+entering the code. The user completed the two-attempt flow with a real account in
+September. On 2026-11-26, on the 10.9.5 machine, an accepted code signed iMessage in by
+the token (`iMessage delegate authentication completed (HTTP 200, status 0, delegate
+status 0)`), and at 23:01 the pane's own helper completed an iCloud sign-in the same
+way, from the password and the code typed together: `verification validation
+response (HTTP 200, ec 0)`, `verification token issued`, `verification accepted;
+signing in with Apple's password-equivalent token`, then `account refresh completed
+(HTTP 200)`. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
-Game Center and full Find My support are not implemented. The experimental iMessage profile
-adapter is described below; native iMessage sign-in is user-confirmed on Mavericks. This module does not
+and Game Center are not implemented. The experimental iMessage profile
+adapter is described below; its server acceptance is not yet verified. This module does not
 guarantee that iCloud services work after account creation.
 
-On Mavericks, a narrow Find My compatibility fix adds a missing top-level
-`"positionType": ""` to JSON POST bodies at
+On Mavericks, a narrow Find My compatibility fix (from upstream) adds a missing
+top-level `"positionType": ""` to JSON POST bodies at
 `https://p<number>-fmip.icloud.com/fmipservice/findme/<dsprsid>/<hardware-udid>/currentLocation`
 (and the unnumbered `fmip.icloud.com` host). It preserves existing values, the
 server shard, authentication, and all other JSON fields. It skips streamed,
@@ -340,9 +595,10 @@ compressed, malformed, and over-1-MiB bodies. The native CFURLRequest transport
 still sends the request; this does not implement Find My registration or other
 service operations. Location data is not logged. Like authentication endpoints,
 Find My hosts bypass generic redirect/header rules while the adapter is enabled.
-This fix shares `disable-icloud-gsa`. Run `bash tools/findmy-selftest.sh` on Mavericks
-for its offline 32-bit/64-bit request regression tests. Live location delivery still
-needs verification with a real device/account.
+This fix shares `disable-icloud-gsa`. Run `bash tools/findmy-selftest.sh` on
+Mavericks for its offline request regression tests. Live location delivery still
+needs verification with a real device/account; full Find My support is not
+implemented.
 
 To turn the capability off, add `disable-icloud-gsa` to
 `/usr/share/aquatransport/config/flags.txt`. Remove that line to turn it back on. An already running
@@ -369,15 +625,14 @@ The module intercepts HTTPS requests on `setup.icloud.com`, port 443, for:
 * `/setup/login_or_create_account`
 * `/setup/iosbuddy/loginDelegates`
 * `/setup/authenticate/<Apple ID>` (including the literal `$APPLE_ID$` placeholder)
-* `/setup/get_account_settings` with Basic authentication containing a numeric DSID and a nonempty MME token
+* `/setup/get_account_settings` with a numeric DSID and a modern `E`- or `U`-prefixed MME token
 
 It recognizes preemptive Basic authentication or a plist body containing
 `username`/`apple-id` and `password`. It lowercases the account identifier before
 the GrandSlam handshake and token exchange; password spelling is preserved.
 Existing-account settings requests instead retain their DSID/token, method and
 body and receive fresh anisette headers. They never enter the password or 2FA
-flow. Token values are opaque: their first character does not determine whether
-device authentication is needed. Email/password settings requests retain native behavior.
+flow. Older tokens and password-based settings requests retain native behavior.
 Requests with streamed bodies, unsupported
 credential formats, or different endpoints retain their native behavior. There is
 no generic browser-login or `NSURLSession` support claim. With GSA enabled, general
@@ -397,6 +652,20 @@ client after device headers are removed; cross-origin redirects also lose any
 explicit Authorization header. A redirected DAV request must pass the host check
 again. General redirect/header rules cannot modify these reserved service hosts.
 The same `disable-icloud-gsa` flag disables the sign-in, DAV and Mail adapters.
+
+**iCloud Keychain** (2026-09-13): the keychain parameter and escrow services
+(`p<digits>-keyvalueservice.icloud.com`, `p<digits>-escrowproxy.icloud.com`)
+carry the same token authentication and are covered by the same streaming
+adapter and host reservation. Their client, `syncdefaultsd`, builds requests
+inside NSURLSession, which none of the request- or message-construction hooks
+observe; the Foundation module is therefore loaded from the TLS peer-name hook
+(the entry Mail uses), arming the adapter in time for the KVS client's retries.
+Daemons where the module cannot arm get device headers injected directly by
+the C rewriter from a loopback-only fetch of the configured anisette provider,
+cached one minute. With this, `syncdefaultsd`'s KVS exchanges return HTTP 200
+and the pane completes iCloud Keychain enablement; the SOS circle itself then
+follows its native approval flow. Find My Mac remains unavailable without a
+Recovery HD, and quota display (`p<digits>-quota.icloud.com`) has no adapter.
 
 ### iMessage profile authentication
 
@@ -423,12 +692,7 @@ only `com.apple.madrid`. It supplies the username/PET, device headers and
 `service-data` must contain nonempty `profile-id` and `auth-token` strings. Only then
 are those server-issued credentials translated into the profile response expected
 by Mavericks. Failed or malformed replies never become successful activation.
-There is no fallback request to `authenticateUser`. One successful IDS delegate
-response is retained for up to 60 seconds to satisfy an identical repeated request
-without reusing a consumed verification code. Matching uses a per-record random
-HMAC key over the request body, URL and client headers. Changed input or expiry
-invalidates the entry. Passwords and codes are not retained in that cache; an idle
-process can retain an expired response until the next lookup or process exit.
+There is no fallback request to `authenticateUser`, and no token caching/replay.
 The existing `disable-icloud-gsa` flag also disables this adapter.
 
 The PET-to-delegate exchange is independently implemented with reference to
@@ -448,10 +712,19 @@ not establish that interception failed: the HTTP request runs in the XPC agent.
 Use ASL's `Seq` substring operator to find AquaTransport diagnostics; `C` alone is
 case-folded equality, not a contains query.
 
+On 2026-09-13, with self-hosted AKDevice-paired anisette, a real user sign-in
+completed the full chain on 10.9.5: GrandSlam SRP challenge accepted, adapter 9's
+profile exchange, and adapter 10's Madrid delegate login at
+`/setup/iosbuddy/loginDelegates` returning HTTP 200 with overall status 0 and
+delegate status 0. The user signed into Messages — the first confirmed Apple-side
+acceptance of the PET-to-delegate exchange. Message sending and FaceTime
+activation remain separately unverified.
+
 Adapter 10 passes 98 offline checks, including compressed iMessage sign-in, 2FA,
 failed delegates, missing credentials, malformed statuses, rejected redirects,
 invalid server proofs, decompression limits, endpoint scope and the off flag,
-alongside the existing iCloud/DAV/Mail checks. The user confirmed native iMessage sign-in succeeds with adapter 10 on 2026-09-09.
+alongside the existing iCloud/DAV/Mail checks. Apple issuing the Madrid delegate
+with this PET and successful native iMessage activation still require a user test.
 The offline 2FA tests run in one process; they do not verify preservation of pending
 verification state across an XPC agent restart. FaceTime uses the same profile
 endpoint, but its use of this delegate and repeated authentication are unverified.
@@ -472,7 +745,7 @@ The corresponding Mail client fields are `machineID`, `oneTimePassword`, and
 `clientInfo` in the newer
 [MCSaslClient header](https://github.com/w0lfschild/macOS_headers/blob/master/macOS/PrivateFrameworks/MailCore/3445.104.11/MCSaslClient.h)
 and [MFAccount interface](https://github.com/w0lfschild/macOS_headers/blob/master/macOS/PrivateFrameworks/Mail/3445.104.11/MFAccount.h).
-The adapter maps these to the local generator's `X-Apple-I-MD-M`, `X-Apple-I-MD`,
+The adapter maps these to the existing provider's `X-Apple-I-MD-M`, `X-Apple-I-MD`,
 and `X-MMe-Client-Info` values, using its existing client identity if the optional
 client-info field is absent. This mapping follows the client field order; the
 Sequoia caller's client-info implementation was not recovered. The user confirmed
@@ -483,22 +756,12 @@ The C engine loads the adapter during `SSLSetPeerDomainName`, before taking a TL
 context lock, only for exact iCloud IMAP/SMTP hosts and with legacy MailCore already
 present. The adapter replaces `_MCAppleTokenSaslClient initialResponse` in memory.
 It preserves native credential retrieval and appends device fields only to an
-existing three-field response with a nonempty token and an iCloud account
-hostname. Like the settings adapter, adapter 12 treats tokens as opaque and does
-not use an `E` prefix to decide whether device fields are needed. IMAP and SMTP
-hosts under `mail.me.com` and `mail.icloud.com`, including their `p<digits>-` shards,
-are recognized. Other accounts and responses outside the three-field format retain
+existing three-field response with an `E`- or `U`-prefixed token and an iCloud account
+hostname. IMAP and SMTP hosts under `mail.me.com` and `mail.icloud.com`, including
+their `p<digits>-` shards, are recognized. Other accounts and older tokens retain
 native behavior. Device data is cached for 60 seconds per Mail process; credentials
 are not cached by this adapter. Missing device data fails the local authentication
 attempt. Neither Mail.app nor the system SASL plugins are replaced.
-
-Adapter 12 (2026-09-21) removes the same token-prefix assumption from Mail that
-adapter 11 removed from account settings. The native MailCore regression with a
-non-`E` token fails before the fix and passes afterwards. All 111 offline checks
-pass, including IMAP/SMTP host selection, unchanged account/token fields, device
-data caching, local generation failure, and initial/runtime disabling with opaque tokens.
-The installed Mail process logged that it added device fields; live mail retrieval
-and sending still require user confirmation for this build.
 
 All Sequoia archives, extracted resources, analysis files and archive-reader tools
 were confined to a hidden, mode-0700 `.noindex` temporary directory with a
@@ -551,7 +814,7 @@ values, server response text, or messages. Both traces exited automatically.
 No account was signed out and no system code was changed for this investigation.
 
 A concrete untested difference remains in token issuance: `aq_apple_request`
-supplies the adapter's client identity to the authenticate exchange.
+supplies the adapter/provider client identity to the authenticate exchange.
 The original native client identity is restored only on the later settings
 request. Whether preserving the native identity during token issuance changes
 the credential Apple issues remains unverified. The old working token was not
@@ -583,99 +846,43 @@ credential tracing to diagnose sign-in: AOSKit has its own logging behavior.
 
 ## Validation
 
-`tools/gsa-selftest.sh` uses a catch-all mock URL protocol and substitutes synthetic
-OTP values at the local provider boundary. No Apple request, real credentials, or
-IP networking is needed; IPC fixtures create temporary Unix sockets. The hardware UUID is read locally but never printed or
-sent over the network. An obsolete server configuration is deliberately present:
-any attempt to use it fails the tests. Coverage includes independent Python SRP
+`tools/gsa-selftest.sh` uses a catch-all mock URL protocol: no Apple request, real
+credentials, or network access is needed. Coverage includes independent Python SRP
 server vectors for `s2k`, `s2k_fo`, leading-zero salts, short public keys and short
 shared secrets; invalid public values and
 iteration counts; short/incorrect/repeated proofs; full token conversion; malformed
-responses; missing anisette; refused redirects; device resynchronization during
-both `init` and `complete`; body- and header-carried server messages; fresh OTP
-generation; optional routing updates; one-retry enforcement; malformed/missing
-messages; native and Apple-side sync failures; trusted-device retry (including
-password-only resends, passwords ending in six or more digits, numeric-only
-passwords, Unicode, changed passwords outside the code format, correction after a
-rejected code, and wrong passwords of the expected length that cannot bypass SRP);
-cancellation;
+responses; missing anisette; refused redirects; trusted-device retry; cancellation;
 endpoint scoping; conflicting rewrite rules; and
 the real AOSKit CFURLConnection path, including Basic authentication with a
 mixed-case account and password. Saved-token refresh tests cover native AOSKit,
-both `E`-prefixed and other opaque tokens, missing anisette, redirects, and exclusion
-of email/password and empty credentials. DAV tests cover the native
+missing anisette, redirects and exclusion of older tokens. DAV tests cover the native
 request path, device headers, unchanged methods and bodies, streamed response
 chunks and DAV headers, authentication-challenge replies, cancellation, redirect
-header removal, host scoping, native discovery usernames and legacy ports, local generation failure and
+header removal, host scoping, native discovery usernames and legacy ports, provider failure and
 the disable flag. Mail tests load Mavericks' actual MailCore with a synthetic
 account and exercise the C TLS trigger, six-field response, challenge replies,
-IMAP/SMTP host scoping, device cache, local generation failure, opaque token preservation,
+IMAP/SMTP host scoping, device cache, provider failure, legacy-token preservation,
 and both initial and runtime disabling. MailCore is available only to x86_64
 non-GC processes on this machine. The remaining suite runs both Intel architectures plus a
-64-bit GC-enabled host. `tools/gsa-diagnose.m` tests the shared native backend
-without reading credentials or starting Apple sign-in. Its `--selftest` mode
-checks field mapping and the provisioning state machine with synthetic native
-routines and HTTP replies: the full 64-bit identifier, routing persistence,
-failed-session cleanup, cooldown, invalid Apple responses and request bounds.
-`tools/anisette-service-test.m` runs those provisioning cases and the native
-synchronization/output-bound/routing cases through the helper's actual transport.
-`tools/anisette-ipc-test.m` checks all three local operations, socket framing, error replies,
-oversized/truncated data, cancellation, an unavailable service and rejection of
-an unexpected server identity on both Intel
-architectures and in a GC host.
-
-With no arguments, `build/gsa-diagnose` checks native provisioning and generates
-local proofs without opening metadata, provisioning, or making HTTP requests. `build/anisette-ipc-test --live` exercises the
-production client and installed helper; only use it after checking native state
-to keep the check offline. Both withhold all device-header values. Mock tests
-alone do not establish usable provisioning or successful Apple sign-in; the live
-results above are recorded separately.
-
-## Safari iCloud sync on Mavericks
-
-The Safari adapter bridges Safari 7's open tabs, bookmarks, Reading List and
-browsing history to their current CloudKit containers. Remote tabs become native
-`CloudTabDevice` objects. Local tabs are taken from Safari's existing filtered
-device dictionary, after its private-browsing checks, and encrypted before upload.
-Bookmarks and Reading List use Safari's bookmark file lock and reload path.
-History changes use Safari's native Global History batch operations.
-
-Refresh is driven by Safari's existing tab-save/show, bookmark save/reload,
-Global History change, legacy sync, key-value-store and account-change callbacks.
-The per-user worker blocks on Darwin notifications. Successful tab cache changes
-are forwarded to Safari's existing `SyncedCloudTabDevicesDidChangeNotification`.
-There is no independent refresh timer or polling schedule.
-
-The worker's job description lives at
-`/usr/share/aquatransport/cloudtabs/org.aquatransport.cloudtabs.plist`.
-Safari and the iCloud preference pane invoke the existing `aquatransport-bootstrap`
-coordinator with `--user-features` in their GUI user session. It registers the
-worker only on Mavericks, with trusted installed code, private credentials and
-keys, and a matching active iCloud Safari account. The existing bootstrap remains
-the sole global AquaTransport launchd entry.
-
-The worker obtains CloudKit service credentials using the existing local
-Anisette/GSA implementation and a modern service-client profile. Enabling Safari
-in iCloud preferences starts authorization in a separate helper; input sheets are
-attached to the existing iCloud pane. Cancellation or failure leaves Safari
-disabled. Disabling and re-enabling Safari performs fresh authorization. CKKS and
-PCS signatures, authenticated encryption, key-wrap checksums, and account
-identities are verified before cloud data reaches Safari.
-Temporary recovery identities and broad wrapping keys are removed after setup;
-only scoped service credentials, Safari service keys, merge state and UI caches remain
-under `~/Library/Application Support/AquaTransport/CloudTabs` (directory mode 0700,
-files 0600). Credentials are refreshed only when a native-triggered sync receives
-an authentication failure.
-
-The worker uses Mavericks' system `/usr/bin/python2.7` with its standard
-library only. Cryptography uses the bundled native OpenSSL bridge; plist
-serialization uses Foundation. HTTP requests use the existing native
-AquaTransport/CFNetwork transport. No Python packages need to be installed.
-Safari must be enabled for the current account in iCloud preferences. Existing
-signed-in installations initialize by disabling and re-enabling Safari; observing
-an already-enabled account does not initialize or migrate it. Adding
-`disable-safari-cloudtabs` to the existing `config/flags.txt` disables this
-adapter. The Safari, bookmark, History, cryptographic, transport, bootstrap and
-notification tests cover both Intel architectures where the corresponding Apple
-framework is available, account isolation, merge conflicts, private storage,
-native model application, encrypted record formats and event delivery.
+64-bit GC-enabled host. The local Anisette generator has its own offline tests,
+run by the same script on both architectures: `tools/anisette-state-test.c` for the
+machine-wide record and the descriptor a worker inherits; `tools/anisette-service-test.m`
+for the helper's provisioning and repair exchange, against synthetic Apple replies and
+with Apple's routines replaced; `tools/anisette-ipc-test.m` for the socket client's
+framing and error cases, against a fixture server; and `tools/anisette-local-test.m` for
+the provider selection: with `local:` configured and nothing listening, the adapter fails
+closed on the service's error and makes no request -- and then, with the generator
+replaced by the fixture, takes the set the provider itself returns and checks
+that each request builder says what the generator said. `tools/gsaprobe.m` has a
+`local` mode for the whole sign-in exchange with that set, through the module:
+on the wire, the body names the client identity once and the envelope carries
+that same one, with the generator's user agent. `tools/gsa-diagnose.m` runs the
+configured provider for real, without reading credentials or starting Apple sign-in. Run
+it by hand on the machine concerned: with `local:` it makes the provisioning exchange if
+the machine is not provisioned yet, and with a server it sends the device identifier as
+described above. `tools/gsa-pairing-probe.m` goes one step further and still without a
+password: it sends the first step of the sign-in exchange -- the account name and the
+device headers -- through the adapter's own exchange code, and prints whether Apple
+answered with a challenge, refused it with a status, or dropped it at the edge with a
+bare 503; the HTTP status, hsc and ec are in the system log. Build it like `gsa-diagnose`.
+Whether Apple then completes a sign-in remains a separate, live validation.

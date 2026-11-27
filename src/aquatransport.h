@@ -4,15 +4,48 @@
 #include <Security/SecureTransport.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <Availability.h>
 #include <openssl/ssl.h>
+
+// The 10.8 additions to Secure Transport that the 10.6 SDK predates: SSLCreateContext and
+// the types it takes. Declared here, exactly as the 10.8+ SDKs declare them, when building
+// against an SDK that does not know them (__MAC_10_8 first appears in the 10.8 SDK's
+// Availability.h), so the library builds on a 10.6 machine with nothing but its own SDK.
+// Compile-time only: the hooks resolve every Secure Transport entry point with dlsym at
+// first call and never link against these, and on a 10.6 the hook for SSLCreateContext has
+// no call sites to rebind, which is the `absent` row in the hook table.
+#if !defined(__MAC_10_8)
+typedef enum {
+    kSSLClientSide = 0,
+    kSSLServerSide
+} SSLProtocolSide;
+typedef enum {
+    kSSLStreamType = 0,
+    kSSLDataType
+} SSLConnectionType;
+extern SSLContextRef SSLCreateContext(CFAllocatorRef alloc, SSLProtocolSide protocolSide,
+                                      SSLConnectionType connectionType);
+// The third session option, which that header stops short of: the two before it are there,
+// and this one continues their enum (0, 1, 2 -- as the 10.8 SDK declares it). Its value only
+// ever leaves this library inside an SSLSetSessionOption call forwarded to Secure Transport.
+#define kSSLSessionOptionBreakOnClientAuth 2
+#endif
 
 // Secure Transport result codes
 #ifndef errSSLWouldBlock
 #define errSSLWouldBlock  -9803
 #endif
+// paramErr, which Secure Transport answers for a bad argument. Named the way the codes below
+// are because it is not reachable through the headers this library compiles against: it lives
+// in MacTypes, which nothing here imports.
+#define ST_Param          -50
 #define ST_ClosedGraceful -9805
 #define ST_ClosedAbort    -9806
 #define ST_PeerAuth       -9841
+// errSSLClientCertRequested: the server has asked for a client certificate and the caller
+// asked to be paused here -- kSSLSessionOptionBreakOnCertRequested, the on-demand identity
+// flow. errSSLServerAuthCompleted (-9841, ST_PeerAuth above) is the other break.
+#define ST_CertReq        -9842
 #define ST_Internal       -9838
 #define ST_Handshake       1
 #define ST_Connected       2
@@ -40,7 +73,12 @@ typedef enum {
     SH_STATE_NEW = 0,
     SH_STATE_HANDSHAKING = 1,
     SH_STATE_CONNECTED = 2,
-    SH_STATE_PEER_AUTH = 3       // waiting for the application's trust decision
+    SH_STATE_PEER_AUTH = 3,      // waiting for the application's trust decision
+    // Paused at the client-certificate break, kSSLSessionOptionBreakOnCertRequested: the
+    // server has asked for a certificate and the caller supplies one only now. The peer's
+    // chain has arrived by this point, as it has at PEER_AUTH -- the server's Certificate
+    // message precedes its CertificateRequest.
+    SH_STATE_CERT_REQUEST = 4
 } ShadowState;
 
 typedef struct {
@@ -56,6 +94,7 @@ typedef struct {
     unsigned char    peerID[256];
     size_t           peerIDLen;
     int              inited;
+    // Which point of the handshake the shadow is at; see ShadowState above.
     ShadowState      state;
     // Native-context compatibility answers, frozen at handshake start. These never
     // configure OpenSSL; its wire protocol/ciphers remain independent.
@@ -64,11 +103,25 @@ typedef struct {
     OSStatus         reportedProtocolStatus;
     OSStatus         reportedCipherStatus;
     int              breakAuth;
+    // kSSLSessionOptionBreakOnCertRequested: the caller wants errSSLClientCertRequested
+    // when the server asks for a client certificate, whatever identity is installed, and
+    // supplies its certificate only then -- SSLSetCertificate's contract allows exactly
+    // that call between the pause and the resume. The pause itself is selected in
+    // my_SSLHandshake; the suspension is client_cert_cb returning -1.
+    int              breakCertReq;
     // SSLSetEnableCertVerify(false): the caller has taken the certificate check on itself --
     // what curl's -k does on this platform. Secure Transport then completes the handshake
     // whatever the chain says, and leaves the caller to fetch it with SSLCopyPeerTrust.
     int              noCertVerify;
     int              approved;
+    // The cert-request pause's counterpart of approved: set when the caller has resumed
+    // from it, so client_cert_cb does not suspend into the same pause twice.
+    int              certApproved;
+    // Set the first time client_cert_cb runs in this handshake. The callback fires exactly
+    // when the server's CertificateRequest arrives, which is the fact the client-certificate
+    // state query is asking about -- an identity being installed says nothing about whether
+    // the server asked. Reset with the handshake, like approved.
+    int              certReqSeen;
     int              clientBypass;
     // Server support is enabled separately from the existing client path.
     int              serverSide;
@@ -107,7 +160,7 @@ Shadow    *sh_create(SSLContextRef c);
 void       sh_release(Shadow *s);
 void       sh_free(SSLContextRef c);
 int        ossl_init(Shadow *s);
-void       capture_identity(Shadow *s, CFArrayRef certRefs);
+void       capture_identity(Shadow *s, CFArrayRef certRefs, int mayBypass);
 int        sh_build_trust(Shadow *s, SecTrustRef *trust);
 CFArrayRef sh_cert_array(Shadow *s);
 void       sh_unblock_write(Shadow *s);

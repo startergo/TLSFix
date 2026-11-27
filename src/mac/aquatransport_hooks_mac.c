@@ -39,7 +39,6 @@
 #include "aquatransport_gsa_mail.h"
 #include "aquatransport_symbols.h"
 #include "aquatransport_maps.h"
-void tf_safari_install(void);
 #include <openssl/err.h>
 #include <pthread.h>
 #include <string.h>
@@ -117,6 +116,7 @@ static OSStatus (*o_SSLGetNegotiatedCipher)(SSLContextRef, SSLCipherSuite *);
 static OSStatus (*o_SSLGetBufferedReadSize)(SSLContextRef, size_t *);
 static OSStatus (*o_SSLCopyPeerTrust)(SSLContextRef, SecTrustRef *);
 static OSStatus (*o_SSLCopyPeerCertificates)(SSLContextRef, CFArrayRef *);
+static OSStatus (*o_SSLGetClientCertificateState)(SSLContextRef, SSLClientCertificateState *);
 static OSStatus (*o_SSLSetCertificate)(SSLContextRef, CFArrayRef);
 // Not an entry point: filled by rebind_cf_finalizers, not dlsym. See kFinalizers.
 static void (*o_SSLContextFinalize)(CFTypeRef);
@@ -172,16 +172,43 @@ static OSStatus my_SSLSetConnection(SSLContextRef c, SSLConnectionRef conn) {
 }
 
 static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_t len) {
-    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, len);
-    tf_gsa_prepare_mail(name, len);
-    OSStatus r = o_SSLSetPeerDomainName(c, name, len);
+    // A single trailing dot is the DNS root label, and callers do send it: iTunes sets
+    // "s.mzstatic.com." as the peer domain name. TLS wants the name without it -- an SNI
+    // carrying the dot makes CDNs answer with their default site's certificate
+    // (s.mzstatic.com serves CN=images.apple.com for the dotted name), and the handshake
+    // then dies in hostname validation against a cert that was never meant for this host.
+    // Strip exactly one dot ("a.b.." stays malformed rather than being silently
+    // reinterpreted), and strip it in every path, this one included: Secure Transport
+    // keeps its own copy of the name for the SNI it sends and the hostname match it runs,
+    // so a context that runs on the stock stack -- engine bypassed, server side, an init
+    // failure, or the engine dynamically gated off below -- must not go on carrying the
+    // dotted one. (The deny-listed processes never install hooks at all and are untouched
+    // by any of this.) The dotless name is also what SNI, the trust policy, the session
+    // cache and the debug log all key on.
+    size_t nlen = (name && len > 1 && name[len-1] == '.') ? len - 1 : len;
+    if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerDomainName(c, name, nlen);
+    // Mail's authenticator keys on the peer name as set; the dotless form still names the
+    // same host, and is what its matcher expects (see tf_gsa_prepare_mail).
+    tf_gsa_prepare_mail(name, nlen);
+    tf_gsa_prepare_keychain(name, nlen);
+    OSStatus r = o_SSLSetPeerDomainName(c, name, nlen);
+    // Recorded only when the stock call accepted it. A set the stock stack refused must leave
+    // the shadow as it was: re-initialising on a refused set would discard a handshake already
+    // in progress on a socket that has consumed its bytes, and the retry could only misfire.
+    if (r != noErr) return r;
     Shadow *s = sh_create(c);
     if (s) {
-        if (name && len) {
-            size_t n = len < 255 ? len : 255; memcpy(s->host, name, n); s->host[n] = 0;
+        if (name && nlen) {
+            size_t n = nlen < 255 ? nlen : 255; memcpy(s->host, name, n); s->host[n] = 0;
             // late SNI -> re-init; the cached trust goes too, since a new handshake means a
             // new peer chain, and so does everything the write side was holding for the old one.
             if (s->inited && s->state != SH_STATE_FAILED) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = SH_STATE_NEW;
+                 // the app approved the *previous* handshake's peer, not the one this handshake
+                 // is about to present -- without this, a context re-targeted after an approved
+                 // connection would skip its auth break entirely
+                 s->approved = 0;
+                 s->certApproved = 0;         // per-handshake, like approved
+                 s->certReqSeen = 0;
                  sh_reset_write(s);
                  if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }
         }
@@ -196,6 +223,7 @@ static OSStatus my_SSLSetPeerDomainName(SSLContextRef c, const char *name, size_
 static OSStatus my_SSLSetPeerID(SSLContextRef c, const void *peerID, size_t len) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetPeerID(c, peerID, len);
     OSStatus r = o_SSLSetPeerID(c, peerID, len);
+    if (r != noErr) return r;                     // see my_SSLSetPeerDomainName
     Shadow *s = sh_create(c);
     if (s) {
         // A replacement id names a different endpoint, so an id that does not fit leaves none
@@ -207,6 +235,10 @@ static OSStatus my_SSLSetPeerID(SSLContextRef c, const void *peerID, size_t len)
     return r;
 }
 
+// kSSLSessionOptionBreakOnServerAuth -- the pause CFNetwork sets on nearly every connection --
+// and kSSLSessionOptionBreakOnCertRequested, the on-demand identity flow where the caller
+// supplies its certificate only after the server asks. Both breaks are honoured by the engine:
+// see the pause selection in my_SSLHandshake and client_cert_cb in the engine.
 static OSStatus my_SSLSetClientSideAuthenticate(SSLContextRef c, SSLAuthenticate auth) {
     if(!tf_on() || ensure_ready()!=1) return o_SSLSetClientSideAuthenticate(c,auth);
     OSStatus result=o_SSLSetClientSideAuthenticate(c,auth);
@@ -216,9 +248,14 @@ static OSStatus my_SSLSetClientSideAuthenticate(SSLContextRef c, SSLAuthenticate
     return result;
 }
 static OSStatus my_SSLSetSessionOption(SSLContextRef c, SSLSessionOption opt, Boolean val) {
-    if (tf_on() && ensure_ready() == 1 && opt == kSSLSessionOptionBreakOnServerAuth) {
+    if (tf_on() && ensure_ready() == 1 &&
+        (opt == kSSLSessionOptionBreakOnServerAuth || opt == kSSLSessionOptionBreakOnCertRequested)) {
         Shadow *s = sh_create(c);
-        if (s) { s->breakAuth = val ? 1 : 0; sh_release(s); }
+        if (s) {
+            if (opt == kSSLSessionOptionBreakOnServerAuth)   s->breakAuth = val ? 1 : 0;
+            else                                             s->breakCertReq = val ? 1 : 0;
+            sh_release(s);
+        }
     }
     OSStatus result=o_SSLSetSessionOption(c,opt,val);
     if(result==noErr && tf_on() && ensure_ready()==1 && opt==kSSLSessionOptionBreakOnClientAuth) {
@@ -305,6 +342,7 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
         s->state = SH_STATE_HANDSHAKING;
     }
     if (s->state == SH_STATE_PEER_AUTH) s->approved = 1;   // app approved the server after the auth break, let it proceed
+    if (s->state == SH_STATE_CERT_REQUEST) s->certApproved = 1;   // app answered the cert request; our cert may go out now
     ERR_clear_error();                    // see the note above my_SSLRead
     int ret = SSL_do_handshake(s->ssl);
     if (ret == 1) {
@@ -321,8 +359,16 @@ static OSStatus my_SSLHandshake(SSLContextRef c) {
         s->state = SH_STATE_CONNECTED; rv = noErr; goto done;
     }
     int e = SSL_get_error(s->ssl, ret);
-    // mutual TLS + pinning: cert_cb suspended us before sending our cert -> hand the server cert to the app
-    if (e == SSL_ERROR_WANT_X509_LOOKUP) { s->state = SH_STATE_PEER_AUTH; rv = ST_PeerAuth; goto done; }
+    // cert_cb suspended us before sending our cert: either break may be the reason. Stock
+    // reports the server-auth break before the cert-request one -- the server's Certificate
+    // message precedes its CertificateRequest -- so an unapproved breakAuth wins even when
+    // both are pending. Each pause is resumed by another SSLHandshake, which sets its flag,
+    // and the next suspension reports the other.
+    if (e == SSL_ERROR_WANT_X509_LOOKUP) {
+        if (s->breakCertReq && !s->certApproved && !(s->breakAuth && !s->approved))
+            { s->state = SH_STATE_CERT_REQUEST; rv = ST_CertReq; goto done; }
+        s->state = SH_STATE_PEER_AUTH; rv = ST_PeerAuth; goto done;   // mutual TLS + pinning -> server cert is the app's to judge
+    }
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) rv = errSSLWouldBlock;
     else {
         // The OpenSSL reason alongside the SSL_get_error class: the class says only that the
@@ -369,6 +415,10 @@ done:
 // by the next call, which the caller makes either way.
 static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLRead(c, data, len, processed);
+    // Stock answers paramErr for a missing out-parameter or an absent buffer with a length;
+    // the engine path would instead write through the NULL. Every other hook guards its
+    // out-parameter -- these two take one more apiece.
+    if (!processed || (!data && len)) return ST_Param;
     Shadow *s = sh_get(c);
     if (!s || s->state != SH_STATE_CONNECTED) { OSStatus r = o_SSLRead(c, data, len, processed); sh_release(s); return r; }
     // A read is another entry, so it is another chance for the queue to go out. One attempt,
@@ -421,6 +471,7 @@ static OSStatus my_SSLRead(SSLContextRef c, void *data, size_t len, size_t *proc
 // consumed in runs -- SSL_write's length is an int.
 static OSStatus my_SSLWrite(SSLContextRef c, const void *data, size_t len, size_t *processed) {
     if (!tf_on()) return o_SSLWrite(c, data, len, processed);
+    if (!processed || (!data && len)) return ST_Param;   // see my_SSLRead
     Shadow *s = sh_get(c);
     if (!s || s->state != SH_STATE_CONNECTED) { OSStatus r = o_SSLWrite(c, data, len, processed); sh_release(s); return r; }
     *processed = 0;
@@ -516,11 +567,27 @@ static void my_SSLContextFinalize(CFTypeRef c) {
 // ShadowState without a case here produces a -Wswitch warning.
 static int sh_session_state(ShadowState state) {
     switch (state) {
-        case SH_STATE_HANDSHAKING: case SH_STATE_PEER_AUTH: return ST_Handshake;
+        case SH_STATE_HANDSHAKING: case SH_STATE_PEER_AUTH: case SH_STATE_CERT_REQUEST:
+                                                           return ST_Handshake;
         case SH_STATE_CONNECTED:                           return ST_Connected;
         case SH_STATE_NEW: case SH_STATE_FAILED:           return -1;
     }
     return -1;
+}
+
+// The states in which the handshake has got far enough for the peer's chain to have arrived,
+// and so for the protocol and cipher questions to have an answer and the peer's trust to be
+// fair to copy: connected, or paused at either break. The server's Certificate message precedes
+// both the server-auth break and its CertificateRequest. As above, a ShadowState without a
+// case here produces a -Wswitch warning.
+static int sh_peer_arrived(ShadowState state) {
+    switch (state) {
+        case SH_STATE_CONNECTED: case SH_STATE_PEER_AUTH: case SH_STATE_CERT_REQUEST:
+                                                           return 1;
+        case SH_STATE_NEW: case SH_STATE_HANDSHAKING: case SH_STATE_FAILED:
+                                                           return 0;
+    }
+    return 0;
 }
 
 static OSStatus my_SSLGetSessionState(SSLContextRef c, SSLSessionState *st) {
@@ -541,7 +608,7 @@ static OSStatus my_SSLGetNegotiatedProtocolVersion(SSLContextRef c, SSLProtocol 
     if (!tf_on()) return o_SSLGetNegotiatedProtocolVersion(c, p);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && (s->state == SH_STATE_CONNECTED || s->state == SH_STATE_PEER_AUTH)) {
+    if (s && sh_peer_arrived(s->state)) {
         rv = p ? s->reportedProtocolStatus : errSecParam;
         if (p) *p = s->reportedProtocol;
     }
@@ -554,7 +621,7 @@ static OSStatus my_SSLGetNegotiatedCipher(SSLContextRef c, SSLCipherSuite *ciphe
     if (!tf_on()) return o_SSLGetNegotiatedCipher(c, cipher);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (s && (s->state == SH_STATE_CONNECTED || s->state == SH_STATE_PEER_AUTH)) {
+    if (s && sh_peer_arrived(s->state)) {
         rv = cipher ? s->reportedCipherStatus : errSecParam;
         if (cipher) *cipher = s->reportedCipher;
     }
@@ -587,11 +654,13 @@ static OSStatus my_SSLGetBufferedReadSize(SSLContextRef c, size_t *sz) {
     return rv;
 }
 
+// Either pause (PEER_AUTH, CERT_REQUEST) leaves the peer's chain already arrived and fair to
+// copy: the server's Certificate message precedes both the auth break and its CertificateRequest.
 static OSStatus my_SSLCopyPeerTrust(SSLContextRef c, SecTrustRef *trust) {
     if (!tf_on()) return o_SSLCopyPeerTrust(c, trust);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (!s || (s->state != SH_STATE_CONNECTED && s->state != SH_STATE_PEER_AUTH) || !trust) rv = o_SSLCopyPeerTrust(c, trust);
+    if (!s || !sh_peer_arrived(s->state) || !trust) rv = o_SSLCopyPeerTrust(c, trust);
     else if (sh_build_trust(s, trust)) rv = noErr;
     else rv = o_SSLCopyPeerTrust(c, trust);
     sh_release(s);
@@ -602,33 +671,74 @@ static OSStatus my_SSLCopyPeerCertificates(SSLContextRef c, CFArrayRef *certs) {
     if (!tf_on()) return o_SSLCopyPeerCertificates(c, certs);
     Shadow *s = sh_get(c);
     OSStatus rv;
-    if (!s || (s->state != SH_STATE_CONNECTED && s->state != SH_STATE_PEER_AUTH) || !certs) rv = o_SSLCopyPeerCertificates(c, certs);
+    if (!s || !sh_peer_arrived(s->state) || !certs) rv = o_SSLCopyPeerCertificates(c, certs);
     else { CFArrayRef arr = sh_cert_array(s); if (!arr) rv = o_SSLCopyPeerCertificates(c, certs); else { *certs = arr; rv = noErr; } }
+    sh_release(s);
+    return rv;
+}
+
+// What the cert-request flow queries around its pause. The fact being asked about is whether
+// the server asked -- which is certReqSeen, the record that client_cert_cb (which fires
+// exactly at the server's CertificateRequest) has run this handshake -- not whether an
+// identity happens to be installed. Requested while the request is unanswered (either pause;
+// PEER_AUTH can be the mTLS suspend, which the request itself triggered), Sent once a handshake
+// that answered it with a certificate completed. Everything else falls to the system context,
+// whose answer is kSSLClientCertNone -- correct, since from its point of view no handshake ran
+// at all.
+static OSStatus my_SSLGetClientCertificateState(SSLContextRef c, SSLClientCertificateState *cs) {
+    if (!tf_on()) return o_SSLGetClientCertificateState(c, cs);
+    if (!cs) return ST_Param;                   // stock's paramErr; see my_SSLRead
+    Shadow *s = sh_get(c);
+    OSStatus rv;
+    if (s && (s->state == SH_STATE_CERT_REQUEST || (s->state == SH_STATE_PEER_AUTH && s->certReqSeen))) {
+        *cs = kSSLClientCertRequested; rv = noErr;
+    }
+    else if (s && s->state == SH_STATE_CONNECTED && s->certReqSeen && s->clientX509) {
+        *cs = kSSLClientCertSent; rv = noErr;
+    }
+    else rv = o_SSLGetClientCertificateState(c, cs);
     sh_release(s);
     return rv;
 }
 
 static OSStatus my_SSLSetCertificate(SSLContextRef c, CFArrayRef certRefs) {
     if (!tf_on() || ensure_ready() != 1) return o_SSLSetCertificate(c, certRefs);
+    OSStatus r = o_SSLSetCertificate(c, certRefs);
+    if (r != noErr) return r;                     // see my_SSLSetPeerDomainName
     Shadow *s = sh_create(c);
     if (s) {
         // disable-mtls hands client-certificate connections back to the system stack:
-        // SSLSetCertificate is forwarded below either way, so the system stack still holds
+        // SSLSetCertificate is forwarded above either way, so the system stack still holds
         // the identity and my_SSLHandshake defers the whole handshake to it. General escape
         // hatch for a client-certificate service this engine cannot carry -- one needing
         // TLS 1.3, or a key the Keychain will not sign for.
         // On a server context this is the server's own identity, which the system stack holds
         // and uses; nothing here needs it.
         if (!s->serverSide || server_tls_enabled()) {
-            if (!s->serverSide && tf_flag("disable-mtls")) s->clientBypass = 1;
-            else capture_identity(s, certRefs);
+            // disable-mtls cannot apply at the cert-request pause: that escape works by
+            // handing the whole connection to the system stack before it starts, and the
+            // paused handshake is already half-consumed on the socket. The pause is answered
+            // with what was supplied, or with no certificate.
+            if (!s->serverSide && tf_flag("disable-mtls") && s->state != SH_STATE_CERT_REQUEST) s->clientBypass = 1;
+            else capture_identity(s, certRefs, s->state != SH_STATE_CERT_REQUEST);
         }
-        if (s->inited && s->state != SH_STATE_FAILED) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = SH_STATE_NEW;
+        if (s->state == SH_STATE_CERT_REQUEST) {
+            // Paused at the cert request: the identity just captured is the answer to it, and
+            // the handshake resumes from where it suspended. SSLSetCertificate's own contract
+            // names exactly this call -- "immediately after SSLHandshake has returned
+            // errSSLClientCertRequested, before the handshake is resumed" -- so there is
+            // nothing to re-initialise; restarting would send a fresh ClientHello down a
+            // socket that has already consumed the server's flight.
+        }
+        else if (s->inited && s->state != SH_STATE_FAILED) { SSL_free(s->ssl); s->ssl = NULL; s->inited = 0; s->state = SH_STATE_NEW;
+             s->approved = 0;                     // a new handshake presents a new peer to approve
+             s->certApproved = 0;                 // and may be asked for its certificate again
+             s->certReqSeen = 0;                  // by a server that has not asked yet
              sh_reset_write(s);
              if (s->trust) { CFRelease(s->trust); s->trust = NULL; } }   // new handshake -> new chain
         sh_release(s);
     }
-    return o_SSLSetCertificate(c, certRefs);
+    return r;
 }
 
 // One row per hooked entry point. The original slot is filled by provider-scoped
@@ -675,6 +785,8 @@ static const struct {
     { "SSLGetBufferedReadSize",          (void *)my_SSLGetBufferedReadSize,          (void **)&o_SSLGetBufferedReadSize },
     { "SSLCopyPeerTrust",                (void *)my_SSLCopyPeerTrust,                (void **)&o_SSLCopyPeerTrust },
     { "SSLCopyPeerCertificates",         (void *)my_SSLCopyPeerCertificates,         (void **)&o_SSLCopyPeerCertificates },
+    // Present across the whole 10.6-10.9 range (it is in the 10.6 SDK), so a required row.
+    { "SSLGetClientCertificateState",    (void *)my_SSLGetClientCertificateState,    (void **)&o_SSLGetClientCertificateState },
     { "SSLSetCertificate",               (void *)my_SSLSetCertificate,               (void **)&o_SSLSetCertificate },
 };
 #define NHOOKS (sizeof kHooks / sizeof kHooks[0])
@@ -778,7 +890,6 @@ static void install_hooks(int tls_only) {
     if (!tls_only) {
         tf_airdrop_install();
         tf_maps_install();
-        tf_safari_install();
     }
 }
 

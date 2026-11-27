@@ -49,7 +49,7 @@ if LC_ALL=C grep -q -a -F "$T/aquatransport.dylib" "$SECBIN" 2>/dev/null ||
     exit 1
 fi
 [ -x "$PROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$PROBE" "$DIR/tools/httpsprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$PROBE" "$DIR/tools/httpsprobe.c"
 [ -x "$URLPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 \
     -framework Foundation -o "$URLPROBE" "$DIR/tools/urlprobe.m"
 [ -x "$ASYNCPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 \
@@ -59,9 +59,9 @@ fi
 [ -x "$POOLPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 \
     -framework Foundation -o "$POOLPROBE" "$DIR/tools/poolprobe.m"
 [ -x "$MULTIPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$MULTIPROBE" "$DIR/tools/multiprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$MULTIPROBE" "$DIR/tools/multiprobe.c"
 [ -x "$UPLOADPROBE" ] || clang -arch x86_64 -arch i386 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
-    -framework CoreFoundation -framework CFNetwork -o "$UPLOADPROBE" "$DIR/tools/uploadprobe.c"
+    -framework CoreFoundation -framework CoreServices -o "$UPLOADPROBE" "$DIR/tools/uploadprobe.c"
 # x86_64 only: the >INT_MAX buffer it passes needs a 64-bit size_t to be a distinct case.
 [ -x "$BIGBUFPROBE" ] || clang -arch x86_64 -mmacosx-version-min=10.6 -Wno-deprecated-declarations \
     -framework CoreFoundation -framework Security -o "$BIGBUFPROBE" "$DIR/tools/bigbufprobe.c"
@@ -178,12 +178,21 @@ check "debug flag in flags.txt enables logging" "handshake" "$(grep 'httpsprobe\
 : > "$T/flags.txt"; rm -f "$LOG"
 
 echo "== loading with no gate =="
-# The property the loader design rests on: loaded into a process with no CoreFoundation and no
-# Security, the library must pull in neither, and must still work if Secure Transport turns up
+# The property the loader design rests on: loaded into a process that has neither CoreFoundation
+# nor Security, the library must sit inert, and must still work once Secure Transport turns up
 # later. Without it, injection would have to wait for Security.framework before it was safe.
+#
+# Loading it does bring both frameworks in. The loader maps the engine at once, and the engine
+# names Security and CoreFoundation in ordinary load commands: c3777af found that the lazy
+# alternative cannot be linked against the 10.6 SDK, and bought nothing observed. So what is
+# asserted first is that the process really started without them. That is what makes the
+# request below a test of a framework that arrived after the library, rather than of one that
+# had been there all along. It replaces a check that demanded "CF=0 Security=0" of the second
+# phase, which no build since that commit could satisfy -- confirmed on 10.9.5 against the
+# 2026-09-22 build and against the build of 2026-11-26 alike, on both architectures.
 for a in x86_64 i386; do
   out=$(arch -$a "$LATECHECK" "$D" 2>&1)
-  check "$a: loading pulls in no frameworks" "injected=|loaded\): CF=0 Security=0" "$(echo "$out" | sed -n 2p)"
+  check "$a: loaded into a process with neither framework" "before our dylib\): CF=0 Security=0" "$(echo "$out" | sed -n 1p)"
   check "$a: works when Security arrives later" "HTTP 404" "$(echo "$out" | tail -1)"
 done
 
@@ -352,23 +361,49 @@ if "$DIR/tools/mtlstest/make.sh" >/dev/null 2>&1; then
     "$MTLSSRV" "$port" "$W/server.crt" "$W/server.key" "$W/ca.crt" > "$out" 2>/dev/null &
     srvpid=$!
     # Wait for the port rather than sleeping: the server prints LISTENING once it is accepting.
-    for _ in $(seq 1 50); do grep -q LISTENING "$out" && break; sleep 0.1; done
+    i=0; while [ $i -lt 50 ]; do grep -q LISTENING "$out" && break; sleep 0.1; i=$((i+1)); done
     run "$MTLSPROBE" 127.0.0.1 "$port" "$W/client$bits.p12" test123 > /dev/null 2>&1
     wait $srvpid 2>/dev/null
-    check "RSA-$bits client certificate reaches the server" "CLIENT_CERT" "$(grep CLIENT "$out")"
+    # Anchored to the whole word: NO_CLIENT_CERT contains CLIENT_CERT, so a substring match
+    # would pass on exactly the failure the case exists to catch.
+    check "RSA-$bits client certificate reaches the server" "^CLIENT_CERT " "$(grep CLIENT "$out")"
     rm -f "$out"
     port=$((port+1))
+    if [ "$bits" = 2048 ]; then
+      # The on-demand identity flow: no certificate up front, the handshake pauses with
+      # errSSLClientCertRequested, and SSLSetCertificate answers the pause -- the exact
+      # sequence its contract names. BreakOnServerAuth is set too, so both breaks are in play
+      # and the ordering is exercised: the pause the identity answers must be -9842, not a
+      # repeat of the -9841 the probe already handled.
+      out="$DIR/build/mtlssrv-late.out"
+      : > "$out"
+      "$MTLSSRV" "$port" "$W/server.crt" "$W/server.key" "$W/ca.crt" > "$out" 2>/dev/null &
+      srvpid=$!
+      i=0; while [ $i -lt 50 ]; do grep -q LISTENING "$out" && break; sleep 0.1; i=$((i+1)); done
+      lateout=$(AQUATRANSPORT_DIR="$T" DYLD_INSERT_LIBRARIES="$D" \
+                "$MTLSPROBE" 127.0.0.1 "$port" "$W/client2048.p12" test123 late 2>&1)
+      wait $srvpid 2>/dev/null
+      check "identity supplied at the cert-request break reaches the server" "^CLIENT_CERT " "$(grep CLIENT "$out")"
+      check "engine pauses with -9842 before the identity is set" "cert request break" "$lateout"
+      rm -f "$out"
+      port=$((port+1))
+    fi
   done
   rm -rf "$W"
 else
   echo "  skip  no /usr/bin/openssl to build the test CA"
 fi
 
-echo "== deny list =="
-# The gate matches on process name, so a copy named ocspd must pass straight through.
-cp "$PROBE" "$DIR/build/ocspd"
-check "process named ocspd is skipped" "$STOCKFAIL" "$(run "$DIR/build/ocspd" https://api.twitter.com/)"
-rm -f "$DIR/build/ocspd"
+echo "== exclusion =="
+# Trust services (ocspd, securityd, trustd) are no longer excluded by name: they get the TLS
+# hooks on their own, so that an HTTPS issuer or revocation download can negotiate modern TLS.
+# tools/test-trust-transport.sh covers that against a TLS-1.3-only peer. What takes a process
+# out of everything is disabled.txt, matched on the executable's name, so a copy of the probe
+# named in it must pass straight through to the stock stack.
+cp "$PROBE" "$DIR/build/aq-excluded-probe"
+printf 'aq-excluded-probe\n' > "$T/disabled.txt"
+check "process named in disabled.txt is skipped" "$STOCKFAIL" "$(run "$DIR/build/aq-excluded-probe" https://api.twitter.com/)"
+rm -f "$T/disabled.txt" "$DIR/build/aq-excluded-probe"
 
 echo
 echo "$pass passed, $fail failed"

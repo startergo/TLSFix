@@ -8,7 +8,6 @@
 //   debug                        log handshakes to /tmp/aquatransport-<uid>.log
 //   disable-mtls                 hand client-certificate connections back to the system stack
 //   disable-icloud-gsa            turn off iCloud authentication on 10.7+ (docs/ICLOUD.md)
-//   disable-safari-cloudtabs      keep Safari's native legacy tab store on Mavericks
 //   disable-certificate-pinning  honour system and keychain anchors for anchor-restricted
 //                                evaluations, defeating pinning process-wide (for monitoring
 //                                your own traffic through a locally trusted proxy root)
@@ -53,13 +52,21 @@ typedef struct { char *scope; char *pattern; char **lines; int nlines; } tf_head
 // Does the current process fall within a rule's scope line?
 int tf_scope_matches(const char *scope);
 
-// Rules are cached and reloaded when a file's mtime changes, so edits take
-// effect without restarting anything. Callers must not free the returned arrays.
+// Rules are cached and reloaded when a file's mtime changes, so edits take effect without
+// restarting anything. A reload frees the previous arrays, so a rule matched out of them is
+// valid only while the rules lock is held: hold tf_rules_lock across the lookup *and*
+// everything done with what it returned. The lookups below expect the lock held, so the whole
+// match-and-use window is one critical section. Both match helpers are safe to call with it
+// held: tf_glob_prefix touches no shared state, and tf_scope_matches reads the process
+// identity, which is filled in once under its own one-time initialisation. Callers must not
+// free the returned arrays.
+void tf_rules_lock(void);
+void tf_rules_unlock(void);
 int tf_redirects(const tf_redirect **out);
 int tf_headerrules(const tf_headerrule **out);
 
 // Returns a newly allocated URL with `from` replaced by `to` when `url` starts
-// with a redirect rule's `from`, else NULL. Caller frees.
+// with a redirect rule's `from`, else NULL. Caller holds tf_rules_lock and frees the result.
 char *tf_apply_redirect(const char *url);
 
 // Is `name` listed (one entry per line) in the given config file? Used for the

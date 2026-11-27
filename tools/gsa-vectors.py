@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 """Independent SRP server equations; emits deterministic offline C fixtures.
 
 Only synthetic credentials. Compatible with OS X's Python 2.7 and Python 3.

@@ -50,11 +50,16 @@ int aq_srp_challenge(aq_srp *s, const char *user, const void *password, size_t p
     SHA256_CTX h;
     int ok = 0;
     BN_CTX *ctx = NULL;
-    if (!s || s->challenged || !group || !user || !password || !protocol ||
+    /* Consume the context before validating the challenge, not after: a first attempt
+     * rejected for a malformed challenge must leave the ephemeral as spent as a failed
+     * one, or a caller could walk the single-use contract with retryable bad input and
+     * reuse (a, A) across exchanges. */
+    if (!s || s->challenged) return 0;
+    s->challenged = -1; /* A failed challenge cannot be reused. */
+    if (!group || !user || !password || !protocol ||
         !salt || !salt_len || salt_len > 1024 || !server || !server_len || server_len > 256 ||
         !iterations || iterations > 1000000 || password_len > 1024*1024 ||
         (strcmp(protocol, "s2k") && strcmp(protocol, "s2k_fo"))) return 0;
-    s->challenged = -1; /* A failed challenge cannot be reused. */
     ctx = BN_CTX_secure_new();
     if (!ctx) return 0;
     BN_CTX_start(ctx);

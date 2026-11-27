@@ -13,58 +13,17 @@
 #include "local-anisette-fixture.h"
 
 static NSString *mode;
-static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls, syncCalls, syncHTTPCalls, routingCalls;
+static int unexpected, anisetteCalls, initCalls, completeCalls, accountCalls, codeCalls;
 static NSData *serverB, *serverKey, *serverProof;
-static NSString *grandSlamRequestUUID;
-static BOOL verified, changedPassword;
+static BOOL verified;
 static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqual:[@"ids-" stringByAppendingString:name]]; }
-static BOOL twoFactor(void) { return [mode hasPrefix:@"2fa"] || [mode hasPrefix:@"ids-2fa"]; }
-static NSString *testPassword(void) {
-    if (fixture(@"2fa-changed-nondigit") && changedPassword) return @"Alternate:PassWordABCDEF";
-    if (fixture(@"2fa-unicode")) return @"P\u00e4ss\U0001f511123456";
-    if (fixture(@"2fa-changed") && changedPassword) return @"Alternate:PassWord1234567";
-    if (fixture(@"2fa-digits")) return @"iamcool123456";
-    if (fixture(@"2fa-long-digits")) return @"iamcool123456789";
-    if (fixture(@"2fa-six-digits")) return @"654321";
-    if (fixture(@"2fa-numeric")) return @"12345678";
-    return @"Synthetic:PassWord";
-}
-static BOOL opaqueSettings(void) { return [mode hasSuffix:@"-opaque"]; }
-static NSString *settingsAuth(void) {
-    return opaqueSettings() ? @"Basic MTIzNDU6b3BhcXVlLWZpeHR1cmU=" : @"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ==";
-}
-
-static NSString *expectedClient(void) {
-    return AQTestClient;
-}
-static NSString *expectedVerificationClient(void) {
-    NSString *client = expectedClient();
-    NSRange application = [client rangeOfString:@" <" options:NSBackwardsSearch];
-    assert(application.location != NSNotFound);
-    return [[client substringToIndex:application.location] stringByAppendingString:
-        @" <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>"];
-}
-static NSData *bytes(NSString *s);
-
-static id localOTP(id self, SEL selector, id owner, NSError **error) {
-    anisetteCalls++;
-    if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) return @{};
-    NSString *otp = [mode hasPrefix:@"resync"] && syncCalls ? @"fresh-otp" : @"fake-otp";
-    return @{@"X-Apple-MD": otp, @"X-Apple-MD-M": @"fake-machine", @"X-Apple-I-MD-RINFO": @"12345",
-        @"device": @"00000000-0000-4000-8000-000000000001",
-        @"Authorization": @"MUST-NOT-BE-FORWARDED", @"X-MMe-Client-Info": @"MUST-NOT-BE-FORWARDED"};
-}
-static id localSync(id self, SEL selector, NSData *server, id owner, NSError **error) {
-    syncCalls++; assert([server isEqual:bytes(@"server-sync")]);
-    if ([mode isEqual:@"resync-native-failure"]) {
-        *error = [NSError errorWithDomain:@"fixture" code:29 userInfo:@{NSLocalizedDescriptionKey:@"fixture sync failure"}];
-        return nil;
-    }
-    return @{@"mid":bytes(@"fresh-mid"), @"srm":bytes(@"client-sync")};
-}
-static BOOL localStoreRouting(id self, SEL selector, NSString *routing, id owner, NSError **error) {
-    routingCalls++; assert([routing isEqual:@"67890"]); return YES;
-}
+/* The trusted-device flow and its variants: the hint where Apple usually puts it, where it
+ * has also been seen, under a new name, or nowhere; the code check answered either way it is
+ * answered; and the one method there is no adapter for. */
+static BOOL is2fa(void) { return [mode hasPrefix:@"2fa"] || [mode isEqual:@"ids-2fa"]; }
+/* The answers that name no method: Apple has sent the code with them, and the adapter must
+ * not ask. */
+static BOOL unlabelled(void) { return [mode isEqual:@"2fa-unlabelled"] || [mode isEqual:@"2fa-again"]; }
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
 static id parse(NSData *d) { return [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL]; }
@@ -89,7 +48,7 @@ static void server_start(NSData *clientA) {
     const SRP_gN *gn = SRP_get_default_gN("2048"); BN_CTX *ctx = BN_CTX_new();
     BIGNUM *A = number(clientA), *b = BN_new(), *v = BN_new(), *B = BN_new(), *tmp = BN_new(), *S = BN_new();
     BN_set_word(b, 1234567);
-    unsigned char derived[32]; NSData *password = hash(bytes(testPassword()));
+    unsigned char derived[32]; NSData *password = hash(bytes([mode isEqual:@"password-tail-digits"] ? @"Synthetic:123456" : @"Synthetic:PassWord"));
     PKCS5_PBKDF2_HMAC([password bytes], 32, (unsigned char *)"ordinarysalt1234", 16, 5, EVP_sha256(), 32, derived);
     NSData *inner = hash(cat([NSArray arrayWithObjects:bytes(@":"), [NSData dataWithBytes:derived length:32], nil]));
     BIGNUM *x = number(hash(cat([NSArray arrayWithObjects:bytes(@"ordinarysalt1234"), inner, nil])));
@@ -108,17 +67,15 @@ static void server_start(NSData *clientA) {
         hash(cat([NSArray arrayWithObjects:bnbytes(A, YES), m, serverKey, nil])), nil]) retain];
     BN_free(A); BN_free(b); BN_free(v); BN_free(B); BN_free(tmp); BN_free(S); BN_free(x); BN_free(k); BN_free(u); BN_CTX_free(ctx);
 }
-static NSData *encrypted_session(void) {
+/* A completed login's session carries the password-equivalent token; the session Apple
+ * returns while it is still asking for a code carries none. */
+static NSData *encrypted_session(BOOL challenge) {
     NSMutableDictionary *session = [NSMutableDictionary dictionaryWithObjectsAndKeys:@"12345", @"adsid", @"fake-idms", @"GsIdmsToken", nil];
-    if (twoFactor() && !verified) {
-        [session setObject:hash(bytes(@"application-session-key")) forKey:@"sk"];
-        [session setObject:@"application-continuation" forKey:@"c"];
-    } else [session setObject:[NSDictionary dictionaryWithObject:
+    if (!challenge) [session setObject:[NSDictionary dictionaryWithObject:
         [NSDictionary dictionaryWithObject:@"fake-pet" forKey:@"token"] forKey:@"com.apple.gs.idms.pet"] forKey:@"t"];
-    /* Cover both known layouts: the basic 2FA fixtures carry au inside spd,
-     * while the variants reproduce current hsc-409 responses with no au. */
-    if (fixture(@"2fa") && !verified) [session setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
-    if (fixture(@"2fa-notify-failure") && !verified) [session setObject:@"futureSecondaryAuth" forKey:@"au"];
+    /* Apple has put the verification hint in the encrypted session instead of Status. As
+     * with the Status-side hint, it is gone once a code has been accepted. */
+    if ([mode isEqual:@"2fa-session-hint"] && !verified) [session setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
     NSData *plain = plist(session); unsigned char aes[32], iv[32]; unsigned int len;
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data key:", 15, aes, &len);
     HMAC(EVP_sha256(), [serverKey bytes], 32, (unsigned char *)"extra data iv:", 14, iv, &len);
@@ -128,6 +85,15 @@ static NSData *encrypted_session(void) {
     assert(EVP_EncryptFinal_ex(ctx, (unsigned char *)[out mutableBytes]+a, &b));
     [out setLength:a+b]; EVP_CIPHER_CTX_free(ctx); return out;
 }
+
+/* The generator, replaced: the remote fixture's synthetic values, so that every assertion
+ * about them holds for the local provider as well. Only the identity differs -- this
+ * machine's, as the generator reports it. */
+static id localOTP(id self, SEL selector, id owner, NSError **error) {
+    anisetteCalls++;
+    return [NSDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-MD", @"fake-machine", @"X-Apple-MD-M",
+        @"84215040", @"X-Apple-I-MD-RINFO", @"fake-device", @"device", nil];
+}
 @interface AQMock : NSURLProtocol @end
 @implementation AQMock
 + (BOOL)canInitWithRequest:(NSURLRequest *)r { return YES; }
@@ -136,6 +102,7 @@ static NSData *encrypted_session(void) {
 - (void)startLoading {
     NSURLRequest *req = [self request]; NSString *host = [[req URL] host], *path = [[req URL] path];
     NSData *data = nil; NSDictionary *result = nil, *responseHeaders = nil; int status = 200;
+    BOOL wrongPassword = NO;   /* this proof was made for a string that is not the password */
     if (fixture(@"disabled")) {
         assert(![NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
         assert([[[parse([req HTTPBody]) objectForKey:@"password"] description] isEqual:@"Synthetic:PassWord"]);
@@ -146,106 +113,95 @@ static NSData *encrypted_session(void) {
     }
     assert([NSURLProtocol propertyForKey:@"AquaTransportGSAHandled" inRequest:req]);
     assert(![req HTTPShouldHandleCookies]);
-    assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] isEqual:@"00000000-0000-4000-8000-000000000001"]);
-    if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
+    if ([host isEqual:@"127.0.0.1"]) {
+        anisetteCalls++;
+        assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req HTTPBody]);
+        NSDictionary *headers = [NSDictionary dictionaryWithObjectsAndKeys:@"fake-otp", @"X-Apple-I-MD", @"fake-machine", @"X-Apple-I-MD-M",
+            @"fake-local", @"X-Apple-I-MD-LU", @"84215040", @"X-Apple-I-MD-RINFO", @"fake-device", @"X-Mme-Device-Id",
+            @"<fixture-device> <fixture-os> <fixture-client>", @"X-MMe-Client-Info", @"MUST-NOT-BE-FORWARDED", @"Authorization", nil];
+        data = [NSJSONSerialization dataWithJSONObject:headers options:0 error:NULL];
+        if (fixture(@"missing-anisette") || [mode isEqual:@"settings-missing"]) data = bytes(@"{}");
+    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2"]) {
         assert(![req valueForHTTPHeaderField:@"Authorization"]);
+        assert(![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
         assert([[req valueForHTTPHeaderField:@"Accept"] isEqual:@"*/*"]);
-        assert([[req valueForHTTPHeaderField:@"User-Agent"] isEqual:AQTestUserAgent]);
         NSDictionary *payload = [parse([req HTTPBody]) objectForKey:@"Request"];
-        NSString *operation = [payload objectForKey:@"o"];
-        assert([operation isEqual:@"init"] || [operation isEqual:@"complete"]);
         assert([[payload objectForKey:@"u"] isEqual:@"test@example.invalid"]);
-        NSString *expectedOTP = [mode hasPrefix:@"resync"] && syncCalls ? @"fresh-otp" : @"fake-otp";
-        assert([[[payload objectForKey:@"cpd"] objectForKey:@"X-Apple-I-MD"] isEqual:expectedOTP]);
+        assert([[[payload objectForKey:@"cpd"] objectForKey:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
         assert(![[payload objectForKey:@"cpd"] objectForKey:@"Authorization"]);
         NSDictionary *cpd = [payload objectForKey:@"cpd"];
-        assert([[cpd objectForKey:@"X-Mme-Device-Id"] isEqual:@"00000000-0000-4000-8000-000000000001"]);
-        assert([[cpd objectForKey:@"X-Apple-I-MD-LU"] isEqual:@"MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAx"]);
-        assert(![req valueForHTTPHeaderField:@"X-Apple-I-MD"] && ![req valueForHTTPHeaderField:@"X-Apple-I-MD-LU"]);
-        assert(![req valueForHTTPHeaderField:@"X-Apple-AK-Context-Type"] && ![cpd objectForKey:@"ckgen"]);
-        NSString *requestUUID = [cpd objectForKey:@"X-Apple-I-Request-UUID"];
-        assert([requestUUID length] == 36 && [requestUUID characterAtIndex:8] == '-' && [requestUUID characterAtIndex:13] == '-' &&
-            [requestUUID characterAtIndex:18] == '-' && [requestUUID characterAtIndex:23] == '-' && [requestUUID characterAtIndex:14] == '4' &&
-            [requestUUID isEqual:[requestUUID uppercaseString]]);
-        BOOL initOperation = [operation isEqual:@"init"];
-        if (!grandSlamRequestUUID || (initOperation && !([mode hasPrefix:@"resync"] && syncCalls)))
-            grandSlamRequestUUID = [requestUUID copy];
-        else assert([requestUUID isEqual:grandSlamRequestUUID]);
         assert([[cpd objectForKey:@"svct"] isEqual:@"iCloud"] && [[cpd objectForKey:@"prkgen"] boolValue]);
-        assert([[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:expectedClient()]);
-        assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:[cpd objectForKey:@"X-MMe-Client-Info"]]);
-        if (initOperation) {
+        /* The body names the client identity once, and the envelope carries that same one, for
+         * a server's set and for the generator's alike. On 2026-11-26 the generator's set
+         * spelled the key otherwise: the envelope kept the adapter's default identity beside
+         * the generator's one-time password, and Apple's edge dropped the request. */
+        NSString *clientInfo = [mode isEqual:@"local"] ? AQTestClient : @"<fixture-device> <fixture-os> <fixture-client>";
+        NSUInteger spellings = 0;
+        for (NSString *k in cpd) if ([[k lowercaseString] isEqual:@"x-mme-client-info"]) spellings++;
+        assert(spellings == 1 && [[cpd objectForKey:@"X-MMe-Client-Info"] isEqual:clientInfo]);
+        assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:clientInfo]);
+        /* The generator's set names its user agent. A server's names none, and none is invented. */
+        if ([mode isEqual:@"local"]) assert([[req valueForHTTPHeaderField:@"User-Agent"] isEqual:AQTestUserAgent]);
+        if ([[payload objectForKey:@"o"] isEqual:@"init"]) {
             initCalls++; server_start([payload objectForKey:@"A2k"]);
             result = [NSDictionary dictionaryWithObjectsAndKeys:@"s2k", @"sp", @5, @"i", bytes(@"ordinarysalt1234"), @"s",
                 [mode isEqual:@"malformed"] ? bytes(@"oversized-invalid") : serverB, @"B", @"continuation", @"c", nil];
             if ([mode isEqual:@"malformed"]) result = [NSDictionary dictionaryWithObject:@"invalid" forKey:@"s"];
         } else {
             completeCalls++;
-            BOOL matches = [[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]];
-            assert(matches);
+            /* The first proof of the mode whose password ends in six digits is made for the
+             * shorter string, which is not the password; the adapter must ask again. */
+            wrongPassword = [mode isEqual:@"password-tail-digits"] && completeCalls == 1;
+            if (!wrongPassword)
+                assert([[payload objectForKey:@"M1"] isEqual:[serverProof subdataWithRange:NSMakeRange(0,32)]]);
             NSMutableData *m2 = [[[serverProof subdataWithRange:NSMakeRange(32,32)] mutableCopy] autorelease];
             if (fixture(@"bad-proof")) ((unsigned char *)[m2 mutableBytes])[0] ^= 1;
             if ([mode isEqual:@"short-proof"]) [m2 setLength:1];
-            result = [NSDictionary dictionaryWithObjectsAndKeys:m2, @"M2", encrypted_session(), @"spd", nil];
+            result = [NSDictionary dictionaryWithObjectsAndKeys:m2, @"M2", encrypted_session(is2fa() && !verified), @"spd", nil];
         }
         NSMutableDictionary *r = [[result mutableCopy] autorelease];
         NSMutableDictionary *s = [NSMutableDictionary dictionaryWithObjectsAndKeys:@0, @"ec", @200, @"hsc", nil];
-        BOOL resyncInit = [mode hasPrefix:@"resync"] && ![mode isEqual:@"resync-complete"] &&
-            ([[payload objectForKey:@"o"] isEqual:@"init"] && (initCalls == 1 || [mode isEqual:@"resync-repeat"]));
-        BOOL resyncComplete = [mode isEqual:@"resync-complete"] && [[payload objectForKey:@"o"] isEqual:@"complete"] && completeCalls == 1;
-        if (resyncInit || resyncComplete) {
-            [r removeAllObjects]; [s setObject:@-22421 forKey:@"ec"]; [s setObject:@434 forKey:@"hsc"];
-            if (![mode isEqual:@"resync-missing"] && ![mode isEqual:@"resync-header"])
-                [s setObject:[mode isEqual:@"resync-malformed"] ? @"***=" : @"c2VydmVyLXN5bmM=" forKey:@"X-Apple-I-MD-DATA"];
-            if ([mode isEqual:@"resync-header"]) responseHeaders = @{@"x-apple-i-md-data":@"c2VydmVyLXN5bmM="};
-        }
-        if (completeCalls && twoFactor() && !verified) {
-            [s setObject:fixture(@"2fa-old-status-200") ? @200 : @409 forKey:@"hsc"];
-            if (fixture(@"2fa-old-status") || fixture(@"2fa-old-status-200"))
-                [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
+        if (completeCalls && is2fa() && !verified) {
+            /* How the hint arrives. Named in Status is the usual form; the others are the ones
+             * the adapter must not be thrown by, and secondaryAuth, which is SMS. */
+            [s setObject:@409 forKey:@"hsc"];
+            if ([mode isEqual:@"2fa-sms"]) [s setObject:@"secondaryAuth" forKey:@"au"];
+            else if ([mode isEqual:@"2fa-renamed"]) [s setObject:@"trustedDeviceSecondaryAuthV2" forKey:@"au"];
+            else if (unlabelled() || [mode isEqual:@"2fa-session-hint"]) ;
+            else [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
+        } else if (wrongPassword) {
+            /* Apple's answer to a wrong password: not a challenge. */
+            [s setObject:@401 forKey:@"hsc"]; [s setObject:@-22406 forKey:@"ec"];
         }
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
-    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/lookup"]) {
-        assert(syncCalls == 1 && ![req HTTPBody] && ![req valueForHTTPHeaderField:@"Authorization"]);
-        result = @{@"urls":@{@"midSyncMachine":[mode isEqual:@"resync-invalid-url"] ?
-            @"https://other.invalid/grandslam/syncMachine" : @"https://gsa.apple.com/grandslam/syncMachine"}};
-    } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/syncMachine"]) {
-        syncHTTPCalls++;
-        NSDictionary *outer = parse([req HTTPBody]), *body = [outer objectForKey:@"Request"];
-        assert([[req HTTPMethod] isEqual:@"POST"] && [[[outer objectForKey:@"Header"] allKeys] count] == 0);
-        assert([[body objectForKey:@"srm"] isEqual:@"Y2xpZW50LXN5bmM="] && [[body objectForKey:@"X-Apple-I-MD-M"] isEqual:@"ZnJlc2gtbWlk"]);
-        assert([[body objectForKey:@"X-Apple-I-MD-RINFO"] unsignedLongLongValue] == 12345);
-        assert(![req valueForHTTPHeaderField:@"Authorization"] && ![req valueForHTTPHeaderField:@"X-Apple-I-MD"]);
-        NSMutableDictionary *reply = [NSMutableDictionary dictionaryWithObject:
-            @{@"ec":[mode isEqual:@"resync-server-failure"] ? @-1 : @0} forKey:@"Status"];
-        if ([mode isEqual:@"resync-routing"]) [reply setObject:@"67890" forKey:@"X-Apple-I-MD-RINFO"];
-        result = @{@"Response":reply};
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
-        codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"] &&
-            [[req valueForHTTPHeaderField:@"X-MMe-Client-Info"] isEqual:expectedVerificationClient()]);
-        result = fixture(@"2fa-notify-failure") ?
-            [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@-1 forKey:@"ec"] forKey:@"Status"] :
-            [NSDictionary dictionary];
+        codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
+        assert(!unlabelled());
+        result = [NSDictionary dictionary];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/validate"]) {
-        codeCalls++;
-        assert([[req valueForHTTPHeaderField:@"X-MMe-Client-Info"] isEqual:expectedVerificationClient()]);
-        NSString *code = [req valueForHTTPHeaderField:@"security-code"];
-        assert([code isEqual:@"123456"] || [code isEqual:@"000000"]);
-        verified = [code isEqual:@"123456"];
-        /* Apple's header wraps the service label and token in base64. The
-         * downstream setup assertions require only the decoded token. */
-        if (verified && !fixture(@"2fa-missing-token")) responseHeaders = @{@"x-apple-pe-token":@"Y29tLmFwcGxlLmdzLmlkbXMucGV0OmZha2UtcGV0"};
-        result = [NSDictionary dictionaryWithObject:verified ? @0 : @-21669 forKey:@"ec"];
+        codeCalls++; assert([[req valueForHTTPHeaderField:@"security-code"] isEqual:@"123456"]);
+        /* /validate has answered with its ec at the top level, and a refusal there is one the
+         * adapter once read straight past. */
+        if ([mode isEqual:@"2fa-refused"]) result = [NSDictionary dictionaryWithObject:@-22421 forKey:@"ec"];
+        else {
+            /* Apple names its token in a header whose case CFNetwork does not preserve. The
+             * rerun mode is the reply that carries none. */
+            if (![mode isEqual:@"2fa-rerun"])
+                responseHeaders = [NSDictionary dictionaryWithObject:@"Y29tLmFwcGxlLmdzLmlkbXMucGV0OnZhbGlkYXRlZC1wZXQ=" forKey:@"x-apple-pe-token"];
+            if ([mode isEqual:@"2fa-top-level"]) { result = [NSDictionary dictionaryWithObject:@0 forKey:@"ec"]; verified = YES; }
+            else { result = [NSDictionary dictionaryWithObject:[NSDictionary dictionaryWithObject:@0 forKey:@"ec"] forKey:@"Status"]; verified = YES; }
+        }
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/iosbuddy/loginDelegates"]) {
         accountCalls++;
         NSDictionary *body = parse([req HTTPBody]);
         assert([[body objectForKey:@"apple-id"] isEqual:@"test@example.invalid"]);
-        assert([[body objectForKey:@"password"] isEqual:@"fake-pet"]);
-        assert([[body objectForKey:@"client-id"] length] && [[body objectForKey:@"client-id"] isEqual:[req valueForHTTPHeaderField:@"X-Mme-Device-Id"]]);
+        assert([[body objectForKey:@"password"] isEqual:is2fa() ? @"validated-pet" : @"fake-pet"]);
+        assert([[body objectForKey:@"client-id"] isEqual:@"fake-device"]);
         NSDictionary *delegates = [body objectForKey:@"delegates"];
         assert([delegates count] == 1 && [[delegates objectForKey:@"com.apple.madrid"] isKindOfClass:[NSDictionary class]]);
-        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
-        assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:[mode hasPrefix:@"resync"] ? @"fresh-otp" : @"fake-otp"]);
+        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:is2fa() ?
+            @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6dmFsaWRhdGVkLXBldA==" : @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
+        assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
         assert([[req valueForHTTPHeaderField:@"X-Apple-ADSID"] isEqual:@"12345"]);
         assert(![req valueForHTTPHeaderField:@"Content-Encoding"]);
@@ -259,17 +215,20 @@ static NSData *encrypted_session(void) {
             [NSDictionary dictionaryWithObject:delegate forKey:@"com.apple.madrid"], @"delegates", nil];
     } else if ([host isEqual:@"setup.icloud.com"] && [path hasPrefix:@"/setup/authenticate/"]) {
         accountCalls++;
-        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
+        /* The password-equivalent token the sign-in presents: the one Apple returned with the
+         * code, where there was one, and otherwise the one a repeated exchange produced. */
+        assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:is2fa() && ![mode isEqual:@"2fa-rerun"] ?
+            @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6dmFsaWRhdGVkLXBldA==" : @"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1wZXQ="]);
         result = [NSDictionary dictionaryWithObjectsAndKeys:[NSDictionary dictionaryWithObject:@"12345" forKey:@"dsid"], @"appleAccountInfo",
             [NSDictionary dictionaryWithObject:@"fake-mme" forKey:@"mmeAuthToken"], @"tokens", nil];
     } else if ([host isEqual:@"setup.icloud.com"] && [path isEqual:@"/setup/get_account_settings"]) {
         accountCalls++;
         if ([mode rangeOfString:@"settings"].location != NSNotFound) {
-            assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:settingsAuth()]);
+            assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ=="]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD"] isEqual:@"fake-otp"]);
             assert([[req valueForHTTPHeaderField:@"X-Apple-I-MD-M"] isEqual:@"fake-machine"]);
-            assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] length] == 36);
-            assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:expectedClient()]);
+            assert([[req valueForHTTPHeaderField:@"X-Mme-Device-Id"] isEqual:@"fake-device"]);
+            assert([[req valueForHTTPHeaderField:@"X-Mme-Client-Info"] isEqual:@"<fixture-device> <fixture-os> <fixture-client>"]);
             assert([[req HTTPMethod] isEqual:@"POST"] && [[req HTTPBody] isEqual:bytes(@"refresh-body-fixture")]);
         } else assert([[req valueForHTTPHeaderField:@"Authorization"] isEqual:@"Basic MTIzNDU6ZmFrZS1tbWU="]);
         result = [NSDictionary dictionaryWithObject:@"ok" forKey:@"fixture"];
@@ -308,7 +267,7 @@ static NSMutableURLRequest *login(NSString *password) {
 static NSMutableURLRequest *settings(void) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://setup.icloud.com/setup/get_account_settings"]];
     [req setHTTPMethod:@"POST"]; [req setHTTPBody:bytes(@"refresh-body-fixture")];
-    [req setValue:settingsAuth() forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Basic MTIzNDU6RS1maXh0dXJlLW1tZQ==" forHTTPHeaderField:@"Authorization"];
     return req;
 }
 static NSMutableURLRequest *idsLogin(NSString *password) {
@@ -317,7 +276,7 @@ static NSMutableURLRequest *idsLogin(NSString *password) {
     [req setValue:@"application/x-apple-plist" forHTTPHeaderField:@"Content-Type"];
     [req setValue:@"fixture-client-id" forHTTPHeaderField:@"x-ds-client-id"];
     [req setValue:@"7" forHTTPHeaderField:@"x-protocol-version"];
-    if (fixture(@"gzip") || twoFactor() || fixture(@"bad-gzip") || fixture(@"gzip-limit") || fixture(@"gzip-trailing")) {
+    if (fixture(@"gzip") || fixture(@"2fa") || fixture(@"bad-gzip") || fixture(@"gzip-limit") || fixture(@"gzip-trailing")) {
         NSData *plain = fixture(@"gzip-limit") ? [NSMutableData dataWithLength:1024*1024+1] : [req HTTPBody];
         NSMutableData *compressed = [[gzip(plain) mutableCopy] autorelease];
         if (fixture(@"bad-gzip")) [compressed setLength:[compressed length]-4];
@@ -326,58 +285,18 @@ static NSMutableURLRequest *idsLogin(NSString *password) {
     }
     return req;
 }
-static NSData *finishTwoFactor(BOOL ids, NSURLResponse **response, NSError **error) {
-    if (fixture(@"2fa-missing-token")) {
-        *response = nil; *error = nil;
-        NSString *input = [testPassword() stringByAppendingString:@"123456"];
-        NSData *result = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(input) : login(input) returningResponse:response error:error];
-        assert(!result && *error && codeCalls == 2 && initCalls == 1 && completeCalls == 1 && !accountCalls);
-        return nil;
-    }
-    if (fixture(@"2fa-code-only")) {
-        /* The validation response supplies the PET; no third password request
-         * or app-token exchange is necessary. */
-        *response = nil; *error = nil;
-        NSData *result = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(@"123456") : login(@"123456")
-            returningResponse:response error:error];
-        assert(!*error && verified && codeCalls == 2 && initCalls == 1 && completeCalls == 1);
-        return result;
-    }
-    /* Dismiss the first code and retry the unmodified password. Even numeric
-     * passwords must complete SRP again and request a replacement code. */
-    /* Changed passwords outside the appended-code format also start fresh. */
-    changedPassword = YES;
-    *response = nil; *error = nil;
-    NSMutableURLRequest *retry = ids ? idsLogin(testPassword()) : login(testPassword());
-    NSData *data = [NSURLConnection sendSynchronousRequest:retry returningResponse:response error:error];
-    if (ids) assert(!*error && [[parse(data) objectForKey:@"status"] integerValue] == 5000);
-    else assert([(NSHTTPURLResponse *)*response statusCode] == 401 || [*error code] == NSURLErrorUserCancelledAuthentication);
-    assert(initCalls == 2 && completeCalls == 2 && codeCalls == 2 && !verified && !accountCalls);
-
-    /* A rejected appended code must leave the session available for correction. */
-    *response = nil; *error = nil;
-    NSString *wrong = [testPassword() stringByAppendingString:@"000000"];
-    [NSURLConnection sendSynchronousRequest:ids ? idsLogin(wrong) : login(wrong) returningResponse:response error:error];
-    assert(*error && !verified && codeCalls == 3 && initCalls == 2 && !accountCalls);
-
-    *response = nil; *error = nil;
-    NSString *correct = [testPassword() stringByAppendingString:@"123456"];
-    data = [NSURLConnection sendSynchronousRequest:ids ? idsLogin(correct) : login(correct) returningResponse:response error:error];
-    assert(verified && codeCalls == 4 && initCalls == 2 && completeCalls == initCalls);
-    return data;
-}
 int main(int argc, char **argv) {
     NSAutoreleasePool *pool = [NSAutoreleasePool new]; mode = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"success";
 #if __OBJC_GC__
     assert([NSGarbageCollector defaultCollector] != nil);
 #endif
     [NSURLProtocol registerClass:[AQMock class]];
-    if (!fixture(@"disabled")) {
-        aq_test_install_otp((IMP)localOTP); aq_test_install_sync((IMP)localSync); aq_test_install_routing((IMP)localStoreRouting);
-    }
+    /* The generator's own set, through the module: the whole sign-in exchange, with its
+     * headers on the envelope and in the body alike. */
+    if ([mode isEqual:@"local"]) aq_test_install_otp((IMP)localOTP);
     if ([mode hasPrefix:@"ids-"]) {
         NSURLResponse *response = nil; NSError *error = nil;
-        NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(testPassword()) returningResponse:&response error:&error];
+        NSData *data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord") returningResponse:&response error:&error];
         if (fixture(@"disabled")) {
             assert(!error && [[parse(data) objectForKey:@"fixture"] isEqual:@"native"]);
             assert(anisetteCalls == 0 && initCalls == 0 && NSClassFromString(@"AQGSAProtocol") == Nil);
@@ -388,29 +307,16 @@ int main(int argc, char **argv) {
         } else if (fixture(@"rejected") || fixture(@"bad-delegate") || fixture(@"missing-token") || fixture(@"missing-profile") || fixture(@"bad-status-type")) {
             assert(error && accountCalls == 1 && !data);
         } else {
-            if (twoFactor()) {
+            if (fixture(@"2fa")) {
                 assert(!error && [[parse(data) objectForKey:@"status"] integerValue] == 5000 && codeCalls == 1 && !accountCalls);
-                data = finishTwoFactor(YES, &response, &error);
-                if (fixture(@"2fa-missing-token")) {
-                    assert(error && !accountCalls && initCalls == 1);
-                    puts("PASS: missing verification token stops IDS without another password exchange");
-                    [pool drain]; return 0;
-                }
+                response = nil; error = nil;
+                data = [NSURLConnection sendSynchronousRequest:idsLogin(@"Synthetic:PassWord123456") returningResponse:&response error:&error];
+                assert(verified && codeCalls == 2);
             }
             assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200 && accountCalls == 1);
             NSDictionary *body = parse(data);
             assert([[body objectForKey:@"status"] integerValue] == 0);
             assert([[body objectForKey:@"auth-token"] isEqual:@"fixture-ids-token"] && [[body objectForKey:@"profile-id"] isEqual:@"D:12345"]);
-            if (twoFactor()) {
-                /* Messages may repeat its successful code-bearing request in
-                 * the same agent. It must not restart SRP with that code. */
-                int previousInit=initCalls, previousComplete=completeCalls, previousCode=codeCalls;
-                NSString *input = fixture(@"2fa-code-only") ? @"123456" : [testPassword() stringByAppendingString:@"123456"];
-                response=nil; error=nil;
-                NSData *repeated=[NSURLConnection sendSynchronousRequest:idsLogin(input) returningResponse:&response error:&error];
-                assert(!error && [parse(repeated) isEqual:body]);
-                assert(initCalls==previousInit && completeCalls==previousComplete && codeCalls==previousCode && accountCalls==1);
-            }
             Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
             for (NSString *url in [NSArray arrayWithObjects:
                 @"http://profile.ess.apple.com/WebObjects/VCProfileService.woa/wa/authenticateUser",
@@ -435,18 +341,12 @@ int main(int argc, char **argv) {
         NSURLResponse *response = nil; NSError *error = nil;
         NSData *data = [NSURLConnection sendSynchronousRequest:settings() returningResponse:&response error:&error];
         assert(initCalls == 0 && completeCalls == 0 && codeCalls == 0 && unexpected == 0 && anisetteCalls == 1);
-        if ([mode isEqual:@"settings"] || [mode isEqual:@"settings-opaque"]) {
+        if ([mode isEqual:@"settings"]) {
             assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200 && accountCalls == 1);
             assert([[parse(data) objectForKey:@"fixture"] isEqual:@"ok"]);
             Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
             NSMutableURLRequest *legacy = settings();
             [legacy setValue:@"Basic MTIzNDU6ZmFrZS1tbWU=" forHTTPHeaderField:@"Authorization"];
-            assert([protocol canInitWithRequest:legacy]);
-            // Token spelling is opaque; email/password and empty credentials
-            // still must not enter the saved-account refresh path.
-            [legacy setValue:@"Basic dGVzdEBleGFtcGxlLmludmFsaWQ6ZmFrZS1tbWU=" forHTTPHeaderField:@"Authorization"];
-            assert(![protocol canInitWithRequest:legacy]);
-            [legacy setValue:@"Basic MTIzNDU6" forHTTPHeaderField:@"Authorization"];
             assert(![protocol canInitWithRequest:legacy]);
             NSMutableURLRequest *foreign = settings();
             [foreign setURL:[NSURL URLWithString:@"https://setup.icloud.com.example.invalid/setup/get_account_settings"]];
@@ -455,8 +355,8 @@ int main(int argc, char **argv) {
         printf("PASS: offline %s without password authentication\n", [mode UTF8String]);
         [pool drain]; return 0;
     }
-    if ([mode isEqual:@"aos"] || [mode isEqual:@"aos-basic"] || [mode isEqual:@"aos-mixed"] || [mode hasPrefix:@"aos-settings"]) {
-        BOOL refresh = [mode hasPrefix:@"aos-settings"];
+    if ([mode isEqual:@"aos"] || [mode isEqual:@"aos-basic"] || [mode isEqual:@"aos-mixed"] || [mode isEqual:@"aos-settings"]) {
+        BOOL refresh = [mode isEqual:@"aos-settings"];
         BOOL basic = ![mode isEqual:@"aos"];
         assert(dlopen("/System/Library/PrivateFrameworks/AOSKit.framework/AOSKit", RTLD_LAZY | RTLD_LOCAL));
         Class cls = NSClassFromString(@"AOSRequest"); assert(cls);
@@ -467,7 +367,7 @@ int main(int argc, char **argv) {
         if (basic) {
             ((void(*)(id,SEL,id,id))objc_msgSend)(request, NSSelectorFromString(@"setUsername:andPassword:"),
                 refresh ? @"12345" : [mode isEqual:@"aos-mixed"] ? @"TeSt@Example.Invalid" : @"test@example.invalid",
-                refresh ? (opaqueSettings() ? @"opaque-fixture" : @"E-fixture-mme") : @"Synthetic:PassWord");
+                refresh ? @"E-fixture-mme" : @"Synthetic:PassWord");
             ((void(*)(id,SEL))objc_msgSend)(request, NSSelectorFromString(@"addBasicAuth"));
         }
         ((void(*)(id,SEL))objc_msgSend)(request, NSSelectorFromString(@"sendSynchronously"));
@@ -480,30 +380,53 @@ int main(int argc, char **argv) {
         puts("PASS: offline sign-in via native AOSRequest / CFURLConnection"); [pool drain]; return 0;
     }
     NSURLResponse *response = nil; NSError *error = nil;
-    NSData *data = [NSURLConnection sendSynchronousRequest:login(testPassword()) returningResponse:&response error:&error];
+    /* What the first request carries: the fixture password, unless the mode is about a
+     * password that ends in six digits, or the password and the code given together. */
+    NSString *typed = [mode isEqual:@"password-tail-digits"] ? @"Synthetic:123456" :
+        [mode isEqual:@"2fa-one-step"] ? @"Synthetic:PassWord123456" : @"Synthetic:PassWord";
+    NSData *data = [NSURLConnection sendSynchronousRequest:login(typed) returningResponse:&response error:&error];
     if ([mode isEqual:@"disabled"]) {
         assert(!error && [[parse(data) objectForKey:@"fixture"] isEqual:@"native"]);
         assert(anisetteCalls == 0 && initCalls == 0 && NSClassFromString(@"AQGSAProtocol") == Nil);
         puts("PASS: disable-icloud-gsa preserves native requests and leaves the module unloaded");
         [pool drain]; return 0;
     }
-    if (twoFactor()) {
-        /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. */
-        assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
-        data = finishTwoFactor(NO, &response, &error);
-        if (fixture(@"2fa-missing-token")) {
-            assert(error && !accountCalls && initCalls == 1);
-            puts("PASS: missing verification token stops iCloud without another password exchange");
-            [pool drain]; return 0;
+    if (is2fa() && ![mode isEqual:@"2fa-sms"] && ![mode isEqual:@"2fa-one-step"]) {
+        /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. Every
+         * variant but SMS asks for the code the same way, whatever the hint looked like. */
+        assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == (unlabelled() ? 0 : 1) && accountCalls == 0);
+        error = nil; response = nil;
+        if ([mode isEqual:@"2fa-again"]) {
+            /* The password typed again while the code is awaited: Apple is asked again, and
+             * answers with another challenge. Until 2026-11-26 the adapter refused it here. */
+            data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord") returningResponse:&response error:&error];
+            assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) &&
+                initCalls == 2 && completeCalls == 2 && codeCalls == 0 && accountCalls == 0);
+            error = nil; response = nil;
         }
+        data = [NSURLConnection sendSynchronousRequest:login([mode isEqual:@"2fa-code-only"] ? @"123456" : @"Synthetic:PassWord123456")
+                                        returningResponse:&response error:&error];
+        if ([mode isEqual:@"2fa-refused"]) assert(error && !verified && codeCalls == 2 && accountCalls == 0);
+        else assert(verified && codeCalls == (unlabelled() ? 1 : 2));
     }
-    BOOL resyncSuccess = [mode isEqual:@"resync"] || [mode isEqual:@"resync-header"] ||
-        [mode isEqual:@"resync-complete"] || [mode isEqual:@"resync-routing"];
-    BOOL success = [mode isEqual:@"success"] || twoFactor() || resyncSuccess;
+    /* SMS: refused at once as unsupported, with no prompt requested and no code asked for. */
+    if ([mode isEqual:@"2fa-sms"]) assert(error && codeCalls == 0 && accountCalls == 0);
+    BOOL success = [mode isEqual:@"success"] || [mode isEqual:@"local"] || [mode isEqual:@"password-tail-digits"] ||
+        (is2fa() && ![mode isEqual:@"2fa-refused"] && ![mode isEqual:@"2fa-sms"]);
     if (error) fprintf(stderr, "fixture error: %s (%ld), init=%d complete=%d account=%d\n", [[error localizedDescription] UTF8String], (long)[error code], initCalls, completeCalls, accountCalls);
     if (success) {
         assert(!error && [(NSHTTPURLResponse *)response statusCode] == 200);
         assert([[parse(data) objectForKey:@"fixture"] isEqual:@"ok"] && accountCalls == 2);
+        /* An accepted code completes the sign-in on the exchange that asked for it. Only a
+         * reply without Apple's token repeats the exchange, as every code once did. */
+        /* Asking Apple again for the code is a second exchange as well. */
+        if (is2fa()) assert(initCalls == (([mode isEqual:@"2fa-rerun"] || [mode isEqual:@"2fa-again"]) ? 2 : 1) &&
+            completeCalls == (([mode isEqual:@"2fa-rerun"] || [mode isEqual:@"2fa-again"]) ? 2 : 1));
+        /* Password and code typed together, with no challenge pending: one exchange, which
+         * asks for the code, and the code checked against it. A password whose own last six
+         * characters are digits: the shorter string refused as the password, then the whole. */
+        if ([mode isEqual:@"2fa-one-step"]) assert(initCalls == 1 && completeCalls == 1 && codeCalls == 2);
+        if ([mode isEqual:@"password-tail-digits"]) assert(initCalls == 2 && completeCalls == 2 && codeCalls == 0);
         Class protocol = NSClassFromString(@"AQGSAProtocol"); assert(protocol);
         for (NSString *url in [NSArray arrayWithObjects:@"http://setup.icloud.com/setup/login_or_create_account",
             @"https://setup.icloud.com.example.invalid/setup/login_or_create_account", @"https://setup.icloud.com:444/setup/login_or_create_account",
@@ -523,27 +446,7 @@ int main(int argc, char **argv) {
         NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:0.2];
         while ([limit timeIntervalSinceNow] > 0) [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:limit];
         assert(client->callbacks == 0); [cancel release]; [client release];
-        if (resyncSuccess) {
-            assert(syncCalls == 1 && syncHTTPCalls == 1 && anisetteCalls == 3);
-            assert(initCalls == ([mode isEqual:@"resync-complete"] ? 1 : 2));
-            assert(completeCalls == ([mode isEqual:@"resync-complete"] ? 2 : 1));
-            assert(routingCalls == ([mode isEqual:@"resync-routing"] ? 1 : 0));
-        }
-    } else {
-        assert(error && accountCalls == 0);
-        if ([mode hasPrefix:@"resync"]) {
-            if ([mode isEqual:@"resync-missing"] || [mode isEqual:@"resync-malformed"])
-                assert(syncCalls == 0 && syncHTTPCalls == 0 && initCalls == 1);
-            else if ([mode isEqual:@"resync-native-failure"])
-                assert(syncCalls == 1 && syncHTTPCalls == 0 && initCalls == 1);
-            else if ([mode isEqual:@"resync-server-failure"])
-                assert(syncCalls == 1 && syncHTTPCalls == 1 && initCalls == 1);
-            else if ([mode isEqual:@"resync-invalid-url"])
-                assert(syncCalls == 1 && syncHTTPCalls == 0 && initCalls == 1);
-            else if ([mode isEqual:@"resync-repeat"])
-                assert(syncCalls == 1 && syncHTTPCalls == 1 && initCalls == 2 && anisetteCalls == 2);
-        }
-    }
+    } else { assert(error && accountCalls == 0); }
     assert(anisetteCalls && (initCalls || [mode isEqual:@"missing-anisette"]) && unexpected == 0);
     printf("PASS: offline %s via lazy module and NSURLConnection\n", [mode UTF8String]);
     [pool drain]; return 0;

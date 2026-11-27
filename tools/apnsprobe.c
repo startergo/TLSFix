@@ -132,7 +132,8 @@ int main(int argc, char **argv) {
     int fd = tcp_connect(host, port);
     if (fd < 0) { printf("connect failed\n"); return 1; }
 
-    SSLContextRef ctx = SSLCreateContext(NULL, kSSLClientSide, kSSLStreamType);
+    SSLContextRef ctx = NULL;
+    SSLNewContext(false, &ctx);
     SSLSetIOFuncs(ctx, sockRead, sockWrite);
     SSLSetConnection(ctx, (SSLConnectionRef)(long)fd);
     SSLSetPeerDomainName(ctx, host, strlen(host));
@@ -140,9 +141,9 @@ int main(int argc, char **argv) {
 
     OSStatus h;
     do { h = SSLHandshake(ctx); } while (h == errSSLWouldBlock);
-    printf("handshake -> %d %s\n", (int)h, h == errSSLPeerAuthCompleted ? "(peer auth break)" : "");
+    printf("handshake -> %d %s\n", (int)h, h == errSSLServerAuthCompleted ? "(server auth break)" : "");
 
-    if (h != errSSLPeerAuthCompleted && h != noErr) { close(fd); return 2; }
+    if (h != errSSLServerAuthCompleted && h != noErr) { close(fd); return 2; }
 
     SSLProtocol proto = 0; SSLCipherSuite suite = 0;
     SSLGetNegotiatedProtocolVersion(ctx, &proto);
@@ -183,7 +184,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    CFRelease(ctx);
+    SSLDisposeContext(ctx);   // pairs with SSLNewContext, not CFRelease
     close(fd);
     return 0;
 }

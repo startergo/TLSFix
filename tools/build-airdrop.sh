@@ -28,22 +28,46 @@ ditto "$SOURCES/AirDropUI.bundle" "$ST/airdrop/AirDropUI.bundle"
 printf '_AQAirDropInstalled\n' > "$BUILD/exports.txt"
 printf '_AQAirDropModernActive\n' >> "$BUILD/exports.txt"
 printf '_AQAirDropNativePeer\n' >> "$BUILD/exports.txt"
-FLAGS=(-arch x86_64 -mmacosx-version-min=10.9 -O2 -fobjc-arc -fblocks -fvisibility=hidden -Wall -Wextra)
-clang "${FLAGS[@]}" -dynamiclib "$SOURCES/AQAirDrop.m" "$SOURCES/AQUI.m" "$DIR/deps/fishhook/fishhook.c" \
+# ARC is a compile-time flag here only. On a link line it makes the compiler driver add
+# libarclite, and current Xcodes ship none of its macOS variant for targets this old ("SDK
+# does not contain 'libarclite'"). Nothing in this payload needs it: every ARC entry point
+# these images import is exported by 10.9's own libobjc. So the sources carry the flag and
+# the links are driven without it.
+CFLAGS=(-arch x86_64 -mmacosx-version-min=10.9 -O2 -fobjc-arc -fblocks -fvisibility=hidden -Wall -Wextra)
+LFLAGS=(-arch x86_64 -mmacosx-version-min=10.9 -fblocks -fvisibility=hidden)
+objc() { # objc <source>: compile one ARC source to build/airdrop/<basename>.o
+  clang "${CFLAGS[@]}" -c "$1" -o "$BUILD/$(basename "${1%.*}").o"
+}
+objc "$SOURCES/AQAirDrop.m"
+objc "$SOURCES/AQUI.m"
+clang -arch x86_64 -mmacosx-version-min=10.9 -O2 -fblocks -fvisibility=hidden -Wall -Wextra \
+  -c "$DIR/deps/fishhook/fishhook.c" -o "$BUILD/fishhook.o"
+clang "${LFLAGS[@]}" -dynamiclib "$BUILD/AQAirDrop.o" "$BUILD/AQUI.o" "$BUILD/fishhook.o" \
   -framework Foundation -framework CFNetwork -framework AppKit -framework IOBluetooth -framework CoreWLAN -Wl,-exported_symbols_list,"$BUILD/exports.txt" \
   -install_name /usr/share/aquatransport/aquatransport_airdrop.dylib -o "$ST/aquatransport_airdrop.dylib"
-clang "${FLAGS[@]}" "$SOURCES/AQHelper.m" "$SOURCES/AQWiFiLease.m" \
+objc "$SOURCES/AQHelper.m"
+objc "$SOURCES/AQWiFiLease.m"
+clang "${LFLAGS[@]}" "$BUILD/AQHelper.o" "$BUILD/AQWiFiLease.o" \
   -framework Foundation -framework CoreWLAN -framework IOBluetooth -framework SystemConfiguration -framework IOKit -o "$ST/airdrop/org.aquatransport.airdrop"
 bootstrap_slices=()
 for arch in x86_64 i386; do
   bootstrap="$BUILD/aquatransport-bootstrap-$arch"
-  clang -arch "$arch" -mmacosx-version-min=10.6 -O2 -fblocks -Wall -Wextra \
-    "$DIR/src/mac/aquatransport_bootstrap.m" "$DIR/src/mac/aquatransport_config.c" \
+  BFLAGS=(-arch "$arch" -mmacosx-version-min=10.6 -O2 -fblocks -Wall -Wextra)
+  # Compiled against the default SDK's headers, which is where xpc/xpc.h exists (from 10.7's),
+  # and linked against the SDK build-macos.sh settled on when it passes one down in
+  # AQUATRANSPORT_SDK: the current default SDK carries no i386 stubs at all. The engine is
+  # built with the same split.
+  clang "${BFLAGS[@]}" -c "$DIR/src/mac/aquatransport_bootstrap.m" -o "$BUILD/aquatransport_bootstrap-$arch.o"
+  clang "${BFLAGS[@]}" -c "$DIR/src/mac/aquatransport_config.c" -o "$BUILD/aquatransport_config-bootstrap-$arch.o"
+  ISYS=()
+  [ -n "${AQUATRANSPORT_SDK:-}" ] && ISYS=(-isysroot "$AQUATRANSPORT_SDK")
+  clang "${BFLAGS[@]}" ${ISYS[@]+"${ISYS[@]}"} "$BUILD/aquatransport_bootstrap-$arch.o" "$BUILD/aquatransport_config-bootstrap-$arch.o" \
     -framework Foundation -o "$bootstrap"
   bootstrap_slices+=("$bootstrap")
 done
 lipo -create "${bootstrap_slices[@]}" -output "$ST/aquatransport-bootstrap"
-clang "${FLAGS[@]}" "$SOURCES/ad_ble_wake.m" -framework Foundation -framework IOBluetooth -o "$ST/airdrop/ad_ble_wake"
+objc "$SOURCES/ad_ble_wake.m"
+clang "${LFLAGS[@]}" "$BUILD/ad_ble_wake.o" -framework Foundation -framework IOBluetooth -o "$ST/airdrop/ad_ble_wake"
 cp "$BUILD/owl/owl" "$ST/airdrop/owl"
 cp "$SOURCES/org.aquatransport.airdrop.plist" "$ST/airdrop/"
 cp "$DIR/src/mac/org.aquatransport.bootstrap.plist" "$BOOT_ST/"
