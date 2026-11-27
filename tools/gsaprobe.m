@@ -21,6 +21,9 @@ static BOOL fixture(NSString *name) { return [mode isEqual:name] || [mode isEqua
  * has also been seen, under a new name, or nowhere; the code check answered either way it is
  * answered; and the one method there is no adapter for. */
 static BOOL is2fa(void) { return [mode hasPrefix:@"2fa"] || [mode isEqual:@"ids-2fa"]; }
+/* The answers that name no method: Apple has sent the code with them, and the adapter must
+ * not ask. */
+static BOOL unlabelled(void) { return [mode isEqual:@"2fa-unlabelled"] || [mode isEqual:@"2fa-again"]; }
 
 static NSData *plist(id obj) { return [NSPropertyListSerialization dataWithPropertyList:obj format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL]; }
 static id parse(NSData *d) { return [NSPropertyListSerialization propertyListWithData:d options:0 format:NULL error:NULL]; }
@@ -164,7 +167,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
             [s setObject:@409 forKey:@"hsc"];
             if ([mode isEqual:@"2fa-sms"]) [s setObject:@"secondaryAuth" forKey:@"au"];
             else if ([mode isEqual:@"2fa-renamed"]) [s setObject:@"trustedDeviceSecondaryAuthV2" forKey:@"au"];
-            else if ([mode isEqual:@"2fa-unlabelled"] || [mode isEqual:@"2fa-session-hint"]) ;
+            else if (unlabelled() || [mode isEqual:@"2fa-session-hint"]) ;
             else [s setObject:@"trustedDeviceSecondaryAuth" forKey:@"au"];
         } else if (wrongPassword) {
             /* Apple's answer to a wrong password: not a challenge. */
@@ -173,6 +176,7 @@ static id localOTP(id self, SEL selector, id owner, NSError **error) {
         [r setObject:s forKey:@"Status"]; result = [NSDictionary dictionaryWithObject:r forKey:@"Response"];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/auth/verify/trusteddevice"]) {
         codeCalls++; assert([req valueForHTTPHeaderField:@"X-Apple-Identity-Token"]);
+        assert(!unlabelled());
         result = [NSDictionary dictionary];
     } else if ([host isEqual:@"gsa.apple.com"] && [path isEqual:@"/grandslam/GsService2/validate"]) {
         codeCalls++; assert([[req valueForHTTPHeaderField:@"security-code"] isEqual:@"123456"]);
@@ -390,12 +394,20 @@ int main(int argc, char **argv) {
     if (is2fa() && ![mode isEqual:@"2fa-sms"] && ![mode isEqual:@"2fa-one-step"]) {
         /* CFNetwork may surface a synthetic 401 as NSURLErrorUserCancelledAuthentication. Every
          * variant but SMS asks for the code the same way, whatever the hint looked like. */
-        assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == 1 && accountCalls == 0);
+        assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) && codeCalls == (unlabelled() ? 0 : 1) && accountCalls == 0);
         error = nil; response = nil;
+        if ([mode isEqual:@"2fa-again"]) {
+            /* The password typed again while the code is awaited: Apple is asked again, and
+             * answers with another challenge. Until 2026-11-26 the adapter refused it here. */
+            data = [NSURLConnection sendSynchronousRequest:login(@"Synthetic:PassWord") returningResponse:&response error:&error];
+            assert(([(NSHTTPURLResponse *)response statusCode] == 401 || [error code] == NSURLErrorUserCancelledAuthentication) &&
+                initCalls == 2 && completeCalls == 2 && codeCalls == 0 && accountCalls == 0);
+            error = nil; response = nil;
+        }
         data = [NSURLConnection sendSynchronousRequest:login([mode isEqual:@"2fa-code-only"] ? @"123456" : @"Synthetic:PassWord123456")
                                         returningResponse:&response error:&error];
         if ([mode isEqual:@"2fa-refused"]) assert(error && !verified && codeCalls == 2 && accountCalls == 0);
-        else assert(verified && codeCalls == 2);
+        else assert(verified && codeCalls == (unlabelled() ? 1 : 2));
     }
     /* SMS: refused at once as unsupported, with no prompt requested and no code asked for. */
     if ([mode isEqual:@"2fa-sms"]) assert(error && codeCalls == 0 && accountCalls == 0);
@@ -407,7 +419,9 @@ int main(int argc, char **argv) {
         assert([[parse(data) objectForKey:@"fixture"] isEqual:@"ok"] && accountCalls == 2);
         /* An accepted code completes the sign-in on the exchange that asked for it. Only a
          * reply without Apple's token repeats the exchange, as every code once did. */
-        if (is2fa()) assert(initCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1) && completeCalls == ([mode isEqual:@"2fa-rerun"] ? 2 : 1));
+        /* Asking Apple again for the code is a second exchange as well. */
+        if (is2fa()) assert(initCalls == (([mode isEqual:@"2fa-rerun"] || [mode isEqual:@"2fa-again"]) ? 2 : 1) &&
+            completeCalls == (([mode isEqual:@"2fa-rerun"] || [mode isEqual:@"2fa-again"]) ? 2 : 1));
         /* Password and code typed together, with no challenge pending: one exchange, which
          * asks for the code, and the code checked against it. A password whose own last six
          * characters are digits: the shorter string refused as the password, then the whole. */

@@ -663,6 +663,16 @@ static NSString *aq_pet_from_header(id value) {
     return aq_device_field([envelope substringFromIndex:[prefix length]]);
 }
 
+/* What a reply holds, by key names only: a value may name the account. */
+static NSString *aq_shape(NSData *d) {
+    id parsed = aq_plist(d) ?: aq_dict([NSJSONSerialization JSONObjectWithData:d options:0 error:NULL]);
+    if ([parsed isKindOfClass:[NSArray class]]) return [NSString stringWithFormat:@"a list of %lu items", (unsigned long)[(NSArray *)parsed count]];
+    if (![parsed isKindOfClass:[NSDictionary class]]) return @"neither a property list nor JSON";
+    NSMutableArray *names = [NSMutableArray array];
+    for (id key in (NSDictionary *)parsed) if ([key isKindOfClass:[NSString class]]) [names addObject:key];
+    return [NSString stringWithFormat:@"keys: %@", [names count] ? [[names sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "] : @"none"];
+}
+
 /* The two requests of the second factor: the prompt on the trusted devices, and the code's
  * validation. Where `pet` is given, an accepted code's password-equivalent token is put
  * there -- nil if Apple's reply carries none. */
@@ -711,6 +721,12 @@ static BOOL aq_second_factor(AQGSAProtocol *owner, NSString *identity, NSString 
      * top-level ec passed as approved, and the retry went on to a second password exchange
      * on a code that had never been accepted. */
     if ([r statusCode] != 200 || (code && !numeric) || (ec && (!numeric || [ec integerValue] != 0))) {
+        /* What a refused prompt was answered with, by key names only. */
+        if (!code) {
+            NSString *type = aq_response_header(r, @"Content-Type") ?: @"no content type";
+            syslog(LOG_NOTICE, "AquaTransport verification prompt reply (HTTP %ld, %s, %lu bytes, %s)", (long)[r statusCode],
+                [type UTF8String], (unsigned long)[d length], [aq_shape(d) UTF8String]);
+        }
         syslog(LOG_NOTICE, "AquaTransport iCloud %s rejected (HTTP %ld, code 21)",
             code ? "verification code" : "verification prompt", (long)[r statusCode]);
         *error = aq_error(21, @"Apple rejected the verification request."); return NO;
@@ -744,6 +760,16 @@ static NSDictionary *aq_login(AQGSAProtocol *owner, NSString *user, NSString *pa
         NSNumber *submitted = [pending objectForKey:@"passwordLength"];
         /* On the retry the code follows the password; where the pane asks for the code alone,
          * it is the password. */
+        /* The password again, and nothing else: the code has not arrived, or was lost. Apple
+         * is asked again, and sends the code again. Refusing it here, as was done until
+         * 2026-11-26, kept the request from Apple, and no code came. Only the length is kept,
+         * so a different string of that length goes too, and Apple refuses it as a password. */
+        BOOL again = submitted && length == [submitted unsignedIntegerValue];
+        if (again) {
+            syslog(LOG_NOTICE, "AquaTransport iCloud password given again with a code awaited; asking Apple again");
+            [AQPending removeObjectForKey:account];
+            return aq_password_login(owner, user, account, password, error);
+        }
         BOOL appended = submitted && length > 6 && length - 6 == [submitted unsignedIntegerValue];
         BOOL alone = submitted && length == 6 && [submitted unsignedIntegerValue] != 6;
         NSString *code = appended ? [password substringFromIndex:length-6] : alone ? password : nil;
@@ -851,13 +877,18 @@ static NSDictionary *aq_password_login(AQGSAProtocol *owner, NSString *user, NSS
                 *error = aq_error(26, @"Missing verification session."); return nil;
             }
             NSString *identity = aq_base64([[NSString stringWithFormat:@"%@:%@", dsid, token] dataUsingEncoding:NSUTF8StringEncoding]);
-            /* Ask for the prompt on the trusted devices, but do not make it a condition: the
-             * code can be read off one of them by hand, and a notification that could not be
-             * delivered is no reason to refuse the attempt. */
-            NSError *notificationError = nil;
-            if (!aq_second_factor(owner, identity, nil, NULL, &notificationError))
-                syslog(LOG_NOTICE, "AquaTransport iCloud verification prompt could not be requested (code %ld); a code read from another device still completes sign-in",
-                       (long)[notificationError code]);
+            /* Where Apple names the trusted-device method, ask for the prompt, but do not make
+             * it a condition: the code can be read off one of them by hand. Where it names
+             * none, the code is already on its way -- Apple sent it with this answer. On
+             * 2026-11-26 codes were accepted ten and twenty-two seconds after such answers
+             * while a request for them was answered HTTP 403 every time, and SideStore's
+             * SideSign came to the same conclusion on 2026-10-13 -- so none is made. */
+            if (secondary) {
+                NSError *notificationError = nil;
+                if (!aq_second_factor(owner, identity, nil, NULL, &notificationError))
+                    syslog(LOG_NOTICE, "AquaTransport iCloud verification prompt could not be requested (code %ld); a code read from another device still completes sign-in",
+                           (long)[notificationError code]);
+            } else syslog(LOG_NOTICE, "AquaTransport iCloud verification code not requested: Apple names no method, and sends it with this answer");
             if ([owner isStopped]) { *error = aq_error(NSUserCancelledError, @"Sign-in cancelled."); return nil; }
             if ([AQPending count] >= 32) [AQPending removeAllObjects];
             /* The challenge's own session is kept: with the code's token, it is the login. */
