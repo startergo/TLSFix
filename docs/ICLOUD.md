@@ -33,7 +33,12 @@ that day it looked refused too, with a bare 503 at Apple's edge; that was this
 adapter, not Apple. The generator's identity was stored under a key the
 GrandSlam envelope did not read, so the request described an Xcode MacBook on
 the outside and carried the Mac's own one-time password inside. Fixed the same
-day; the comparison is under *Anisette V3*.
+day; the comparison is under *Anisette V3*. That evening the account was signed
+in again in the pane, on the Mac's own generator, from the password and a code
+typed together in one entry: `account refresh completed (HTTP 200)`, and the
+account store rewritten fifteen seconds later. Apple now sends the code with its
+answer instead of on request, and the code a trusted device can produce by hand
+is offered only while that device is offline (*Install and try a sign-in*).
 
 The mock tests pass through the installed AOSKit framework's actual
 `AOSRequest` / `CFURLConnection` path. They cannot establish that Apple's current
@@ -467,10 +472,11 @@ What to expect when switching to it:
   the GrandSlam envelope did not read, so the envelope described another device
   (*When sign-in fails at its first step*, under *Anisette V3*). With that put
   right, the pairing probe's first step was answered with a challenge, three
-  times in three, in the same minutes as a `v3:` identity was refused. A sign-in
-  in the pane with this generator is the last thing not yet confirmed; upstream's
-  own notes mark their November login work "live acceptance remains to be
-  tested". The sources are one line apart, and the pairing probe (under
+  times in three, in the same minutes as a `v3:` identity was refused. The same
+  afternoon the preference pane's own helper got through device data and password
+  to Apple's request for a code on this generator, and at 23:01 a sign-in in the pane
+  completed on it (*Install and try a sign-in*). Upstream's own notes mark their
+  November login work "live acceptance remains to be tested". The sources are one line apart, and the pairing probe (under
   Validation) says in one request whether Apple is answering a source.
 - **The engine's own injection has no local source.** Where the Objective-C
   module cannot arm in a process making keychain or escrow requests, the engine
@@ -502,13 +508,45 @@ Quit and reopen System Preferences, then sign in normally. A reboot is not requi
 for the preference pane's own requests. If an account helper owns the request, that
 process must also be restarted to load updated code.
 
-For trusted-device two-factor authentication, the first attempt requests a code and
-returns an authentication failure to the old client. Approve the request on the
-trusted device, then retry within five minutes using **your password immediately
-followed by the six-digit code**. A code by itself is not supported. Keep the same
-preference pane/helper process running between attempts. Pending state stores only
-the verification session, not the password, and is bounded to 32 accounts per process.
-Expired entries are removed on the next attempt.
+For trusted-device two-factor authentication, the first attempt returns an
+authentication failure to the old client, and Apple sends the code: a sign-in request
+appears on the trusted devices, and Allow shows it. Read the code, then retry within
+five minutes using **your password immediately followed by the six-digit code** -- or
+the code by itself, where the pane asks for it that way. Entering the password on its
+own again asks Apple for the code again. The password and the code can be given
+together the first time as well: read the code off the device before you start and
+type the password with it on the end. That needs no second attempt, and it is how the
+sign-in of 2026-11-26 was made. Keep the same preference pane/helper process running
+between attempts. Pending state stores the
+verification session and the length of the password that was submitted, never the
+password, and is bounded to 32 accounts per process. Expired entries are removed on the
+next attempt. The log's credentials line records the length of the password field, and
+never any of it.
+
+An accepted code completes the sign-in. Apple returns a password-equivalent token
+with the code it accepts, in the `X-Apple-PE-Token` reply header, and the token the
+sign-in then presents to iCloud in place of the password is that one, put into the
+session of the exchange that asked for the code. Until 2026-11-26 the adapter instead
+ran the password exchange a second time and took the token from that reply's session,
+as AltSign does. On the 10.9.5 machine that day Apple accepted the code and answered
+the repeated exchange `409` again; the adapter went on to submit the same code a
+second time, which spent it (`-21669`), and the pane asked again. A reply that
+carries no token still falls back to repeating the exchange (`2fa-code-only` covers
+the first, `2fa-rerun` the fallback).
+
+**Password and code together.** Nothing has to be asked for first. When a request
+carries six digits on the end of the password and the process making it has no
+challenge pending, the adapter asks with the digits off and checks them against the
+challenge that comes back, as on any retry. The case is not rare on this pane: the
+password typed into it is saved, and iMessage's and FaceTime's agent reads it too. On
+the 10.9.5 machine on 2026-11-26 that agent held the challenge and Apple accepted the
+code there -- it signed iMessage in -- and forty-one seconds later the pane's helper
+was sent the same string with no challenge to match it to, and Apple refused the whole
+of it as the password (`-22406`). Every such refusal counts at Apple as a wrong
+password. At 23:01 that day the pane's own helper was given the sixteen characters
+this way, and the sign-in completed. A password whose own last six characters are digits is still taken as typed,
+at the cost of one refused attempt with the shorter string (`2fa-one-step` covers the
+first, `password-tail-digits` the second).
 
 Three things about that exchange are worth knowing. Each comes from upstream's
 work of 2026-11, and each has an offline case of its own (`tools/gsaprobe.m`, the
@@ -523,11 +561,26 @@ work of 2026-11, and each has an offline case of its own (`tools/gsaprobe.m`, th
   a code counts as accepted only on a numeric `ec` of 0. A refusal there used to
   pass as approval, and the retry then ran a second password exchange on a code
   that had never been accepted.
-- If the prompt cannot be delivered to a trusted device, the attempt still goes
-  on: the code can be read off one of them by hand.
+- The code is not asked for. Apple sends it with an answer that names no method:
+  on 2026-11-26 codes were accepted ten and twenty-two seconds after such answers,
+  while a request for the prompt, `/auth/verify/trusteddevice`, was answered
+  `HTTP 403` every time, with this adapter's headers and with AltSign's. SideStore's
+  SideSign stopped asking too, on 2026-10-13. The prompt is requested only where
+  Apple names the trusted-device method, as it did in September. A code produced by
+  hand still completes the sign-in. On iOS 18 and 26 a trusted device offers **Get
+  Verification Code** only while it is offline -- Airplane Mode, and Wi-Fi off as
+  well: Settings, the account, *Sign-In & Security*, the pop-up *Account Details
+  Unavailable*.
 
 The old pane may show a generic authentication failure rather than instructions for
-entering the code. The user completed this two-attempt flow with a real account. SMS-only
+entering the code. The user completed the two-attempt flow with a real account in
+September. On 2026-11-26, on the 10.9.5 machine, an accepted code signed iMessage in by
+the token (`iMessage delegate authentication completed (HTTP 200, status 0, delegate
+status 0)`), and at 23:01 the pane's own helper completed an iCloud sign-in the same
+way, from the password and the code typed together: `verification validation
+response (HTTP 200, ec 0)`, `verification token issued`, `verification accepted;
+signing in with Apple's password-equivalent token`, then `account refresh completed
+(HTTP 200)`. SMS-only
 verification (`secondaryAuth`), account recovery, account creation, terms acceptance,
 and Game Center are not implemented. The experimental iMessage profile
 adapter is described below; its server acceptance is not yet verified. This module does not
